@@ -88,7 +88,7 @@ pub fn print_banner(
     );
     println!();
     println!(
-        "  {}Type {}/help{} for skills, {}/provider{} to switch models, or ask a question.{}",
+        "  {}Type {}/model{} to switch models, {}/help{} for skills, or ask a question.{}",
         TEXT_MUTED, ACCENT_CYAN, TEXT_MUTED, ACCENT_CYAN, TEXT_MUTED, RESET,
     );
     println!();

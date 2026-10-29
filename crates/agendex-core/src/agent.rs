@@ -513,7 +513,7 @@ impl AgendexAgent {
                         }
                     }
                 }
-                "/provider" | "/providers" => {
+                "/provider" | "/providers" | "/model" | "/models" => {
                     return self.handle_provider_command(user_input).await;
                 }
                 _ => {
