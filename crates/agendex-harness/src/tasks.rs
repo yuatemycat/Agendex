@@ -640,7 +640,7 @@ fn is_host_power_invocation(command: &str) -> bool {
         base.trim_end_matches(".exe").to_string()
     }
     fn is_power_bin(name: &str) -> bool {
-        matches!(
+        if matches!(
             name,
             "shutdown"
                 | "reboot"
@@ -650,7 +650,15 @@ fn is_host_power_invocation(command: &str) -> bool {
                 | "stop-computer"
                 | "restart-computer"
                 | "suspend-computer"
-        )
+        ) {
+            return true;
+        }
+        // Test seam. This is not a Windows program, so a missed guard cannot power the host off.
+        #[cfg(test)]
+        if name == "agendex-test-refuse-spawn" {
+            return true;
+        }
+        false
     }
     fn split_cmd(command: &str) -> Vec<String> {
         let mut out = Vec::new();
@@ -722,10 +730,11 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         let manager = TaskManager::new(&tmp);
+        // Never pass a real shutdown invocation into the spawner from a test.
         let err = manager
-            .run_command("shutdown /s /t 0", 1000, None, false, None)
+            .run_command("agendex-test-refuse-spawn", 1000, None, false, None)
             .await
-            .expect_err("host power command must not spawn");
+            .expect_err("refused command must not spawn");
         assert!(
             err.to_string().contains("refused to spawn host power command"),
             "{err}"
