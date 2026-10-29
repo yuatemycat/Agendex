@@ -1,0 +1,21 @@
+[package]
+name = "agendex-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+agendex-harness = { path = "../agendex-harness" }
+agendex-trajectory = { path = "../agendex-trajectory" }
+agendex-ast = { path = "../agendex-ast" }
+agendex-scaffold = { path = "../agendex-scaffold" }
+agendex-mcp = { path = "../agendex-mcp" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }

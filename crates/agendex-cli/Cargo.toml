@@ -1,0 +1,27 @@
+[package]
+name = "agendex-cli"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "agendex_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agendex"
+path = "src/main.rs"
+
+[dependencies]
+agendex-core = { path = "../agendex-core" }
+agendex-harness = { path = "../agendex-harness" }
+agendex-trajectory = { path = "../agendex-trajectory" }
+agendex-ast = { path = "../agendex-ast" }
+agendex-scaffold = { path = "../agendex-scaffold" }
+agendex-mcp = { path = "../agendex-mcp" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }

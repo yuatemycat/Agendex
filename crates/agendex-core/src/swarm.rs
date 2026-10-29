@@ -1,0 +1,496 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{Mutex, RwLock};
+
+use crate::agent::{AgendexAgent, AgentConfig, ApprovalHandler};
+use crate::mailbox::{MailboxEvent, MailboxManager};
+use crate::worktree::{WorkspaceMode, WorktreeManager};
+use agendex_trajectory::compactor::ModelTier;
+
+/// Specification of a dynamic subagent persona including permissions and model tier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentPersona {
+    pub name: String,
+    pub role: String,
+    pub system_prompt: String,
+    pub allowed_tools: Vec<String>,
+    pub model_tier: ModelTier,
+}
+
+impl SubagentPersona {
+    pub fn new(
+        name: impl Into<String>,
+        role: impl Into<String>,
+        system_prompt: impl Into<String>,
+        allowed_tools: Vec<String>,
+        model_tier: ModelTier,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            role: role.into(),
+            system_prompt: system_prompt.into(),
+            allowed_tools,
+            model_tier,
+        }
+    }
+
+    /// Read-only research and exploration persona.
+    pub fn researcher() -> Self {
+        Self {
+            name: "researcher".to_string(),
+            role: "Codebase & Documentation Researcher".to_string(),
+            system_prompt:
+                "You are a read-only research specialist. Inspect files and explain architectures."
+                    .to_string(),
+            allowed_tools: vec![
+                "read_file".to_string(),
+                "list_directory".to_string(),
+                "send_message".to_string(),
+            ],
+            model_tier: ModelTier::Standard128k,
+        }
+    }
+
+    /// Full implementation persona with write and command permissions.
+    pub fn coder() -> Self {
+        Self {
+            name: "coder".to_string(),
+            role: "Software Implementation Engineer".to_string(),
+            system_prompt: "You are a software engineer specializing in surgical code implementation and bug fixes.".to_string(),
+            allowed_tools: vec![
+                "read_file".to_string(),
+                "write_file".to_string(),
+                "edit_file".to_string(),
+                "list_directory".to_string(),
+                "run_command".to_string(),
+                "send_message".to_string(),
+            ],
+            model_tier: ModelTier::HighTier256k,
+        }
+    }
+
+    /// Code quality and security review persona.
+    pub fn reviewer() -> Self {
+        Self {
+            name: "reviewer".to_string(),
+            role: "Security & Code Quality Reviewer".to_string(),
+            system_prompt:
+                "You are an expert reviewer auditing code changes for correctness and security."
+                    .to_string(),
+            allowed_tools: vec![
+                "read_file".to_string(),
+                "list_directory".to_string(),
+                "send_message".to_string(),
+            ],
+            model_tier: ModelTier::Standard128k,
+        }
+    }
+}
+
+/// Lifecycle execution status of a subagent instance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubagentStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Terminated,
+}
+
+/// Record representing a spawned subagent instance and its current execution state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentInstance {
+    pub id: String,
+    pub persona: SubagentPersona,
+    pub status: SubagentStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub workspace_dir: PathBuf,
+    pub workspace_mode: WorkspaceMode,
+    pub result: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Coordinates dynamic subagent personas, instance lifecycles, and asynchronous execution.
+pub struct SubagentManager {
+    parent_id: String,
+    base_config: AgentConfig,
+    mailbox: Arc<MailboxManager>,
+    worktree_mgr: Arc<WorktreeManager>,
+    personas: Arc<RwLock<HashMap<String, SubagentPersona>>>,
+    instances: Arc<RwLock<HashMap<String, SubagentInstance>>>,
+    join_handles: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    pub approval_handler: Option<ApprovalHandler>,
+}
+
+impl SubagentManager {
+    /// Initialize a new subagent manager with standard default personas registered.
+    pub fn new(
+        parent_id: impl Into<String>,
+        base_config: AgentConfig,
+        mailbox: Arc<MailboxManager>,
+        worktree_mgr: Arc<WorktreeManager>,
+    ) -> Self {
+        let mut personas = HashMap::new();
+        let r = SubagentPersona::researcher();
+        let c = SubagentPersona::coder();
+        let rev = SubagentPersona::reviewer();
+
+        personas.insert(r.name.clone(), r);
+        personas.insert(c.name.clone(), c);
+        personas.insert(rev.name.clone(), rev);
+
+        use std::io::IsTerminal;
+        let approval_handler: Option<ApprovalHandler> = if !base_config.auto_approve_risky
+            && std::io::stdin().is_terminal()
+        {
+            Some(Arc::new(|cmd: &str, reason: &str| -> bool {
+                use std::io::Write;
+                print!(
+                    "\n[Subagent Safety Gate] Command is classified as risky ({}):\n  {}\nAllow execution? [y/N]: ",
+                    reason, cmd
+                );
+                let _ = std::io::stdout().flush();
+                let mut input = String::new();
+                if std::io::stdin().read_line(&mut input).is_ok() {
+                    let trimmed = input.trim().to_lowercase();
+                    trimmed == "y" || trimmed == "yes"
+                } else {
+                    false
+                }
+            }))
+        } else {
+            None
+        };
+
+        Self {
+            parent_id: parent_id.into(),
+            base_config,
+            mailbox,
+            worktree_mgr,
+            personas: Arc::new(RwLock::new(personas)),
+            instances: Arc::new(RwLock::new(HashMap::new())),
+            join_handles: Arc::new(Mutex::new(HashMap::new())),
+            approval_handler,
+        }
+    }
+
+    pub fn with_approval_handler(mut self, handler: ApprovalHandler) -> Self {
+        self.approval_handler = Some(handler);
+        self
+    }
+
+    /// Register or update a dynamic subagent persona.
+    pub async fn register_persona(&self, persona: SubagentPersona) -> anyhow::Result<()> {
+        let mut p = self.personas.write().await;
+        p.insert(persona.name.clone(), persona);
+        Ok(())
+    }
+
+    /// Get a registered persona by name.
+    pub async fn get_persona(&self, name: &str) -> Option<SubagentPersona> {
+        let p = self.personas.read().await;
+        p.get(name).cloned()
+    }
+
+    /// List all currently registered subagent personas.
+    pub async fn list_personas(&self) -> Vec<SubagentPersona> {
+        let p = self.personas.read().await;
+        p.values().cloned().collect()
+    }
+
+    /// Spawn a subagent instance using a registered persona name.
+    pub async fn spawn_subagent(
+        &self,
+        persona_name: &str,
+        prompt: &str,
+        mode: WorkspaceMode,
+    ) -> anyhow::Result<String> {
+        let persona = self
+            .get_persona(persona_name)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Subagent persona '{}' not registered", persona_name))?;
+
+        self.spawn_custom_subagent(persona, prompt, mode).await
+    }
+
+    /// Spawn a subagent instance using an explicit persona configuration.
+    pub async fn spawn_custom_subagent(
+        &self,
+        persona: SubagentPersona,
+        prompt: &str,
+        mode: WorkspaceMode,
+    ) -> anyhow::Result<String> {
+        let subagent_id = uuid::Uuid::new_v4().to_string();
+
+        // 1. Create isolated workspace
+        let isolated_ws = self
+            .worktree_mgr
+            .create_workspace(&subagent_id, mode)
+            .await?;
+
+        let instance = SubagentInstance {
+            id: subagent_id.clone(),
+            persona: persona.clone(),
+            status: SubagentStatus::Pending,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            workspace_dir: isolated_ws.path.clone(),
+            workspace_mode: mode,
+            result: None,
+            error: None,
+        };
+
+        {
+            let mut inst_map = self.instances.write().await;
+            inst_map.insert(subagent_id.clone(), instance);
+        }
+
+        // 2. Clone base config for child agent
+        let mut child_config = self.base_config.clone();
+        child_config.workspace_dir = isolated_ws.path.clone();
+        child_config.session_id = subagent_id.clone();
+        child_config.model_tier = persona.model_tier;
+
+        let instances = Arc::clone(&self.instances);
+        let mailbox = Arc::clone(&self.mailbox);
+        let id_clone = subagent_id.clone();
+        let parent_id_clone = self.parent_id.clone();
+        let prompt_owned = prompt.to_string();
+        let approval_handler = self.approval_handler.clone();
+
+        // 3. Spawn background execution task
+        let handle = tokio::spawn(async move {
+            // Update status to Running
+            {
+                let mut inst_map = instances.write().await;
+                if let Some(inst) = inst_map.get_mut(&id_clone) {
+                    inst.status = SubagentStatus::Running;
+                    inst.updated_at = Utc::now();
+                }
+            }
+            let _ = mailbox.notify_event(MailboxEvent::StatusChanged {
+                agent_id: id_clone.clone(),
+                status: "Running".to_string(),
+            });
+
+            // Initialize agent
+            let agent_init = AgendexAgent::init(child_config).await;
+            match agent_init {
+                Ok(mut agent) => {
+                    if let Some(handler) = &approval_handler {
+                        agent = agent.with_approval_handler(Arc::clone(handler));
+                    }
+                    agent = agent
+                        .with_allowed_tools(persona.allowed_tools.clone())
+                        .with_mailbox(Arc::clone(&mailbox))
+                        .with_agent_id(id_clone.clone())
+                        .with_parent_id(parent_id_clone);
+
+                    let turn_res = agent.process_turn(&prompt_owned).await;
+                    match turn_res {
+                        Ok(output) => {
+                            let mut inst_map = instances.write().await;
+                            if let Some(inst) = inst_map.get_mut(&id_clone) {
+                                inst.status = SubagentStatus::Completed;
+                                inst.result = Some(output.clone());
+                                inst.updated_at = Utc::now();
+                            }
+                            let _ = mailbox.notify_event(MailboxEvent::TaskCompleted {
+                                agent_id: id_clone.clone(),
+                                result: output,
+                            });
+                        }
+                        Err(e) => {
+                            let err_msg = e.to_string();
+                            let mut inst_map = instances.write().await;
+                            if let Some(inst) = inst_map.get_mut(&id_clone) {
+                                inst.status = SubagentStatus::Failed;
+                                inst.error = Some(err_msg.clone());
+                                inst.updated_at = Utc::now();
+                            }
+                            let _ = mailbox.notify_event(MailboxEvent::TaskFailed {
+                                agent_id: id_clone.clone(),
+                                error: err_msg,
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    let err_msg = format!("Failed to initialize subagent agent: {}", e);
+                    let mut inst_map = instances.write().await;
+                    if let Some(inst) = inst_map.get_mut(&id_clone) {
+                        inst.status = SubagentStatus::Failed;
+                        inst.error = Some(err_msg.clone());
+                        inst.updated_at = Utc::now();
+                    }
+                    let _ = mailbox.notify_event(MailboxEvent::TaskFailed {
+                        agent_id: id_clone.clone(),
+                        error: err_msg,
+                    });
+                }
+            }
+        });
+
+        {
+            let mut handles = self.join_handles.lock().await;
+            handles.insert(subagent_id.clone(), handle);
+        }
+
+        Ok(subagent_id)
+    }
+
+    /// Retrieve an instance record by ID.
+    pub async fn get_instance(&self, id: &str) -> Option<SubagentInstance> {
+        let inst_map = self.instances.read().await;
+        inst_map.get(id).cloned()
+    }
+
+    /// Retrieve the current status of an instance.
+    pub async fn get_status(&self, id: &str) -> Option<SubagentStatus> {
+        let inst_map = self.instances.read().await;
+        inst_map.get(id).map(|i| i.status.clone())
+    }
+
+    /// List all subagent instances.
+    pub async fn list_instances(&self) -> Vec<SubagentInstance> {
+        let inst_map = self.instances.read().await;
+        inst_map.values().cloned().collect()
+    }
+
+    /// Terminate a running subagent instance.
+    pub async fn terminate_subagent(&self, id: &str) -> anyhow::Result<()> {
+        {
+            let mut handles = self.join_handles.lock().await;
+            if let Some(handle) = handles.remove(id) {
+                handle.abort();
+            }
+        }
+
+        {
+            let mut inst_map = self.instances.write().await;
+            if let Some(inst) = inst_map.get_mut(id) {
+                inst.status = SubagentStatus::Terminated;
+                inst.updated_at = Utc::now();
+            }
+        }
+
+        let _ = self.mailbox.notify_event(MailboxEvent::StatusChanged {
+            agent_id: id.to_string(),
+            status: "Terminated".to_string(),
+        });
+
+        Ok(())
+    }
+
+    /// Terminate all tracked subagents.
+    pub async fn terminate_all(&self) -> anyhow::Result<()> {
+        let ids: Vec<String> = {
+            let inst_map = self.instances.read().await;
+            inst_map.keys().cloned().collect()
+        };
+
+        for id in ids {
+            let _ = self.terminate_subagent(&id).await;
+        }
+
+        Ok(())
+    }
+
+    /// Reactively wait until a subagent finishes without busy polling.
+    pub async fn wait_for_subagent(
+        &self,
+        id: &str,
+        timeout_dur: Option<Duration>,
+    ) -> anyhow::Result<SubagentInstance> {
+        // Fast path: if already finished, return immediately
+        if let Some(inst) = self.get_instance(id).await {
+            match inst.status {
+                SubagentStatus::Completed | SubagentStatus::Failed | SubagentStatus::Terminated => {
+                    return Ok(inst);
+                }
+                _ => {}
+            }
+        }
+
+        // Subscribe to mailbox broadcast channel for reactive events
+        let id_owned = id.to_string();
+        let event = self
+            .mailbox
+            .wait_for_condition(
+                move |evt| match evt {
+                    MailboxEvent::TaskCompleted { agent_id, .. } => agent_id == &id_owned,
+                    MailboxEvent::TaskFailed { agent_id, .. } => agent_id == &id_owned,
+                    MailboxEvent::StatusChanged { agent_id, status } => {
+                        agent_id == &id_owned
+                            && (status == "Terminated"
+                                || status == "Completed"
+                                || status == "Failed")
+                    }
+                    _ => false,
+                },
+                timeout_dur,
+            )
+            .await?;
+
+        tracing::debug!("Subagent {} finished with event {:?}", id, event);
+
+        self.get_instance(id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Subagent instance '{}' not found after completion", id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_subagent_persona_registration() -> anyhow::Result<()> {
+        let test_root =
+            std::env::temp_dir().join(format!("agendex_swarm_persona_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&test_root)?;
+
+        let mailbox = Arc::new(MailboxManager::new());
+        let worktree_mgr = Arc::new(WorktreeManager::new(test_root.clone(), None)?);
+        let base_config = AgentConfig {
+            workspace_dir: test_root.clone(),
+            ..Default::default()
+        };
+
+        let manager = SubagentManager::new("parent", base_config, mailbox, worktree_mgr);
+
+        // Check defaults
+        assert!(manager.get_persona("researcher").await.is_some());
+        assert!(manager.get_persona("coder").await.is_some());
+        assert!(manager.get_persona("reviewer").await.is_some());
+
+        // Register custom persona
+        let custom = SubagentPersona::new(
+            "security_auditor",
+            "Auditor",
+            "Perform security scans",
+            vec!["read_file".to_string()],
+            ModelTier::Standard128k,
+        );
+        manager.register_persona(custom).await?;
+
+        assert!(manager.get_persona("security_auditor").await.is_some());
+
+        // Approval handler wiring check
+        let custom_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag_clone = Arc::clone(&custom_called);
+        let custom_mgr = manager.with_approval_handler(Arc::new(move |_cmd, _reason| {
+            flag_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            true
+        }));
+        assert!(custom_mgr.approval_handler.is_some());
+
+        let _ = std::fs::remove_dir_all(&test_root);
+        Ok(())
+    }
+}
