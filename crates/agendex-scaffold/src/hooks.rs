@@ -115,10 +115,11 @@ impl HookDispatcher {
     /// Initializes a new HookDispatcher for the specified workspace.
     pub async fn new(workspace_dir: impl AsRef<Path>) -> anyhow::Result<Self> {
         let ws = workspace_dir.as_ref().to_path_buf();
-        let hooks_dir = ws.join(".agenda").join("hooks");
-
-        // Ensure hooks directory exists
-        let _ = tokio::fs::create_dir_all(&hooks_dir).await;
+        let hooks_dir = if ws.join(".agendex").join("hooks").exists() {
+            ws.join(".agendex").join("hooks")
+        } else {
+            ws.join(".agenda").join("hooks")
+        };
 
         Ok(Self {
             workspace_dir: ws,

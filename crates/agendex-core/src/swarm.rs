@@ -49,6 +49,8 @@ impl SubagentPersona {
             allowed_tools: vec![
                 "read_file".to_string(),
                 "list_directory".to_string(),
+                "glob".to_string(),
+                "grep".to_string(),
                 "send_message".to_string(),
             ],
             model_tier: ModelTier::Standard128k,
@@ -66,6 +68,8 @@ impl SubagentPersona {
                 "write_file".to_string(),
                 "edit_file".to_string(),
                 "list_directory".to_string(),
+                "glob".to_string(),
+                "grep".to_string(),
                 "run_command".to_string(),
                 "send_message".to_string(),
             ],
@@ -84,6 +88,8 @@ impl SubagentPersona {
             allowed_tools: vec![
                 "read_file".to_string(),
                 "list_directory".to_string(),
+                "glob".to_string(),
+                "grep".to_string(),
                 "send_message".to_string(),
             ],
             model_tier: ModelTier::Standard128k,

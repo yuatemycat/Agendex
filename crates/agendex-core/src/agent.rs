@@ -68,24 +68,20 @@ pub struct AgendexAgent {
 
 impl AgendexAgent {
     pub async fn init(config: AgentConfig) -> anyhow::Result<Self> {
-        let agendex_dir = if config.workspace_dir.join(".agendex").exists()
-            || !config.workspace_dir.join(".agenda").exists()
-        {
-            config.workspace_dir.join(".agendex")
-        } else {
-            config.workspace_dir.join(".agenda")
-        };
-        let log_dir = agendex_dir.join("logs").join(&config.session_id);
+        // Initialize SnapshotEngine first (ensures git and state_dir are initialized consistently)
+        let snapshot_engine_raw = SnapshotEngine::new(&config.workspace_dir)?;
+        let state_dir = snapshot_engine_raw.state_dir().to_path_buf();
+        let log_dir = state_dir.join("logs").join(&config.session_id);
         tokio::fs::create_dir_all(&log_dir).await?;
 
-        let task_manager = Arc::new(TaskManager::new(log_dir.join("tasks")));
+        let task_manager = Arc::new(TaskManager::new(state_dir.join("tasks")));
         let tool_registry = Arc::new(ToolRegistry::new(
             config.workspace_dir.clone(),
             Arc::clone(&task_manager),
         ));
         let trajectory = Arc::new(Mutex::new(TrajectoryLogger::new(&log_dir)?));
         let compactor = Arc::new(Mutex::new(CompactorEngine::new(config.model_tier)));
-        let snapshot_engine = Arc::new(Mutex::new(SnapshotEngine::new(&config.workspace_dir)?));
+        let snapshot_engine = Arc::new(Mutex::new(snapshot_engine_raw));
 
         let mut skill_registry = SkillRegistry::new();
         let _ = skill_registry.discover_skills(&config.workspace_dir).await;

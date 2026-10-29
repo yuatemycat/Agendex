@@ -113,6 +113,54 @@ pub struct ManageTaskArgs {
     pub tail_lines: Option<usize>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobArgs {
+    pub pattern: String,
+    pub path: Option<PathBuf>,
+    pub max_results: Option<usize>,
+    #[serde(default)]
+    pub show_hidden: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobResult {
+    pub pattern: String,
+    pub base_path: PathBuf,
+    pub matches: Vec<PathBuf>,
+    pub total_matches: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrepArgs {
+    pub pattern: String,
+    pub path: Option<PathBuf>,
+    pub glob: Option<String>,
+    #[serde(default)]
+    pub case_insensitive: bool,
+    pub max_results: Option<usize>,
+    pub context_lines: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrepMatch {
+    pub path: PathBuf,
+    pub line_number: usize,
+    pub line_content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before_context: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_context: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrepResult {
+    pub pattern: String,
+    pub matches: Vec<GrepMatch>,
+    pub total_matches: usize,
+    pub truncated: bool,
+}
+
 // ============================================================================
 // ToolRegistry
 // ============================================================================
@@ -481,6 +529,200 @@ impl ToolRegistry {
         }
     }
 
+    /// Fast file pattern matching using glob patterns (e.g. '**/*.rs', 'src/**/*.ts'). Respects .gitignore.
+    pub async fn glob(&self, args: GlobArgs) -> Result<GlobResult> {
+        let base_dir = match &args.path {
+            Some(p) => self.resolve_path(p),
+            None => self.workspace_dir.clone(),
+        };
+
+        if !base_dir.exists() {
+            return Err(anyhow!("Path not found: '{}'", base_dir.display()));
+        }
+
+        let glob = globset::GlobBuilder::new(&args.pattern)
+            .literal_separator(true)
+            .build()
+            .or_else(|_| globset::Glob::new(&args.pattern))
+            .with_context(|| format!("Invalid glob pattern: '{}'", args.pattern))?;
+        let matcher = glob.compile_matcher();
+
+        let max_results = args.max_results.unwrap_or(200);
+        let mut matches = Vec::new();
+        let mut truncated = false;
+
+        let mut builder = ignore::WalkBuilder::new(&base_dir);
+        builder
+            .hidden(!args.show_hidden)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true);
+
+        for result in builder.build() {
+            let entry = match result {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                continue;
+            }
+
+            let path = entry.path();
+            let rel_path = path.strip_prefix(&base_dir).unwrap_or(path);
+            let ws_rel_path = path.strip_prefix(&self.workspace_dir).unwrap_or(path);
+
+            let is_match = matcher.is_match(rel_path)
+                || matcher.is_match(entry.file_name())
+                || matcher.is_match(ws_rel_path);
+
+            if is_match {
+                if matches.len() >= max_results {
+                    truncated = true;
+                    break;
+                }
+                matches.push(ws_rel_path.to_path_buf());
+            }
+        }
+
+        let total = matches.len();
+        Ok(GlobResult {
+            pattern: args.pattern,
+            base_path: base_dir,
+            matches,
+            total_matches: total,
+            truncated,
+        })
+    }
+
+    /// Fast regex search across files in the workspace. Skips binary files and respects .gitignore.
+    pub async fn grep(&self, args: GrepArgs) -> Result<GrepResult> {
+        let target_dir = match &args.path {
+            Some(p) => self.resolve_path(p),
+            None => self.workspace_dir.clone(),
+        };
+
+        if !target_dir.exists() {
+            return Err(anyhow!("Path not found: '{}'", target_dir.display()));
+        }
+
+        let re = regex::RegexBuilder::new(&args.pattern)
+            .case_insensitive(args.case_insensitive)
+            .build()
+            .with_context(|| format!("Invalid regex pattern: '{}'", args.pattern))?;
+
+        let glob_matcher = if let Some(g) = &args.glob {
+            let compiled = globset::GlobBuilder::new(g)
+                .literal_separator(true)
+                .build()
+                .or_else(|_| globset::Glob::new(g))
+                .with_context(|| format!("Invalid file filter glob: '{}'", g))?;
+            Some(compiled.compile_matcher())
+        } else {
+            None
+        };
+
+        let max_results = args.max_results.unwrap_or(100);
+        let context_lines = args.context_lines.unwrap_or(0);
+        let mut matches = Vec::new();
+        let mut truncated = false;
+
+        let mut walker_builder = ignore::WalkBuilder::new(&target_dir);
+        walker_builder
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true);
+
+        for result in walker_builder.build() {
+            let entry = match result {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                continue;
+            }
+
+            let path = entry.path();
+
+            if let Some(ref gm) = glob_matcher {
+                let file_name = entry.file_name();
+                let rel = path.strip_prefix(&target_dir).unwrap_or(path);
+                if !gm.is_match(file_name) && !gm.is_match(rel) {
+                    continue;
+                }
+            }
+
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if BINARY_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) {
+                    continue;
+                }
+            }
+
+            let raw_bytes = match tokio::fs::read(path).await {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+
+            let probe_len = raw_bytes.len().min(512);
+            if raw_bytes[..probe_len].contains(&0x00) {
+                continue;
+            }
+
+            let text = String::from_utf8_lossy(&raw_bytes);
+            let lines: Vec<&str> = text.lines().collect();
+
+            let rel_path = path
+                .strip_prefix(&self.workspace_dir)
+                .unwrap_or(path)
+                .to_path_buf();
+
+            for (idx, line) in lines.iter().enumerate() {
+                if re.is_match(line) {
+                    if matches.len() >= max_results {
+                        truncated = true;
+                        break;
+                    }
+
+                    let line_number = idx + 1;
+                    let before_context = if context_lines > 0 {
+                        let start = idx.saturating_sub(context_lines);
+                        Some(lines[start..idx].iter().map(|s| s.to_string()).collect())
+                    } else {
+                        None
+                    };
+
+                    let after_context = if context_lines > 0 {
+                        let end = (idx + 1 + context_lines).min(lines.len());
+                        Some(lines[idx + 1..end].iter().map(|s| s.to_string()).collect())
+                    } else {
+                        None
+                    };
+
+                    matches.push(GrepMatch {
+                        path: rel_path.clone(),
+                        line_number,
+                        line_content: line.to_string(),
+                        before_context,
+                        after_context,
+                    });
+                }
+            }
+
+            if truncated {
+                break;
+            }
+        }
+
+        let total = matches.len();
+        Ok(GrepResult {
+            pattern: args.pattern,
+            matches,
+            total_matches: total,
+            truncated,
+        })
+    }
+
     /// Dispatches dynamic tool execution from JSON-RPC / tool-call payload.
     pub async fn execute_tool(
         &self,
@@ -511,6 +753,16 @@ impl ToolRegistry {
             "manage_task" => {
                 let params: ManageTaskArgs = serde_json::from_value(args)?;
                 self.manage_task(params).await
+            }
+            "glob" => {
+                let params: GlobArgs = serde_json::from_value(args)?;
+                let res = self.glob(params).await?;
+                Ok(serde_json::to_value(res)?)
+            }
+            "grep" => {
+                let params: GrepArgs = serde_json::from_value(args)?;
+                let res = self.grep(params).await?;
+                Ok(serde_json::to_value(res)?)
             }
             other => Err(anyhow!("Unknown tool name: '{}'", other)),
         }
@@ -589,6 +841,36 @@ impl ToolRegistry {
                         "tail_lines": { "type": "integer", "description": "Recent output line count" }
                     },
                     "required": ["action"]
+                }
+            }),
+            json!({
+                "name": "glob",
+                "description": "Fast file pattern matching using glob patterns (e.g. '**/*.rs', 'src/**/*.ts'). Respects .gitignore.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "description": "Glob pattern (e.g. '**/*.rs', '*.json')" },
+                        "path": { "type": "string", "description": "Base directory to search in (defaults to workspace)" },
+                        "max_results": { "type": "integer", "description": "Maximum number of results to return (default 200)" },
+                        "show_hidden": { "type": "boolean", "description": "Include hidden/dot files" }
+                    },
+                    "required": ["pattern"]
+                }
+            }),
+            json!({
+                "name": "grep",
+                "description": "Fast regex search across files in the workspace. Skips binary files and respects .gitignore.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "description": "Regex or substring pattern to search for" },
+                        "path": { "type": "string", "description": "Directory or file to search in (defaults to workspace)" },
+                        "glob": { "type": "string", "description": "Optional glob filter for filenames (e.g. '*.rs', '*.toml')" },
+                        "case_insensitive": { "type": "boolean", "description": "Perform case-insensitive matching" },
+                        "max_results": { "type": "integer", "description": "Maximum matching lines to return (default 100)" },
+                        "context_lines": { "type": "integer", "description": "Number of context lines before and after matches" }
+                    },
+                    "required": ["pattern"]
                 }
             }),
         ]
@@ -836,7 +1118,168 @@ mod tests {
 
         // Definitions
         let defs = registry.list_tool_definitions();
-        assert_eq!(defs.len(), 5);
+        assert_eq!(defs.len(), 7);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_glob_tool() {
+        let tmp = std::env::temp_dir().join(format!(
+            "agendex_glob_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let task_manager = Arc::new(TaskManager::new(tmp.join("tasks")));
+        let registry = ToolRegistry::new(tmp.clone(), task_manager);
+
+        let src_dir = tmp.join("src").join("nested");
+        tokio::fs::create_dir_all(&src_dir).await.unwrap();
+
+        tokio::fs::write(src_dir.join("lib.rs"), "pub fn test() {}\n")
+            .await
+            .unwrap();
+        tokio::fs::write(src_dir.join("main.rs"), "fn main() {}\n")
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.join("Cargo.toml"), "[package]\nname = \"test\"\n")
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.join("README.md"), "# Title\n")
+            .await
+            .unwrap();
+
+        // 1. Glob matching all .rs files
+        let rs_res = registry
+            .glob(GlobArgs {
+                pattern: "**/*.rs".to_string(),
+                path: None,
+                max_results: None,
+                show_hidden: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rs_res.total_matches, 2);
+        assert!(rs_res.matches.iter().any(|p| p.ends_with("lib.rs")));
+        assert!(rs_res.matches.iter().any(|p| p.ends_with("main.rs")));
+
+        // 2. Glob matching .toml files
+        let toml_res = registry
+            .glob(GlobArgs {
+                pattern: "*.toml".to_string(),
+                path: None,
+                max_results: None,
+                show_hidden: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(toml_res.total_matches, 1);
+        assert!(toml_res.matches[0].ends_with("Cargo.toml"));
+
+        // 3. Glob dispatched via execute_tool
+        let exec_val = registry
+            .execute_tool("glob", json!({ "pattern": "*.md" }))
+            .await
+            .unwrap();
+        assert_eq!(exec_val["total_matches"], 1);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_grep_tool() {
+        let tmp = std::env::temp_dir().join(format!(
+            "agendex_grep_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let task_manager = Arc::new(TaskManager::new(tmp.join("tasks")));
+        let registry = ToolRegistry::new(tmp.clone(), task_manager);
+
+        let src_dir = tmp.join("src");
+        tokio::fs::create_dir_all(&src_dir).await.unwrap();
+
+        let file1 = src_dir.join("app.rs");
+        tokio::fs::write(
+            &file1,
+            "// Line 1\nlet target_var = 42;\n// Line 3\nlet other_var = 100;\n",
+        )
+        .await
+        .unwrap();
+
+        let file2 = tmp.join("README.md");
+        tokio::fs::write(
+            &file2,
+            "# Documentation\nContains TARGET_VAR in uppercase.\n",
+        )
+        .await
+        .unwrap();
+
+        // 1. Exact case grep
+        let grep_res = registry
+            .grep(GrepArgs {
+                pattern: "target_var".to_string(),
+                path: None,
+                glob: None,
+                case_insensitive: false,
+                max_results: None,
+                context_lines: Some(1),
+            })
+            .await
+            .unwrap();
+        assert_eq!(grep_res.total_matches, 1);
+        assert_eq!(grep_res.matches[0].line_number, 2);
+        assert!(grep_res.matches[0]
+            .line_content
+            .contains("let target_var = 42;"));
+        assert_eq!(
+            grep_res.matches[0].before_context.as_deref(),
+            Some(&["// Line 1".to_string()][..])
+        );
+        assert_eq!(
+            grep_res.matches[0].after_context.as_deref(),
+            Some(&["// Line 3".to_string()][..])
+        );
+
+        // 2. Case-insensitive grep across all files
+        let grep_ci = registry
+            .grep(GrepArgs {
+                pattern: "target_var".to_string(),
+                path: None,
+                glob: None,
+                case_insensitive: true,
+                max_results: None,
+                context_lines: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(grep_ci.total_matches, 2);
+
+        // 3. Glob filtered grep
+        let grep_filtered = registry
+            .grep(GrepArgs {
+                pattern: "target_var".to_string(),
+                path: None,
+                glob: Some("*.rs".to_string()),
+                case_insensitive: true,
+                max_results: None,
+                context_lines: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(grep_filtered.total_matches, 1);
+        assert!(grep_filtered.matches[0].path.ends_with("app.rs"));
+
+        // 4. Executed via JSON tool dispatch
+        let json_exec = registry
+            .execute_tool(
+                "grep",
+                json!({
+                    "pattern": "TARGET_VAR",
+                    "case_insensitive": false
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json_exec["total_matches"], 1);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

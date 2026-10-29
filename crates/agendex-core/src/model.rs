@@ -125,6 +125,36 @@ pub struct ModelResponse {
     pub completion_tokens: usize,
 }
 
+/// Resolves endpoint URL for OpenAI wire format, avoiding double `/v1/v1`.
+pub fn resolve_openai_endpoint(base: &str) -> String {
+    let base_trimmed = base.trim_end_matches('/');
+    if base_trimmed.ends_with("/v1") {
+        format!("{base_trimmed}/chat/completions")
+    } else {
+        format!("{base_trimmed}/v1/chat/completions")
+    }
+}
+
+/// Resolves endpoint URL for Anthropic wire format, avoiding double `/v1/v1`.
+pub fn resolve_anthropic_endpoint(base: &str) -> String {
+    let base_trimmed = base.trim_end_matches('/');
+    if base_trimmed.ends_with("/v1") {
+        format!("{base_trimmed}/messages")
+    } else {
+        format!("{base_trimmed}/v1/messages")
+    }
+}
+
+/// Resolves endpoint URL for Google Gemini wire format, avoiding double `/v1beta/v1beta`.
+pub fn resolve_gemini_endpoint(base: &str, model: &str, api_key: &str) -> String {
+    let base_trimmed = base.trim_end_matches('/');
+    if base_trimmed.ends_with("/v1beta") {
+        format!("{base_trimmed}/models/{model}:generateContent?key={api_key}")
+    } else {
+        format!("{base_trimmed}/v1beta/models/{model}:generateContent?key={api_key}")
+    }
+}
+
 pub struct ModelClient {
     client: reqwest::Client,
     pub config: ModelConfig,
@@ -160,12 +190,7 @@ impl ModelClient {
             .base_url
             .as_deref()
             .unwrap_or("https://generativelanguage.googleapis.com");
-        let url = format!(
-            "{}/v1beta/models/{}:generateContent?key={}",
-            base.trim_end_matches('/'),
-            self.config.model_name,
-            self.config.api_key
-        );
+        let url = resolve_gemini_endpoint(base, &self.config.model_name, &self.config.api_key);
 
         let mut system_parts = Vec::new();
         let mut contents = Vec::new();
@@ -314,7 +339,7 @@ impl ModelClient {
             .base_url
             .as_deref()
             .unwrap_or("https://api.openai.com");
-        let url = format!("{}/v1/chat/completions", base.trim_end_matches('/'));
+        let url = resolve_openai_endpoint(base);
 
         let mut payload_messages = Vec::new();
         for msg in messages {
@@ -433,7 +458,7 @@ impl ModelClient {
             .base_url
             .as_deref()
             .unwrap_or("https://api.anthropic.com");
-        let url = format!("{}/v1/messages", base.trim_end_matches('/'));
+        let url = resolve_anthropic_endpoint(base);
 
         let mut system_prompt = String::new();
         let mut anthropic_messages = Vec::new();
@@ -583,5 +608,68 @@ impl ModelClient {
             prompt_tokens,
             completion_tokens,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_openai_endpoint_v1_handling() {
+        // When provider base URL ends with /v1
+        assert_eq!(
+            resolve_openai_endpoint("https://integrate.api.nvidia.com/v1"),
+            "https://integrate.api.nvidia.com/v1/chat/completions"
+        );
+        assert_eq!(
+            resolve_openai_endpoint("https://integrate.api.nvidia.com/v1/"),
+            "https://integrate.api.nvidia.com/v1/chat/completions"
+        );
+        // When provider base URL does not have /v1
+        assert_eq!(
+            resolve_openai_endpoint("https://api.openai.com"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            resolve_openai_endpoint("https://api.openai.com/"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            resolve_openai_endpoint("http://localhost:11434/v1"),
+            "http://localhost:11434/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_resolve_anthropic_endpoint_v1_handling() {
+        assert_eq!(
+            resolve_anthropic_endpoint("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            resolve_anthropic_endpoint("https://api.anthropic.com"),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn test_resolve_gemini_endpoint_v1beta_handling() {
+        assert_eq!(
+            resolve_gemini_endpoint(
+                "https://generativelanguage.googleapis.com/v1beta",
+                "gemini-2.5-flash",
+                "fake_key"
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=fake_key"
+        );
+        assert_eq!(
+            resolve_gemini_endpoint(
+                "https://generativelanguage.googleapis.com",
+                "gemini-2.5-flash",
+                "fake_key"
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=fake_key"
+        );
     }
 }

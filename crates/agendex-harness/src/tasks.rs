@@ -244,9 +244,7 @@ impl TaskManager {
         summary: Option<&str>,
     ) -> Result<RunCommandResult> {
         if is_host_power_invocation(command) {
-            return Err(anyhow!(
-                "refused to spawn host power command: {command}"
-            ));
+            return Err(anyhow!("refused to spawn host power command: {command}"));
         }
 
         let task_id = format!("task-{}", uuid::Uuid::new_v4().simple());
@@ -736,7 +734,8 @@ mod tests {
             .await
             .expect_err("refused command must not spawn");
         assert!(
-            err.to_string().contains("refused to spawn host power command"),
+            err.to_string()
+                .contains("refused to spawn host power command"),
             "{err}"
         );
         let _ = std::fs::remove_dir_all(&tmp);

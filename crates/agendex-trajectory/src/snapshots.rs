@@ -4,6 +4,64 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 use tokio::process::Command;
 
+/// Resolves the dedicated Agendex state directory for a workspace.
+///
+/// Priority:
+/// 1. `AGENDEX_STATE_DIR` environment variable if set.
+/// 2. If `.git` exists in `workspace_dir` (as a directory or gitdir pointer), stores under `.git/agendex/`.
+/// 3. Otherwise, stores under the user's home folder: `~/.agendex/workspaces/<sanitized-name>-<hash>/`.
+pub fn state_dir_for_workspace(workspace_dir: &Path) -> PathBuf {
+    if let Ok(custom) = std::env::var("AGENDEX_STATE_DIR") {
+        if !custom.trim().is_empty() {
+            return PathBuf::from(custom.trim());
+        }
+    }
+
+    let git_path = workspace_dir.join(".git");
+    if git_path.is_dir() {
+        return git_path.join("agendex");
+    }
+
+    if git_path.is_file() {
+        if let Ok(content) = std::fs::read_to_string(&git_path) {
+            if let Some(rest) = content.trim().strip_prefix("gitdir:") {
+                let p = rest.trim();
+                let real_git_dir = if Path::new(p).is_absolute() {
+                    PathBuf::from(p)
+                } else {
+                    workspace_dir.join(p)
+                };
+                return real_git_dir.join("agendex");
+            }
+        }
+        return git_path.join("agendex");
+    }
+
+    // Fall back to home folder
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+
+    use std::hash::{Hash, Hasher};
+    let canonical = workspace_dir
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_dir.to_path_buf());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical.to_string_lossy().hash(&mut hasher);
+    let hash_val = format!("{:012x}", hasher.finish());
+
+    let folder_name = canonical
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace");
+
+    home.join(".agendex")
+        .join("workspaces")
+        .join(format!("{folder_name}-{hash_val}"))
+}
+
 /// Record representing a workspace tree snapshot at a discrete point in time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SnapshotRecord {
@@ -18,6 +76,9 @@ pub struct SnapshotRecord {
 /// Git workspace time-travel engine using lightweight Git tree hashing (`git write-tree`).
 pub struct SnapshotEngine {
     workspace_dir: PathBuf,
+    state_dir: PathBuf,
+    index_file: PathBuf,
+    snapshots_file: PathBuf,
     snapshots: Vec<SnapshotRecord>,
     git_initialized: bool,
 }
@@ -31,6 +92,9 @@ impl SnapshotEngine {
 
         let mut engine = Self {
             workspace_dir,
+            state_dir: PathBuf::new(),
+            index_file: PathBuf::new(),
+            snapshots_file: PathBuf::new(),
             snapshots: Vec::new(),
             git_initialized,
         };
@@ -40,7 +104,76 @@ impl SnapshotEngine {
             engine.init_git_sync()?;
         }
 
+        let state_dir = state_dir_for_workspace(&engine.workspace_dir);
+        engine.init_state_dir(state_dir)?;
+
         Ok(engine)
+    }
+
+    /// Initialize a new snapshot engine with a specific state directory.
+    pub fn new_with_state_dir(
+        workspace_dir: impl AsRef<Path>,
+        state_dir: impl AsRef<Path>,
+    ) -> anyhow::Result<Self> {
+        let workspace_dir = workspace_dir.as_ref().to_path_buf();
+        let git_dir = workspace_dir.join(".git");
+        let git_initialized = git_dir.exists();
+
+        let mut engine = Self {
+            workspace_dir,
+            state_dir: PathBuf::new(),
+            index_file: PathBuf::new(),
+            snapshots_file: PathBuf::new(),
+            snapshots: Vec::new(),
+            git_initialized,
+        };
+
+        if !engine.git_initialized {
+            engine.init_git_sync()?;
+        }
+
+        engine.init_state_dir(state_dir.as_ref().to_path_buf())?;
+
+        Ok(engine)
+    }
+
+    /// Configure state directory, isolated index path, and load persistent snapshots from disk.
+    fn init_state_dir(&mut self, state_dir: PathBuf) -> anyhow::Result<()> {
+        std::fs::create_dir_all(&state_dir)?;
+        self.index_file = state_dir.join("index");
+        self.snapshots_file = state_dir.join("snapshots.json");
+        self.state_dir = state_dir;
+
+        if self.snapshots_file.is_file() {
+            if let Ok(data) = std::fs::read_to_string(&self.snapshots_file) {
+                if let Ok(records) = serde_json::from_str::<Vec<SnapshotRecord>>(&data) {
+                    self.snapshots = records;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Persist in-memory snapshot records to disk so `/revert` works across CLI invocations.
+    pub fn save_snapshots_to_disk(&self) -> anyhow::Result<()> {
+        if !self.snapshots_file.as_os_str().is_empty() {
+            if let Some(parent) = self.snapshots_file.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let data = serde_json::to_string_pretty(&self.snapshots)?;
+            std::fs::write(&self.snapshots_file, data)?;
+        }
+        Ok(())
+    }
+
+    /// Path to the dedicated state directory.
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    /// Path to the isolated index file used to prevent modifying user's real `.git/index`.
+    pub fn index_file(&self) -> &Path {
+        &self.index_file
     }
 
     /// Synchronously initialize a local git repository in workspace if needed.
@@ -86,21 +219,23 @@ impl SnapshotEngine {
     ) -> anyhow::Result<SnapshotRecord> {
         self.ensure_git_ready().await?;
 
-        // 1. Stage all working tree files (git add -A)
-        let add_out = Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(&self.workspace_dir)
-            .output()
-            .await?;
-        Self::check_output(&add_out, "git add -A")?;
+        // 1. Stage working tree files using isolated index (NEVER modifying user's real .git/index)
+        let mut cmd = Command::new("git");
+        cmd.args(["add", "-A"]).current_dir(&self.workspace_dir);
+        if !self.index_file.as_os_str().is_empty() {
+            cmd.env("GIT_INDEX_FILE", &self.index_file);
+        }
+        let add_out = cmd.output().await?;
+        Self::check_output(&add_out, "git add -A (isolated index)")?;
 
-        // 2. Compute the lightweight tree hash (git write-tree)
-        let write_tree_out = Command::new("git")
-            .arg("write-tree")
-            .current_dir(&self.workspace_dir)
-            .output()
-            .await?;
-        Self::check_output(&write_tree_out, "git write-tree")?;
+        // 2. Compute lightweight tree hash from isolated index (git write-tree)
+        let mut wt_cmd = Command::new("git");
+        wt_cmd.arg("write-tree").current_dir(&self.workspace_dir);
+        if !self.index_file.as_os_str().is_empty() {
+            wt_cmd.env("GIT_INDEX_FILE", &self.index_file);
+        }
+        let write_tree_out = wt_cmd.output().await?;
+        Self::check_output(&write_tree_out, "git write-tree (isolated index)")?;
 
         let tree_hash = String::from_utf8_lossy(&write_tree_out.stdout)
             .trim()
@@ -121,6 +256,8 @@ impl SnapshotEngine {
         };
 
         self.snapshots.push(record.clone());
+        let _ = self.save_snapshots_to_disk();
+
         tracing::debug!(
             "Captured workspace snapshot [{}] hash={}",
             record.label,
@@ -167,21 +304,27 @@ impl SnapshotEngine {
                 )
             })?;
 
-        // 1. Reset index and working directory to the tree snapshot (git read-tree -u --reset <tree_hash>)
-        let read_out = Command::new("git")
+        // 1. Reset isolated index and working directory to the tree snapshot (git read-tree -u --reset <tree_hash>)
+        let mut read_cmd = Command::new("git");
+        read_cmd
             .args(["read-tree", "-u", "--reset", &record.tree_hash])
-            .current_dir(&self.workspace_dir)
-            .output()
-            .await?;
+            .current_dir(&self.workspace_dir);
+        if !self.index_file.as_os_str().is_empty() {
+            read_cmd.env("GIT_INDEX_FILE", &self.index_file);
+        }
+        let read_out = read_cmd.output().await?;
         Self::check_output(&read_out, "git read-tree -u --reset")?;
 
-        // 2. Remove untracked files that were introduced after the snapshot was taken (git clean -fd)
-        let clean_out = Command::new("git")
+        // 2. Remove untracked files introduced after snapshot was taken (git clean -fd)
+        let mut clean_cmd = Command::new("git");
+        clean_cmd
             .args(["clean", "-fd"])
-            .current_dir(&self.workspace_dir)
-            .output()
-            .await?;
-        Self::check_output(&clean_out, "git clean -fd")?;
+            .current_dir(&self.workspace_dir);
+        if !self.index_file.as_os_str().is_empty() {
+            clean_cmd.env("GIT_INDEX_FILE", &self.index_file);
+        }
+        let clean_out = clean_cmd.output().await?;
+        Self::check_output(&clean_out, "git clean -fd (isolated index)")?;
 
         tracing::info!(
             "Workspace successfully rolled back to snapshot [{}] tree_hash={}",
@@ -220,13 +363,16 @@ impl SnapshotEngine {
                 )
             })?;
 
-        let diff_out = Command::new("git")
+        let mut diff_cmd = Command::new("git");
+        diff_cmd
             .args(["diff", &record.tree_hash])
-            .current_dir(&self.workspace_dir)
-            .output()
-            .await?;
+            .current_dir(&self.workspace_dir);
+        if !self.index_file.as_os_str().is_empty() {
+            diff_cmd.env("GIT_INDEX_FILE", &self.index_file);
+        }
+        let diff_out = diff_cmd.output().await?;
 
-        Self::check_output(&diff_out, "git diff")?;
+        Self::check_output(&diff_out, "git diff (isolated index)")?;
         Ok(String::from_utf8_lossy(&diff_out.stdout).to_string())
     }
 
@@ -240,6 +386,10 @@ impl SnapshotEngine {
                 .await?;
             if status.success() {
                 self.git_initialized = true;
+                if self.state_dir.as_os_str().is_empty() {
+                    let state_dir = state_dir_for_workspace(&self.workspace_dir);
+                    self.init_state_dir(state_dir)?;
+                }
             } else {
                 anyhow::bail!(
                     "git init failed in workspace: {}",
@@ -290,9 +440,10 @@ impl SnapshotEngine {
         self.snapshots.len()
     }
 
-    /// Clear in-memory snapshot history.
+    /// Clear in-memory snapshot history and update disk storage.
     pub fn clear_history(&mut self) {
         self.snapshots.clear();
+        let _ = self.save_snapshots_to_disk();
     }
 }
 
@@ -389,6 +540,99 @@ mod tests {
         // Rollback non-existent label fails cleanly
         let err = engine.rollback("non_existent_label").await;
         assert!(err.is_err());
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_disk_persistence_and_isolated_index() -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "agendex_test_snap_persist_{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&temp_dir).await?;
+
+        // 1. Initialize repo with a committed file
+        let mut engine1 = SnapshotEngine::new(&temp_dir)?;
+        let file1 = temp_dir.join("tracked.txt");
+        tokio::fs::write(&file1, "Initial tracked content\n").await?;
+
+        // 2. Stage a user file in real git index
+        let user_staged = temp_dir.join("user_staged.txt");
+        tokio::fs::write(&user_staged, "User explicitly staged this\n").await?;
+        let stage_out = Command::new("git")
+            .args(["add", "user_staged.txt"])
+            .current_dir(&temp_dir)
+            .output()
+            .await?;
+        assert!(stage_out.status.success());
+
+        // Check real git status before snapshot
+        let status_pre = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&temp_dir)
+            .output()
+            .await?;
+        let status_pre_str = String::from_utf8_lossy(&status_pre.stdout).to_string();
+        assert!(status_pre_str.contains("A  user_staged.txt"));
+        assert!(status_pre_str.contains("?? tracked.txt"));
+
+        // 3. Engine captures snapshot (MUST NOT stage tracked.txt into real git index)
+        let snap1 = engine1.capture_snapshot("turn-1").await?;
+        assert_eq!(snap1.label, "turn-1");
+
+        // Real git status MUST still have tracked.txt as untracked in real index
+        let status_post = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&temp_dir)
+            .output()
+            .await?;
+        let status_post_str = String::from_utf8_lossy(&status_post.stdout).to_string();
+        assert_eq!(
+            status_pre_str, status_post_str,
+            "Real git status must not be modified by snapshot capture"
+        );
+
+        // 4. Verify snapshots.json was written to disk
+        let snapshots_json = engine1.state_dir().join("snapshots.json");
+        assert!(snapshots_json.exists(), "snapshots.json must exist on disk");
+
+        // 5. Drop engine1, simulate a subsequent -p or resumed session with engine2
+        drop(engine1);
+        let mut engine2 = SnapshotEngine::new(&temp_dir)?;
+        assert_eq!(
+            engine2.snapshot_count(),
+            1,
+            "engine2 must reload snapshots from disk"
+        );
+        assert_eq!(engine2.latest_snapshot().unwrap().id, snap1.id);
+
+        // 6. Mutate file and rollback via engine2
+        tokio::fs::write(&file1, "Corrupted by agent\n").await?;
+        let bad_file = temp_dir.join("agent_garbage.tmp");
+        tokio::fs::write(&bad_file, "garbage\n").await?;
+
+        let rolled = engine2.rollback_latest().await?;
+        assert_eq!(rolled.id, snap1.id);
+
+        assert_eq!(
+            tokio::fs::read_to_string(&file1)
+                .await?
+                .replace("\r\n", "\n"),
+            "Initial tracked content\n"
+        );
+        assert!(!bad_file.exists(), "agent_garbage.tmp must be cleaned");
+
+        // Real user staged file is still preserved
+        let status_after_revert = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&temp_dir)
+            .output()
+            .await?;
+        let status_after_revert_str =
+            String::from_utf8_lossy(&status_after_revert.stdout).to_string();
+        assert!(status_after_revert_str.contains("A  user_staged.txt"));
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
         Ok(())

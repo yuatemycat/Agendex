@@ -164,6 +164,71 @@ exit            # Exit the interactive session
 
 ---
 
-## 6. License
+## 6. Live Benchmark: Autonomous Bug Discovery & Self-Correction
+
+The following is an end-to-end run showing Agendex pointed at a Rust crate with a failing unit test. The agent autonomously inspected the repository, ran the test suite, diagnosed the off-by-one bug, patched the source file, and verified the fix.
+
+| Metric | Measurement |
+| :--- | :--- |
+| **Model** | `nvidia/nemotron-3.5-lightning-30b-a3b` via NVIDIA NIM (OpenAI wire format) |
+| **Agendex** | `main` |
+| **Fixture** | Rust crate (`src/lib.rs`, `src/config.rs`, `src/net.rs`) with 1 failing unit test |
+| **Performance** | 11 seconds wall time, 6 model turns, 9 tool calls |
+
+### The Command
+
+```bash
+agendex --format openai \
+  --base-url https://integrate.api.nvidia.com/v1 \
+  --model nvidia/nemotron-3.5-lightning-30b-a3b \
+  --api-key "$NVIDIA_API_KEY" -y \
+  -p "The test suite fails (cargo test). Find the bug, fix it, and run the tests to confirm they pass."
+```
+
+### The Bug
+
+```rust
+/// Sum of integers 1..=n
+pub fn sum_to(n: u32) -> u32 {
+    (1..n).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn sums() {
+        assert_eq!(sum_to(4), 10);
+    }
+}
+```
+
+### Autonomous Execution Trajectory
+
+1. **`list_directory`**: Scans the workspace structure.
+2. **`read_file`**: Batches reads across `Cargo.toml`, `src/lib.rs`, `src/net.rs`, and `src/config.rs`.
+3. **`run_command`**: Runs `cargo test` (exit code 101, assertion failure `left == 6, right == 10`).
+4. **Diagnosis**: Identifies that `(1..n)` is an exclusive range summing to 6 instead of 10.
+5. **`edit_file`**: Surgically rewrites `(1..n).sum()` to `(1..=n).sum()` in `src/lib.rs`.
+6. **`run_command`**: Verifies with `cargo test` (exit code 0, all tests pass).
+
+```diff
+-    (1..n).sum()
++    (1..=n).sum()
+```
+
+### Resumed Turn: Memory Across CLI Invocations
+
+When resumed with `agendex --conversation <session-id>`:
+> *"Without using any tools: what file did you change in the previous turn, and what exactly did you change?"*
+
+Agendex answers directly from its reloaded trajectory memory:
+> *"In the previous turn I changed `src/lib.rs`. The exact edit was replacing the range `(1..n)` with `(1..=n)` on the line that computes the sum."*
+
+Every action is persisted in `.git/agendex/logs/<session-id>/trajectory.jsonl` (compact) and `trajectory_full.jsonl` (lossless audit log), with workspace time-travel snapshots stored in `.git/agendex/snapshots.json`.
+
+---
+
+## 7. License
 
 Apache 2.0 / MIT Dual License.
