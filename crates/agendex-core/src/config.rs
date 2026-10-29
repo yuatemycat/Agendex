@@ -147,13 +147,23 @@ impl AgendexConfigFile {
             .or_else(|| self.agent.as_ref().and_then(|a| a.auto_approve_risky))
     }
 
-    /// Saves the current configuration file representation to a file on disk.
+    /// Saves the current configuration file representation to a file on disk with restrictive permissions.
     pub fn save_to_disk(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
         }
         let toml_str = toml::to_string_pretty(self)?;
         std::fs::write(path, toml_str)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
         Ok(())
     }
 
@@ -339,10 +349,17 @@ pub fn parse_tier_string(val: &str) -> ModelTier {
     }
 }
 
-/// Returns the standard path to `~/.agendex/config.toml`.
+/// Returns the standard path to `~/.agendex/config.toml`, honoring `AGENDEX_CONFIG` or `AGENDEX_CONFIG_PATH` overrides.
 pub fn default_config_path() -> Option<PathBuf> {
     if let Ok(override_path) = std::env::var("AGENDEX_CONFIG") {
-        return Some(PathBuf::from(override_path));
+        if !override_path.trim().is_empty() {
+            return Some(PathBuf::from(override_path));
+        }
+    }
+    if let Ok(override_path) = std::env::var("AGENDEX_CONFIG_PATH") {
+        if !override_path.trim().is_empty() {
+            return Some(PathBuf::from(override_path));
+        }
     }
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
@@ -474,9 +491,9 @@ pub fn ensure_default_config_exists() -> Option<PathBuf> {
     Some(path)
 }
 
-/// Loads the default config from `~/.agendex/config.toml` if it exists.
+/// Loads the default config from `~/.agendex/config.toml` if it exists, without creating it if missing.
 pub fn load_default_config() -> Option<AgendexConfigFile> {
-    let path = ensure_default_config_exists()?;
+    let path = default_config_path()?;
     if path.exists() {
         match load_config_from_path(&path) {
             Ok(cfg) => Some(cfg),

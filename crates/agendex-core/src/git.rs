@@ -144,10 +144,10 @@ pub async fn commit_task_changes(
                 add_cmd.arg(f);
             }
         } else {
-            add_cmd.args(["add", "--all"]);
+            add_cmd.args(["add", "-u"]);
         }
     } else {
-        add_cmd.args(["add", "--all"]);
+        add_cmd.args(["add", "-u"]);
     }
 
     let add_out = add_cmd
@@ -304,6 +304,23 @@ mod tests {
         assert_eq!(c2.files_changed.len(), 2);
         assert!(!c2.files_changed.contains(&"user_unrelated.txt".to_string()));
         assert!(c2.message.contains("add new feature file"));
+
+        // 6. When target_files is None, stages tracked updates only without committing untracked files
+        std::fs::write(tmp.join("README.md"), "# Updated again").unwrap();
+        let res3 = commit_task_changes(&tmp, "tracked update only", None)
+            .await
+            .unwrap();
+        assert!(res3.is_some());
+        let c3 = res3.unwrap();
+        assert_eq!(c3.files_changed, vec!["README.md".to_string()]);
+        assert!(!c3.files_changed.contains(&"user_unrelated.txt".to_string()));
+
+        // Verify user_unrelated.txt is still untracked
+        let uncommitted = get_uncommitted_files(&tmp).await.unwrap();
+        assert!(
+            uncommitted.iter().any(|f| f.contains("user_unrelated.txt")),
+            "Untracked file must remain untracked"
+        );
 
         // Verify git config user.name was NOT written into the local repo
         let local_config = std::fs::read_to_string(tmp.join(".git").join("config")).unwrap();

@@ -477,13 +477,15 @@ impl SharedApprovalQueue {
 
     /// Temporarily pauses the background console reader so interactive menus have exclusive terminal access.
     pub fn pause(&self) {
-        self.is_paused.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.is_paused
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         std::thread::sleep(std::time::Duration::from_millis(60));
     }
 
     /// Resumes the background console reader.
     pub fn resume(&self) {
-        self.is_paused.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.is_paused
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Asynchronously wait for user approval ticket without blocking the async runtime

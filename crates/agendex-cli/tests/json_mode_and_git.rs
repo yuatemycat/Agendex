@@ -59,6 +59,7 @@ async fn test_headless_json_event_stream_and_git_commit() {
 
     // 4. Modify a file in workspace and test automated git commit
     std::fs::write(tmp.join("solution.rs"), "pub fn solution() -> i32 { 42 }\n").unwrap();
+    agent.record_touched_file("solution.rs").await;
     let commit_res = agent
         .commit_workspace_changes("feat: add solution")
         .await

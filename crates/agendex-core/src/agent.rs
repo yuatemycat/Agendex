@@ -227,7 +227,9 @@ impl AgendexAgent {
             token_stream_handler: None,
             touched_files: Arc::new(Mutex::new(std::collections::HashSet::new())),
             streamed_tokens_in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            auto_approve_yolo: Arc::new(std::sync::atomic::AtomicBool::new(config.auto_approve_risky)),
+            auto_approve_yolo: Arc::new(std::sync::atomic::AtomicBool::new(
+                config.auto_approve_risky,
+            )),
         })
     }
 
@@ -259,7 +261,9 @@ impl AgendexAgent {
 
     pub async fn request_diff_approval(&self, path: &str, diff: &str) -> bool {
         if self.config.auto_approve_risky
-            || self.auto_approve_yolo.load(std::sync::atomic::Ordering::SeqCst)
+            || self
+                .auto_approve_yolo
+                .load(std::sync::atomic::Ordering::SeqCst)
         {
             return true;
         }
@@ -297,6 +301,12 @@ impl AgendexAgent {
         if let Some(handler) = &self.event_handler {
             handler(&event);
         }
+    }
+
+    /// Explicitly records a file path as touched by the agent during this session.
+    pub async fn record_touched_file(&self, path: impl AsRef<std::path::Path>) {
+        let p_str = path.as_ref().to_string_lossy().replace('\\', "/");
+        self.touched_files.lock().await.insert(p_str);
     }
 
     pub async fn commit_workspace_changes(
@@ -477,9 +487,12 @@ impl AgendexAgent {
                     return Ok(self.handle_config_command());
                 }
                 "/yolo" => {
-                    let cur = self.auto_approve_yolo.load(std::sync::atomic::Ordering::SeqCst);
+                    let cur = self
+                        .auto_approve_yolo
+                        .load(std::sync::atomic::Ordering::SeqCst);
                     let nxt = !cur;
-                    self.auto_approve_yolo.store(nxt, std::sync::atomic::Ordering::SeqCst);
+                    self.auto_approve_yolo
+                        .store(nxt, std::sync::atomic::Ordering::SeqCst);
                     if nxt {
                         return Ok("⚡ YOLO mode ENABLED: commands and file edits will execute without interactive approval prompts.".to_string());
                     } else {
@@ -494,10 +507,39 @@ impl AgendexAgent {
                 }
                 "/compact" => {
                     let mut comp = self.compactor.lock().await;
-                    let summary =
-                        comp.generate_continuation_summary("Manual context compaction triggered.");
+                    let mut history = self.history.lock().await;
+                    let before_count = history.len();
+                    let summary = comp.generate_continuation_summary(if rest_args.is_empty() {
+                        "Manual context compaction triggered."
+                    } else {
+                        rest_args
+                    });
+                    comp.grant_immunity(1);
+
+                    let safe_cut = find_safe_compaction_boundary(&history, 4);
+                    let evicted_count = if safe_cut > 2 && safe_cut < history.len() {
+                        let mut compacted = Vec::new();
+                        compacted.push(history[0].clone()); // system prompt
+                        if history.len() > 1 {
+                            compacted.push(history[1].clone()); // initial user prompt
+                        }
+                        compacted.push(ChatMessage::system(format!(
+                            "[Context Compaction Anchor]\n{}",
+                            summary
+                        )));
+                        compacted.extend_from_slice(&history[safe_cut..]);
+                        let evicted = history.len().saturating_sub(compacted.len());
+                        *history = compacted;
+                        evicted
+                    } else {
+                        0
+                    };
+
                     return Ok(format!(
-                        "Context compacted.\n\nContinuation Summary:\n{}",
+                        "Context compacted successfully.\n• Messages before: {}\n• Messages retained: {}\n• Evicted: {}\n\nContinuation Anchor:\n{}",
+                        before_count,
+                        history.len(),
+                        evicted_count,
                         summary
                     ));
                 }
@@ -839,6 +881,8 @@ impl AgendexAgent {
                 }
 
                 // Record turn token consumption & cost accounting in Trajectory
+                let has_known =
+                    agendex_trajectory::is_known_pricing_model(&self.config.model.model_name);
                 let est_cost = agendex_trajectory::estimate_cost(
                     &self.config.model.model_name,
                     turn_prompt_tokens,
@@ -851,6 +895,7 @@ impl AgendexAgent {
                         turn_prompt_tokens,
                         turn_completion_tokens,
                         est_cost,
+                        has_known,
                     );
                 }
 
@@ -862,6 +907,7 @@ impl AgendexAgent {
         }
 
         // Record token usage if maximum iterations reached
+        let has_known = agendex_trajectory::is_known_pricing_model(&self.config.model.model_name);
         let est_cost = agendex_trajectory::estimate_cost(
             &self.config.model.model_name,
             turn_prompt_tokens,
@@ -874,6 +920,7 @@ impl AgendexAgent {
                 turn_prompt_tokens,
                 turn_completion_tokens,
                 est_cost,
+                has_known,
             );
         }
 
@@ -1295,19 +1342,40 @@ impl AgendexAgent {
                     }
                 }
 
-                let pre_cmd_untracked = if tc.name == "run_command" {
-                    let out = tokio::process::Command::new("git")
+                let pre_cmd_state = if tc.name == "run_command" {
+                    let out_untracked = tokio::process::Command::new("git")
                         .args(["ls-files", "--others", "--exclude-standard"])
                         .current_dir(&self.config.workspace_dir)
                         .output()
                         .await;
-                    out.ok().map(|o| {
-                        String::from_utf8_lossy(&o.stdout)
-                            .lines()
-                            .map(|l| l.trim().replace('\\', "/"))
-                            .filter(|l| !l.is_empty())
-                            .collect::<Vec<String>>()
-                    })
+                    let untracked = out_untracked
+                        .ok()
+                        .map(|o| {
+                            String::from_utf8_lossy(&o.stdout)
+                                .lines()
+                                .map(|l| l.trim().replace('\\', "/"))
+                                .filter(|l| !l.is_empty())
+                                .collect::<Vec<String>>()
+                        })
+                        .unwrap_or_default();
+
+                    let out_modified = tokio::process::Command::new("git")
+                        .args(["diff", "--name-only"])
+                        .current_dir(&self.config.workspace_dir)
+                        .output()
+                        .await;
+                    let modified = out_modified
+                        .ok()
+                        .map(|o| {
+                            String::from_utf8_lossy(&o.stdout)
+                                .lines()
+                                .map(|l| l.trim().replace('\\', "/"))
+                                .filter(|l| !l.is_empty())
+                                .collect::<Vec<String>>()
+                        })
+                        .unwrap_or_default();
+
+                    Some((untracked, modified))
                 } else {
                     None
                 };
@@ -1317,19 +1385,34 @@ impl AgendexAgent {
                     .execute_tool(&tc.name, tc.arguments.clone())
                     .await;
 
-                if let Some(pre_files) = pre_cmd_untracked {
-                    let post_out = tokio::process::Command::new("git")
+                if let Some((pre_untracked, pre_modified)) = pre_cmd_state {
+                    let post_untracked_out = tokio::process::Command::new("git")
                         .args(["ls-files", "--others", "--exclude-standard"])
                         .current_dir(&self.config.workspace_dir)
                         .output()
                         .await;
-                    if let Ok(o) = post_out {
+                    if let Ok(o) = post_untracked_out {
                         let mut snap = self.snapshot_engine.lock().await;
                         let mut touched = self.touched_files.lock().await;
                         for line in String::from_utf8_lossy(&o.stdout).lines() {
                             let trimmed = line.trim().replace('\\', "/");
-                            if !trimmed.is_empty() && !pre_files.contains(&trimmed) {
+                            if !trimmed.is_empty() && !pre_untracked.contains(&trimmed) {
                                 snap.record_created_file(&trimmed);
+                                touched.insert(trimmed);
+                            }
+                        }
+                    }
+
+                    let post_diff_out = tokio::process::Command::new("git")
+                        .args(["diff", "--name-only"])
+                        .current_dir(&self.config.workspace_dir)
+                        .output()
+                        .await;
+                    if let Ok(o) = post_diff_out {
+                        let mut touched = self.touched_files.lock().await;
+                        for line in String::from_utf8_lossy(&o.stdout).lines() {
+                            let trimmed = line.trim().replace('\\', "/");
+                            if !trimmed.is_empty() && !pre_modified.contains(&trimmed) {
                                 touched.insert(trimmed);
                             }
                         }
@@ -1742,14 +1825,24 @@ impl AgendexAgent {
         let mut out = String::new();
         out.push_str("Session Cost Breakdown:\n");
         if let Some(l) = last {
+            let last_cost_str = if l.has_known_cost {
+                format!("${:.4}", l.estimated_cost)
+            } else {
+                "n/a".to_string()
+            };
             out.push_str(&format!(
-                "  • Last Turn Cost:    ${:.4} ({} in, {} out)\n",
-                l.estimated_cost, l.prompt_tokens, l.completion_tokens
+                "  • Last Turn Cost:    {} ({} in, {} out)\n",
+                last_cost_str, l.prompt_tokens, l.completion_tokens
             ));
         }
+        let total_cost_str = if usage.has_known_cost {
+            format!("${:.4}", usage.total_cost)
+        } else {
+            "n/a".to_string()
+        };
         out.push_str(&format!(
-            "  • Cumulative Cost:   ${:.4} across {} turn(s)\n",
-            usage.total_cost, usage.turn_count
+            "  • Cumulative Cost:   {} across {} turn(s)\n",
+            total_cost_str, usage.turn_count
         ));
         out.push_str(&format!(
             "  • Total Volume:      {} prompt + {} completion = {} tokens\n",
@@ -1798,14 +1891,17 @@ impl AgendexAgent {
 
     /// Handles `/context` command.
     pub async fn handle_context_command(&self) -> String {
-        let usage = self.session_usage().await;
+        let history = self.history.lock().await;
+        // Estimate token count of current active messages in context
+        let active_chars: usize = history.iter().map(|m| m.content.len()).sum();
+        // Standard rule of thumb: ~4 characters per token
+        let active_tokens = (active_chars / 4).max(1);
+        drop(history);
+
         let tier = self.config.model_tier;
         let limit = tier.ceiling_tokens();
-        let active_tokens = {
-            let traj = self.trajectory.lock().await;
-            (traj.step_count() * 120 + usage.total_tokens).min(limit)
-        };
-        let ratio = (active_tokens as f64 / limit as f64).clamp(0.0, 1.0);
+        let clamped_tokens = active_tokens.min(limit);
+        let ratio = (clamped_tokens as f64 / limit as f64).clamp(0.0, 1.0);
         let bar_len: usize = 24;
         let filled = (ratio * bar_len as f64).round() as usize;
         let empty = bar_len.saturating_sub(filled);
@@ -1818,7 +1914,7 @@ impl AgendexAgent {
             model_name,
             bar,
             pct,
-            format_num(active_tokens),
+            format_num(clamped_tokens),
             format_num(limit),
             tier
         )
@@ -1846,13 +1942,17 @@ impl AgendexAgent {
         if let Ok(reg) = self.skill_registry.read() {
             let skills = reg.list_skills();
             if skills.is_empty() {
-                return "No skills currently discovered in .agents/skills/ or .agenda/skills/.".to_string();
+                return "No skills currently discovered in .agents/skills/ or .agenda/skills/."
+                    .to_string();
             }
             out.push_str(&format!("Discovered Skills ({} total):\n\n", skills.len()));
             for s in skills {
                 out.push_str(&format!(
                     "• {:<16} ({})\n  Description: {}\n  Source:      {}\n\n",
-                    s.name, s.command, s.description, s.path.display()
+                    s.name,
+                    s.command,
+                    s.description,
+                    s.path.display()
                 ));
             }
         }
@@ -1884,11 +1984,19 @@ impl AgendexAgent {
         out.push_str("Native Harness Tools:\n");
         out.push_str("  • read_file         Read file contents with optional line boundaries\n");
         out.push_str("  • write_file        Create or overwrite files in the workspace\n");
-        out.push_str("  • edit_file         Exact AST/text replacement with syntax gate validation\n");
+        out.push_str(
+            "  • edit_file         Exact AST/text replacement with syntax gate validation\n",
+        );
         out.push_str("  • run_command       Execute shell commands with safety policy gate\n");
-        out.push_str("  • find_definition   Find AST symbol definition (functions, classes, types)\n");
-        out.push_str("  • search_history    Search past conversation trajectories across sessions\n");
-        out.push_str("  • save_skill        Persist multi-turn procedural instructions to SKILL.md\n");
+        out.push_str(
+            "  • find_definition   Find AST symbol definition (functions, classes, types)\n",
+        );
+        out.push_str(
+            "  • search_history    Search past conversation trajectories across sessions\n",
+        );
+        out.push_str(
+            "  • save_skill        Persist multi-turn procedural instructions to SKILL.md\n",
+        );
         out.push_str("  • synthesize_tool   Synthesize and sandbox ad-hoc executable tools\n");
 
         let mcp_tools = self.mcp_registry.list_tools().await;
@@ -1967,8 +2075,10 @@ impl AgendexAgent {
         );
 
         tokio::fs::write(&agents_md_path, content).await?;
-        let _ = tokio::fs::create_dir_all(self.config.workspace_dir.join(".agents").join("skills")).await;
-        let _ = tokio::fs::create_dir_all(self.config.workspace_dir.join(".agents").join("rules")).await;
+        let _ = tokio::fs::create_dir_all(self.config.workspace_dir.join(".agents").join("skills"))
+            .await;
+        let _ = tokio::fs::create_dir_all(self.config.workspace_dir.join(".agents").join("rules"))
+            .await;
 
         Ok(format!(
             "Successfully initialized AGENTS.md and .agents/ scaffolding at {}.",
@@ -1981,7 +2091,9 @@ impl AgendexAgent {
         let home_dir = std::env::var("USERPROFILE")
             .or_else(|_| std::env::var("HOME"))
             .unwrap_or_else(|_| ".".to_string());
-        let config_path = std::path::PathBuf::from(home_dir).join(".agendex").join("config.toml");
+        let config_path = std::path::PathBuf::from(home_dir)
+            .join(".agendex")
+            .join("config.toml");
         let active_prov = self
             .active_provider_name
             .try_read()
@@ -1992,7 +2104,9 @@ impl AgendexAgent {
             .try_read()
             .map(|m| m.model_name.clone())
             .unwrap_or_else(|_| self.config.model.model_name.clone());
-        let yolo = self.auto_approve_yolo.load(std::sync::atomic::Ordering::SeqCst);
+        let yolo = self
+            .auto_approve_yolo
+            .load(std::sync::atomic::Ordering::SeqCst);
 
         format!(
             "Agendex Configuration:\n  Config Path:        {}\n  Active Provider:    {}\n  Active Model:       {}\n  Model Tier Ceiling: {:?}\n  Auto-Approve (YOLO):{}\n  Workspace:          {}",
@@ -2035,11 +2149,74 @@ impl AgendexAgent {
         if !trimmed_arg.is_empty() {
             let target_log_dir = logs_dir.join(trimmed_arg);
             if !target_log_dir.exists() {
-                return Ok(format!("Session '{}' not found in logs directory.", trimmed_arg));
+                return Ok(format!(
+                    "Session '{}' not found in logs directory.",
+                    trimmed_arg
+                ));
             }
-            let mut traj = self.trajectory.lock().await;
-            *traj = agendex_trajectory::TrajectoryLogger::new(&target_log_dir)?;
-            return Ok(format!("Resumed session '{}'. Trajectory reconnected.", trimmed_arg));
+            let logger = agendex_trajectory::TrajectoryLogger::new(&target_log_dir)?;
+            let steps = logger.get_steps().to_vec();
+            {
+                let mut traj = self.trajectory.lock().await;
+                *traj = logger;
+            }
+
+            // Reload past conversation messages into self.history
+            let mut history = self.history.lock().await;
+            let mut reloaded = Vec::new();
+            if let Some(sys) = history.first() {
+                if sys.role == "system" {
+                    reloaded.push(sys.clone());
+                }
+            } else {
+                reloaded.push(ChatMessage::system(
+                    "You are Agendex, a local-first autonomous developer agent.",
+                ));
+            }
+
+            for step in &steps {
+                match step.step_type.as_str() {
+                    "USER_INPUT" => {
+                        reloaded.push(ChatMessage::user(&step.content));
+                    }
+                    "MODEL_TURN" => {
+                        let tool_calls = step.tool_calls.as_ref().and_then(|v| {
+                            serde_json::from_value::<Vec<crate::model::ToolCall>>(v.clone()).ok()
+                        });
+                        reloaded.push(ChatMessage::assistant(
+                            if step.content.is_empty() {
+                                None
+                            } else {
+                                Some(step.content.clone())
+                            },
+                            tool_calls,
+                        ));
+                    }
+                    "TOOL_RESULT" => {
+                        let name = step
+                            .metadata
+                            .as_ref()
+                            .and_then(|m| m.get("tool_name"))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("tool");
+                        let call_id = step
+                            .metadata
+                            .as_ref()
+                            .and_then(|m| m.get("call_id"))
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("call_1");
+                        reloaded.push(ChatMessage::tool_result(call_id, name, &step.content));
+                    }
+                    _ => {}
+                }
+            }
+            let restored_count = reloaded.len();
+            *history = reloaded;
+
+            return Ok(format!(
+                "Resumed session '{}'. Trajectory reconnected and {} conversation messages restored.",
+                trimmed_arg, restored_count
+            ));
         }
 
         if !logs_dir.exists() {

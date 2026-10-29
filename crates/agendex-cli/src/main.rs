@@ -245,16 +245,16 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            let mut line_editor = agendex_cli::editor::create_reedline_editor(
-                &config.workspace_dir,
-                commands,
-            )?;
+            let mut line_editor =
+                agendex_cli::editor::create_reedline_editor(&config.workspace_dir, commands)?;
 
             loop {
                 let prompt = agendex_cli::editor::AgendexPrompt {
                     model_name: agent.active_model_config.read().await.model_name.clone(),
                     git_branch: agendex_cli::editor::detect_git_branch(&config.workspace_dir),
-                    yolo_mode: agent.auto_approve_yolo.load(std::sync::atomic::Ordering::SeqCst),
+                    yolo_mode: agent
+                        .auto_approve_yolo
+                        .load(std::sync::atomic::Ordering::SeqCst),
                 };
 
                 if let Some(ref queue) = approval_queue {
@@ -304,7 +304,8 @@ async fn main() -> anyhow::Result<()> {
                             std::thread::sleep(std::time::Duration::from_millis(50));
 
                             let active_prov = agent.active_provider_name.read().await.clone();
-                            let active_mdl = agent.active_model_config.read().await.model_name.clone();
+                            let active_mdl =
+                                agent.active_model_config.read().await.model_name.clone();
 
                             let selection_res = agendex_cli::model_selector::launch_model_selector(
                                 &active_prov,
@@ -318,7 +319,10 @@ async fn main() -> anyhow::Result<()> {
                             match selection_res {
                                 Ok(Some(choice)) => {
                                     match agent
-                                        .switch_provider(&choice.provider_key, Some(&choice.model_name))
+                                        .switch_provider(
+                                            &choice.provider_key,
+                                            Some(&choice.model_name),
+                                        )
                                         .await
                                     {
                                         Ok(_) => {
@@ -344,7 +348,10 @@ async fn main() -> anyhow::Result<()> {
                                             println!();
                                         }
                                         Err(err) => {
-                                            eprintln!("\n[Error] Failed to switch model: {}\n", err);
+                                            eprintln!(
+                                                "\n[Error] Failed to switch model: {}\n",
+                                                err
+                                            );
                                         }
                                     }
                                 }
@@ -419,30 +426,38 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         } else {
-            let _prompt_str = agendex_core::ui::prompt_string();
             let mut line = String::new();
-            while std::io::stdin().read_line(&mut line).is_ok() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    line.clear();
-                    continue;
-                }
-                if trimmed == "exit" || trimmed == "quit" {
-                    break;
-                }
-                match agent.process_turn(trimmed).await {
-                    Ok(reply) => {
-                        if !parsed.json_mode {
-                            println!("{}", reply);
-                        }
-                    }
-                    Err(err) => {
-                        if !parsed.json_mode {
-                            eprintln!("[Error]: {}", err);
-                        }
-                    }
-                }
+            loop {
                 line.clear();
+                match std::io::stdin().read_line(&mut line) {
+                    Ok(0) => break, // EOF reached cleanly in pipe mode
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if trimmed == "exit"
+                            || trimmed == "quit"
+                            || trimmed == "/exit"
+                            || trimmed == "/quit"
+                        {
+                            break;
+                        }
+                        match agent.process_turn(trimmed).await {
+                            Ok(reply) => {
+                                if !parsed.json_mode {
+                                    println!("{}", reply);
+                                }
+                            }
+                            Err(err) => {
+                                if !parsed.json_mode {
+                                    eprintln!("[Error]: {}", err);
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
             }
         }
     }

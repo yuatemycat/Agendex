@@ -221,6 +221,21 @@ impl TrajectoryLogger {
             self.in_memory_steps.push(row?);
         }
 
+        // Fallback: If DB table had no steps, recover from trajectory.jsonl
+        if self.in_memory_steps.is_empty() {
+            if let Some(ref path) = self.compact_path {
+                if path.exists() {
+                    if let Ok(content) = std::fs::read_to_string(path) {
+                        for line in content.lines() {
+                            if let Ok(step) = serde_json::from_str::<TrajectoryStep>(line) {
+                                self.in_memory_steps.push(step);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Reload cumulative token and cost usage
         if let Ok(mut stmt_usage) = conn.prepare(
             "SELECT COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(estimated_cost), 0.0), COUNT(*)
@@ -233,6 +248,7 @@ impl TrajectoryLogger {
                     total_tokens: row.get::<_, i64>(2)? as usize,
                     total_cost: row.get::<_, f64>(3)?,
                     turn_count: row.get::<_, i64>(4)? as usize,
+                    has_known_cost: row.get::<_, f64>(3)? > 0.0,
                 })
             }) {
                 self.session_usage = usage;
@@ -249,8 +265,14 @@ impl TrajectoryLogger {
         prompt_tokens: usize,
         completion_tokens: usize,
         estimated_cost: f64,
+        has_known_cost: bool,
     ) -> anyhow::Result<TokenUsage> {
-        let turn = TokenUsage::new(prompt_tokens, completion_tokens, estimated_cost);
+        let turn = TokenUsage::new(
+            prompt_tokens,
+            completion_tokens,
+            estimated_cost,
+            has_known_cost,
+        );
         let created_at = Utc::now().to_rfc3339();
 
         {

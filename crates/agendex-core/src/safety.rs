@@ -317,6 +317,7 @@ impl CommandSafetyAssessor {
 
         let mut idx = 0;
         let mut elevated = false;
+        let mut has_busybox = false;
         while idx < tokens.len() {
             let t = normalize_bin(&tokens[idx]);
             if t == "sudo" || t == "doas" || t == "runas" {
@@ -335,6 +336,7 @@ impl CommandSafetyAssessor {
                     idx += 1;
                 }
             } else if t == "busybox" {
+                has_busybox = true;
                 idx += 1;
                 while idx < tokens.len() && tokens[idx].starts_with('-') {
                     idx += 1;
@@ -348,6 +350,8 @@ impl CommandSafetyAssessor {
         if idx >= tokens.len() {
             return if elevated {
                 approval("elevated privileges (sudo)")
+            } else if has_busybox {
+                approval("'busybox' invocation requires an explicit safe applet")
             } else {
                 CommandSafetyVerdict::Safe
             };
@@ -1092,6 +1096,7 @@ mod tests {
             "echo reboot | bash",
             "busybox sh -c reboot",
             "busybox sh -c \"echo shutdown | sh\"",
+            "busybox rm -rf /",
             "gdbus call --system --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 --method org.freedesktop.login1.Manager.Reboot true",
             "systemd-run shutdown",
             "dbus-send --system --print-reply --dest=org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager.PowerOff",
@@ -1127,6 +1132,8 @@ mod tests {
             "rm -rf ./target/debug/build",
             "rm temp.txt",
             "mv src/old.rs src/new.rs",
+            "busybox echo hi",
+            "busybox cat Cargo.toml",
         ] {
             assert!(
                 is_safe(c),
@@ -1176,6 +1183,8 @@ mod tests {
             "curl -O https://example.com/x",
             "xargs rm < list.txt",
             "sudo ls",
+            "busybox",
+            "busybox nc -l -p 8080",
         ] {
             assert!(
                 needs_approval(c),

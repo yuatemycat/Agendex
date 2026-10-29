@@ -11,7 +11,10 @@ pub use compactor::{
 };
 pub use search::{HistorySearchQuery, HistorySearchResult, TrajectorySearcher};
 pub use snapshots::{state_dir_for_workspace, SnapshotEngine, SnapshotRecord, TurnRollbackResult};
-pub use telemetry::{estimate_cost, format_comma, format_telemetry, SessionUsage, TokenUsage};
+pub use telemetry::{
+    estimate_cost, estimate_cost_optional, format_comma, format_telemetry, is_known_pricing_model,
+    SessionUsage, TokenUsage,
+};
 pub use trajectory::{
     CheckpointRecord, TrajectoryLogger, TrajectoryStep, TrajectoryStepInput,
     DEFAULT_COMPACT_CHAR_LIMIT,
