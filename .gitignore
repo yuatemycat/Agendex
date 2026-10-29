@@ -4,4 +4,5 @@
 *.db-wal
 .agenda/
 .agendex/
+.agents/
 *.log
