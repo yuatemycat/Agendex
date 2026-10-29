@@ -39,20 +39,8 @@ async fn main() -> anyhow::Result<()> {
     // refused unless `--yes` was passed.
     use std::io::IsTerminal;
     let agent = if !config.auto_approve_risky && std::io::stdin().is_terminal() {
-        agent.with_approval_handler(std::sync::Arc::new(|cmd, reason| {
-            print!(
-                "\n[Safety Gate] Command is classified as risky ({}):\n  {}\nAllow execution? [y/N]: ",
-                reason, cmd
-            );
-            let _ = std::io::stdout().flush();
-            let mut input = String::new();
-            if std::io::stdin().read_line(&mut input).is_ok() {
-                let trimmed = input.trim().to_lowercase();
-                trimmed == "y" || trimmed == "yes"
-            } else {
-                false
-            }
-        }))
+        let queue = agendex_core::swarm::SharedApprovalQueue::new();
+        agent.with_approval_queue(queue)
     } else {
         agent
     };

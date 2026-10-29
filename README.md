@@ -208,7 +208,7 @@ mod tests {
 1. **`list_directory`**: Scans the workspace structure.
 2. **`read_file`**: Batches reads across `Cargo.toml`, `src/lib.rs`, `src/net.rs`, and `src/config.rs`.
 3. **`run_command`**: Runs `cargo test` (exit code 101, assertion failure `left == 6, right == 10`).
-4. **Diagnosis**: Identifies that `(1..n)` is an exclusive range summing to 6 instead of 10.
+4. **Diagnosis**: Identifies that `(1..n)` at line 4 of `src/lib.rs` is an exclusive range summing to 6 instead of 10 (resolving the assertion failure reported at line 10).
 5. **`edit_file`**: Surgically rewrites `(1..n).sum()` to `(1..=n).sum()` in `src/lib.rs`.
 6. **`run_command`**: Verifies with `cargo test` (exit code 0, all tests pass).
 

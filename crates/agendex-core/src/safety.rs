@@ -372,6 +372,52 @@ impl CommandSafetyAssessor {
                 bin_name
             )));
         }
+        if (bin_name == "init" || bin_name == "telinit")
+            && args.iter().any(|a| matches!(a.as_str(), "0" | "6"))
+        {
+            return Some(blocked(format!(
+                "host power command '{} {}' is never run by the agent",
+                bin_name,
+                args.join(" ")
+            )));
+        }
+        if bin_name == "busybox" {
+            let mut i = 0;
+            while i < args.len() && args[i].starts_with('-') {
+                i += 1;
+            }
+            if i < args.len() {
+                let sub_bin = normalize_bin(&args[i]);
+                let sub_args = &args[i + 1..];
+                if let Some(v) = Self::hard_block(&sub_bin, sub_args) {
+                    return Some(v);
+                }
+            }
+        }
+        if bin_name == "xargs" || bin_name == "parallel" {
+            let mut i = 0;
+            while i < args.len() {
+                let a = &args[i];
+                if a == "--" {
+                    i += 1;
+                    break;
+                }
+                if a.starts_with('-') {
+                    let takes_arg =
+                        matches!(a.as_str(), "-I" | "-n" | "-P" | "-L" | "-s" | "-E" | "-d");
+                    i += if takes_arg { 2 } else { 1 };
+                } else {
+                    break;
+                }
+            }
+            if i < args.len() {
+                let target_bin = normalize_bin(&args[i]);
+                let target_args = &args[i + 1..];
+                if let Some(v) = Self::hard_block(&target_bin, target_args) {
+                    return Some(v);
+                }
+            }
+        }
         if bin_name == "systemctl"
             && args.iter().any(|a| {
                 matches!(
@@ -952,6 +998,15 @@ mod tests {
             "Restart-Computer",
             "powershell -Command \"shutdown /s /t 0\"",
             "cmd /c shutdown /s /t 0",
+            "init 0",
+            "init 6",
+            "telinit 0",
+            "busybox reboot",
+            "busybox shutdown",
+            "xargs shutdown",
+            "sudo xargs shutdown",
+            "xargs -n 1 reboot",
+            "parallel shutdown",
         ] {
             assert!(
                 is_blocked(c),

@@ -686,7 +686,10 @@ fn is_host_power_invocation(command: &str) -> bool {
                 i += 1;
                 continue;
             }
-            if matches!(name.as_str(), "powershell" | "pwsh" | "cmd") {
+            if matches!(
+                name.as_str(),
+                "powershell" | "pwsh" | "cmd" | "sh" | "bash" | "zsh"
+            ) {
                 if let Some(pos) = tokens.iter().position(|t| {
                     matches!(
                         t.to_lowercase().as_str(),
@@ -698,6 +701,38 @@ fn is_host_power_invocation(command: &str) -> bool {
                     }
                 }
                 return false;
+            }
+            if name == "busybox" {
+                i += 1;
+                while i < tokens.len() && tokens[i].starts_with('-') {
+                    i += 1;
+                }
+                continue;
+            }
+            if name == "xargs" || name == "parallel" {
+                i += 1;
+                while i < tokens.len() {
+                    let a = &tokens[i];
+                    if a == "--" {
+                        i += 1;
+                        break;
+                    }
+                    if a.starts_with('-') {
+                        let takes_arg =
+                            matches!(a.as_str(), "-I" | "-n" | "-P" | "-L" | "-s" | "-E" | "-d");
+                        i += if takes_arg { 2 } else { 1 };
+                    } else {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if name == "init" || name == "telinit" {
+                if let Some(arg) = tokens.get(i + 1) {
+                    if arg == "0" || arg == "6" {
+                        return true;
+                    }
+                }
             }
             return is_power_bin(&name);
         }
@@ -717,6 +752,11 @@ mod tests {
         assert!(is_host_power_invocation(
             "powershell -Command \"shutdown /s /t 0\""
         ));
+        assert!(is_host_power_invocation("init 0"));
+        assert!(is_host_power_invocation("init 6"));
+        assert!(is_host_power_invocation("busybox reboot"));
+        assert!(is_host_power_invocation("xargs shutdown"));
+        assert!(is_host_power_invocation("sudo xargs shutdown"));
         assert!(!is_host_power_invocation("grep shutdown log.txt"));
         assert!(!is_host_power_invocation("echo shutdown"));
     }

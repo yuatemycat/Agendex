@@ -165,6 +165,55 @@ pub struct GrepResult {
 // ToolRegistry
 // ============================================================================
 
+fn strip_verbatim(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut components = Vec::new();
+    for c in path.components() {
+        match c {
+            Component::Prefix(p) => components.push(Component::Prefix(p)),
+            Component::RootDir => components.push(Component::RootDir),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if let Some(Component::Normal(_)) = components.last() {
+                    components.pop();
+                }
+            }
+            Component::Normal(c) => components.push(Component::Normal(c)),
+        }
+    }
+    components.into_iter().collect()
+}
+
+fn is_subpath(path: &Path, base: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let p_str = path.to_string_lossy().to_lowercase().replace('/', "\\");
+        let b_str = base.to_string_lossy().to_lowercase().replace('/', "\\");
+        if p_str == b_str {
+            return true;
+        }
+        let prefix = if b_str.ends_with('\\') {
+            b_str
+        } else {
+            format!("{}\\", b_str)
+        };
+        p_str.starts_with(&prefix)
+    }
+    #[cfg(not(windows))]
+    {
+        path.starts_with(base)
+    }
+}
+
 /// Native Tool Registry providing sandboxed filesystem tools and process management.
 pub struct ToolRegistry {
     workspace_dir: PathBuf,
@@ -187,18 +236,35 @@ impl ToolRegistry {
         &self.task_manager
     }
 
-    /// Resolves a path safely against workspace directory.
-    pub fn resolve_path(&self, p: &Path) -> PathBuf {
-        if p.is_absolute() {
+    /// Resolves a path safely against workspace directory and verifies it does not escape.
+    pub fn resolve_path(&self, p: &Path) -> Result<PathBuf> {
+        let base = strip_verbatim(
+            &self
+                .workspace_dir
+                .canonicalize()
+                .unwrap_or_else(|_| normalize_path(&self.workspace_dir)),
+        );
+        let raw = if p.is_absolute() {
             p.to_path_buf()
         } else {
             self.workspace_dir.join(p)
+        };
+        let normalized =
+            strip_verbatim(&raw.canonicalize().unwrap_or_else(|_| normalize_path(&raw)));
+
+        if !is_subpath(&normalized, &base) {
+            return Err(anyhow!(
+                "Path '{}' escapes workspace boundary '{}'",
+                p.display(),
+                self.workspace_dir.display()
+            ));
         }
+        Ok(normalized)
     }
 
     /// Reads a file with line-bound and byte-bound safeguards and binary rejection.
     pub async fn read_file(&self, args: ReadFileArgs) -> Result<ReadFileResult> {
-        let resolved = self.resolve_path(&args.path);
+        let resolved = self.resolve_path(&args.path)?;
         if !resolved.exists() {
             return Err(anyhow!("File not found: '{}'", resolved.display()));
         }
@@ -311,7 +377,7 @@ impl ToolRegistry {
 
     /// Writes content to a file with strict overwrite/append safety checks.
     pub async fn write_file(&self, args: WriteFileArgs) -> Result<WriteFileResult> {
-        let resolved = self.resolve_path(&args.path);
+        let resolved = self.resolve_path(&args.path)?;
 
         if args.overwrite && args.append {
             return Err(anyhow!(
@@ -376,7 +442,7 @@ impl ToolRegistry {
     /// Lists directory contents with recursion depth limit, hidden filter, and truncation bounds.
     pub async fn list_directory(&self, args: ListDirArgs) -> Result<ListDirResult> {
         let target_dir = match args.path {
-            Some(ref p) => self.resolve_path(p),
+            Some(ref p) => self.resolve_path(p)?,
             None => self.workspace_dir.clone(),
         };
 
@@ -532,7 +598,7 @@ impl ToolRegistry {
     /// Fast file pattern matching using glob patterns (e.g. '**/*.rs', 'src/**/*.ts'). Respects .gitignore.
     pub async fn glob(&self, args: GlobArgs) -> Result<GlobResult> {
         let base_dir = match &args.path {
-            Some(p) => self.resolve_path(p),
+            Some(p) => self.resolve_path(p)?,
             None => self.workspace_dir.clone(),
         };
 
@@ -556,7 +622,8 @@ impl ToolRegistry {
             .hidden(!args.show_hidden)
             .git_ignore(true)
             .git_global(true)
-            .git_exclude(true);
+            .git_exclude(true)
+            .require_git(false);
 
         for result in builder.build() {
             let entry = match result {
@@ -598,7 +665,7 @@ impl ToolRegistry {
     /// Fast regex search across files in the workspace. Skips binary files and respects .gitignore.
     pub async fn grep(&self, args: GrepArgs) -> Result<GrepResult> {
         let target_dir = match &args.path {
-            Some(p) => self.resolve_path(p),
+            Some(p) => self.resolve_path(p)?,
             None => self.workspace_dir.clone(),
         };
 
@@ -631,7 +698,8 @@ impl ToolRegistry {
         walker_builder
             .git_ignore(true)
             .git_global(true)
-            .git_exclude(true);
+            .git_exclude(true)
+            .require_git(false);
 
         for result in walker_builder.build() {
             let entry = match result {
@@ -1280,6 +1348,130 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(json_exec["total_matches"], 1);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_path_traversal_and_workspace_containment() {
+        let tmp = std::env::temp_dir().join(format!(
+            "agendex_traversal_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let ws_dir = tmp.join("workspace");
+        tokio::fs::create_dir_all(&ws_dir).await.unwrap();
+
+        let task_manager = Arc::new(TaskManager::new(tmp.join("tasks")));
+        let registry = ToolRegistry::new(ws_dir.clone(), task_manager);
+
+        // Outside file
+        let outside_file = tmp.join("secret.txt");
+        tokio::fs::write(&outside_file, "classified").await.unwrap();
+
+        // 1. resolve_path rejects relative parent escape
+        let rel_escape = registry.resolve_path(Path::new("../secret.txt"));
+        assert!(rel_escape.is_err());
+
+        // 2. resolve_path rejects absolute outside path
+        let abs_escape = registry.resolve_path(&outside_file);
+        assert!(abs_escape.is_err());
+
+        // 3. read_file rejects relative escape
+        let read_res = registry
+            .read_file(ReadFileArgs {
+                path: PathBuf::from("../secret.txt"),
+                start_line: None,
+                end_line: None,
+                byte_offset: None,
+                max_bytes: None,
+            })
+            .await;
+        assert!(read_res.is_err());
+
+        // 4. write_file rejects relative escape
+        let write_res = registry
+            .write_file(WriteFileArgs {
+                path: PathBuf::from("../escape.txt"),
+                content: "malicious".to_string(),
+                overwrite: true,
+                append: false,
+            })
+            .await;
+        assert!(write_res.is_err());
+
+        // 5. Valid file inside workspace succeeds
+        let valid_write = registry
+            .write_file(WriteFileArgs {
+                path: PathBuf::from("valid.txt"),
+                content: "safe".to_string(),
+                overwrite: true,
+                append: false,
+            })
+            .await;
+        assert!(valid_write.is_ok());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_grep_and_glob_respects_gitignore_without_git_repo() {
+        let tmp = std::env::temp_dir().join(format!(
+            "agendex_ignore_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let task_manager = Arc::new(TaskManager::new(tmp.join("tasks")));
+        let registry = ToolRegistry::new(tmp.clone(), task_manager);
+
+        // Intentionally DO NOT initialize a git repo here!
+        tokio::fs::write(tmp.join(".gitignore"), "target/\n*.log\nnode_modules/\n")
+            .await
+            .unwrap();
+
+        let src_dir = tmp.join("src");
+        tokio::fs::create_dir_all(&src_dir).await.unwrap();
+        tokio::fs::write(src_dir.join("main.rs"), "fn main() { let x = 42; }\n")
+            .await
+            .unwrap();
+
+        let target_dir = tmp.join("target").join("debug");
+        tokio::fs::create_dir_all(&target_dir).await.unwrap();
+        tokio::fs::write(target_dir.join("build.rs"), "let x = 42;\n")
+            .await
+            .unwrap();
+
+        tokio::fs::write(tmp.join("debug.log"), "let x = 42;\n")
+            .await
+            .unwrap();
+
+        // Grep for 'x = 42' should ONLY find src/main.rs, ignoring target/ and debug.log
+        let grep_res = registry
+            .grep(GrepArgs {
+                pattern: "x = 42".to_string(),
+                path: None,
+                glob: None,
+                case_insensitive: false,
+                max_results: None,
+                context_lines: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(grep_res.total_matches, 1);
+        assert!(grep_res.matches[0].path.ends_with("main.rs"));
+
+        // Glob for '**/*.rs' should ONLY match src/main.rs, ignoring target/
+        let glob_res = registry
+            .glob(GlobArgs {
+                pattern: "**/*.rs".to_string(),
+                path: None,
+                max_results: None,
+                show_hidden: false,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(glob_res.total_matches, 1);
+        assert!(glob_res.matches[0].ends_with("main.rs"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

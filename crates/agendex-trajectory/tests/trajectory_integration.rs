@@ -106,7 +106,8 @@ async fn test_trajectory_full_lifecycle() -> anyhow::Result<()> {
         restored_content.replace("\r\n", "\n"),
         "fn main() { println!(\"Hello World\"); }\n"
     );
-    assert!(!temp_untracked.exists());
+    // Untracked user files created outside snapshots must be preserved (no git clean -fd)
+    assert!(temp_untracked.exists());
 
     // Rollback trajectory history to step 1
     trajectory.truncate_after(1)?;

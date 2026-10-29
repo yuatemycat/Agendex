@@ -305,6 +305,9 @@ impl SnapshotEngine {
             })?;
 
         // 1. Reset isolated index and working directory to the tree snapshot (git read-tree -u --reset <tree_hash>)
+        // Note: We deliberately do NOT run `git clean -fd`. Untracked files (such as user-created
+        // test files) must never be destroyed by rollback. Files that were tracked in later
+        // snapshots are cleanly removed by `read-tree -u --reset` because they exist in the index.
         let mut read_cmd = Command::new("git");
         read_cmd
             .args(["read-tree", "-u", "--reset", &record.tree_hash])
@@ -314,17 +317,6 @@ impl SnapshotEngine {
         }
         let read_out = read_cmd.output().await?;
         Self::check_output(&read_out, "git read-tree -u --reset")?;
-
-        // 2. Remove untracked files introduced after snapshot was taken (git clean -fd)
-        let mut clean_cmd = Command::new("git");
-        clean_cmd
-            .args(["clean", "-fd"])
-            .current_dir(&self.workspace_dir);
-        if !self.index_file.as_os_str().is_empty() {
-            clean_cmd.env("GIT_INDEX_FILE", &self.index_file);
-        }
-        let clean_out = clean_cmd.output().await?;
-        Self::check_output(&clean_out, "git clean -fd (isolated index)")?;
 
         tracing::info!(
             "Workspace successfully rolled back to snapshot [{}] tree_hash={}",
@@ -610,8 +602,8 @@ mod tests {
 
         // 6. Mutate file and rollback via engine2
         tokio::fs::write(&file1, "Corrupted by agent\n").await?;
-        let bad_file = temp_dir.join("agent_garbage.tmp");
-        tokio::fs::write(&bad_file, "garbage\n").await?;
+        let user_handmade_test = temp_dir.join("user_test.txt");
+        tokio::fs::write(&user_handmade_test, "Hand-made user test file\n").await?;
 
         let rolled = engine2.rollback_latest().await?;
         assert_eq!(rolled.id, snap1.id);
@@ -622,7 +614,10 @@ mod tests {
                 .replace("\r\n", "\n"),
             "Initial tracked content\n"
         );
-        assert!(!bad_file.exists(), "agent_garbage.tmp must be cleaned");
+        assert!(
+            user_handmade_test.exists(),
+            "User hand-made test file must NEVER be deleted by rollback"
+        );
 
         // Real user staged file is still preserved
         let status_after_revert = Command::new("git")

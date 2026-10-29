@@ -126,7 +126,7 @@ struct ApprovalTicket {
     subagent_id: String,
     command: String,
     reason: String,
-    responder: std::sync::mpsc::Sender<bool>,
+    responder: tokio::sync::oneshot::Sender<bool>,
 }
 
 /// Shared approval queue serializing interactive prompts across concurrent subagents
@@ -174,9 +174,9 @@ impl SharedApprovalQueue {
         Arc::new(Self { sender })
     }
 
-    /// Synchronously wait for user approval ticket without blocking the async runtime
-    pub fn request_approval(&self, subagent_id: &str, command: &str, reason: &str) -> bool {
-        let (tx, rx) = std::sync::mpsc::channel();
+    /// Asynchronously wait for user approval ticket without blocking the async runtime
+    pub async fn request_approval(&self, subagent_id: &str, command: &str, reason: &str) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel();
         let ticket = ApprovalTicket {
             subagent_id: subagent_id.to_string(),
             command: command.to_string(),
@@ -188,7 +188,7 @@ impl SharedApprovalQueue {
             return false;
         }
 
-        rx.recv().unwrap_or(false)
+        rx.await.unwrap_or(false)
     }
 }
 
@@ -329,18 +329,8 @@ impl SubagentManager {
         let id_clone = subagent_id.clone();
         let parent_id_clone = self.parent_id.clone();
         let prompt_owned = prompt.to_string();
-        let approval_handler: Option<ApprovalHandler> =
-            if let Some(handler) = &self.approval_handler {
-                Some(Arc::clone(handler))
-            } else if let Some(queue) = &self.approval_queue {
-                let q = Arc::clone(queue);
-                let id = subagent_id.clone();
-                Some(Arc::new(move |cmd: &str, reason: &str| -> bool {
-                    q.request_approval(&id, cmd, reason)
-                }))
-            } else {
-                None
-            };
+        let approval_queue = self.approval_queue.clone();
+        let approval_handler = self.approval_handler.clone();
 
         // 3. Spawn background execution task
         let handle = tokio::spawn(async move {
@@ -361,7 +351,9 @@ impl SubagentManager {
             let agent_init = AgendexAgent::init(child_config).await;
             match agent_init {
                 Ok(mut agent) => {
-                    if let Some(handler) = &approval_handler {
+                    if let Some(queue) = &approval_queue {
+                        agent = agent.with_approval_queue(Arc::clone(queue));
+                    } else if let Some(handler) = &approval_handler {
                         agent = agent.with_approval_handler(Arc::clone(handler));
                     }
                     agent = agent

@@ -64,6 +64,7 @@ pub struct AgendexAgent {
     pub parent_id: Option<String>,
     pub history: Arc<Mutex<Vec<ChatMessage>>>,
     pub approval_handler: Option<ApprovalHandler>,
+    pub approval_queue: Option<Arc<crate::swarm::SharedApprovalQueue>>,
 }
 
 impl AgendexAgent {
@@ -195,11 +196,17 @@ impl AgendexAgent {
             parent_id: None,
             history,
             approval_handler: None,
+            approval_queue: None,
         })
     }
 
     pub fn with_approval_handler(mut self, handler: ApprovalHandler) -> Self {
         self.approval_handler = Some(handler);
+        self
+    }
+
+    pub fn with_approval_queue(mut self, queue: Arc<crate::swarm::SharedApprovalQueue>) -> Self {
+        self.approval_queue = Some(queue);
         self
     }
 
@@ -252,7 +259,9 @@ impl AgendexAgent {
             mailbox,
             worktree_mgr,
         );
-        if let Some(handler) = &self.approval_handler {
+        if let Some(queue) = &self.approval_queue {
+            mgr = mgr.with_approval_queue(Arc::clone(queue));
+        } else if let Some(handler) = &self.approval_handler {
             mgr = mgr.with_approval_handler(Arc::clone(handler));
         }
         mgr
@@ -541,7 +550,12 @@ impl AgendexAgent {
                     return format!("Command denied by safety policy: {}", reason);
                 }
                 crate::safety::CommandSafetyVerdict::NeedsApproval { risk_reason } => {
-                    let approved = if let Some(handler) = &self.approval_handler {
+                    let approved = if let Some(queue) = &self.approval_queue {
+                        let agent_id = self.agent_id.as_deref().unwrap_or("parent");
+                        queue
+                            .request_approval(agent_id, cmd_str, &risk_reason)
+                            .await
+                    } else if let Some(handler) = &self.approval_handler {
                         handler(cmd_str, &risk_reason)
                     } else {
                         self.config.auto_approve_risky
@@ -627,7 +641,11 @@ impl AgendexAgent {
                     .and_then(|r| r.as_str())
                     .unwrap_or("");
 
-                let target_path = self.config.workspace_dir.join(path);
+                let target_path = match self.tool_registry.resolve_path(std::path::Path::new(path))
+                {
+                    Ok(p) => p,
+                    Err(e) => return format!("Failed to edit {}: {}", path, e),
+                };
                 match self
                     .ast_patcher
                     .patch_file(&target_path, target, replacement)
