@@ -7,6 +7,7 @@ pub mod mailbox;
 pub mod model;
 pub mod safety;
 pub mod swarm;
+pub mod ui;
 pub mod worktree;
 
 pub use agent::{AgendexAgent, AgentConfig};
@@ -28,4 +29,5 @@ pub use model::{
 };
 pub use safety::{CommandSafetyAssessor, CommandSafetyVerdict};
 pub use swarm::{SubagentInstance, SubagentManager, SubagentPersona, SubagentStatus};
+pub use ui::*;
 pub use worktree::{IsolatedWorkspace, WorkspaceMode, WorktreeManager};

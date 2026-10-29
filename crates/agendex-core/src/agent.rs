@@ -1400,18 +1400,55 @@ impl AgendexAgent {
         let cur_model = self.active_model_config.read().await.clone();
 
         let mut out = String::new();
-        out.push_str("=======================================================\n");
         out.push_str(&format!(
-            " Active LLM Provider: [{}] (model: {})\n",
-            active, cur_model.model_name
+            "\n  {}╭──────────────────────────────────────────────────────────────────────────╮{}\n",
+            crate::ui::TEXT_MUTED, crate::ui::RESET
         ));
         out.push_str(&format!(
-            " Format: {:?} | Base URL: {}\n",
-            cur_model.format,
-            cur_model.base_url.as_deref().unwrap_or("<default>")
+            "  {}│{}  {}✦ Active LLM Provider:{} {}{:<47}{} {}│{}\n",
+            crate::ui::TEXT_MUTED,
+            crate::ui::RESET,
+            crate::ui::ACCENT_CYAN,
+            crate::ui::RESET,
+            crate::ui::TEXT_PRIMARY,
+            active,
+            crate::ui::RESET,
+            crate::ui::TEXT_MUTED,
+            crate::ui::RESET
         ));
-        out.push_str("=======================================================\n\n");
-        out.push_str("Configured Providers:\n");
+        out.push_str(&format!(
+            "  {}│{}    Model:    {}{:<50}{} {}│{}\n",
+            crate::ui::TEXT_MUTED,
+            crate::ui::RESET,
+            crate::ui::TEXT_PRIMARY,
+            cur_model.model_name,
+            crate::ui::RESET,
+            crate::ui::TEXT_MUTED,
+            crate::ui::RESET
+        ));
+        out.push_str(&format!(
+            "  {}│{}    Endpoint: {}{:<50}{} {}│{}\n",
+            crate::ui::TEXT_MUTED,
+            crate::ui::RESET,
+            crate::ui::TEXT_SECONDARY,
+            cur_model
+                .base_url
+                .as_deref()
+                .unwrap_or("<upstream default>"),
+            crate::ui::RESET,
+            crate::ui::TEXT_MUTED,
+            crate::ui::RESET
+        ));
+        out.push_str(&format!(
+            "  {}╰──────────────────────────────────────────────────────────────────────────╯{}\n\n",
+            crate::ui::TEXT_MUTED, crate::ui::RESET
+        ));
+
+        out.push_str(&format!(
+            "  {}Available Providers:{} \n",
+            crate::ui::TEXT_PRIMARY,
+            crate::ui::RESET
+        ));
 
         let mut keys: Vec<&String> = cfg.providers.keys().collect();
         keys.sort();
@@ -1419,22 +1456,40 @@ impl AgendexAgent {
         for key in keys {
             let entry = &cfg.providers[key];
             let is_active = key.eq_ignore_ascii_case(&active);
-            let marker = if is_active { " *" } else { "  " };
+            let marker = if is_active {
+                format!("{}*{}", crate::ui::ACCENT_GREEN, crate::ui::RESET)
+            } else {
+                " ".to_string()
+            };
             let model = entry
                 .model
                 .as_deref()
                 .unwrap_or_else(|| crate::config::default_model_for_preset(key));
             let url = entry.base_url.as_deref().unwrap_or("<upstream default>");
             out.push_str(&format!(
-                "{} {:<12} - model: {:<30} url: {}\n",
-                marker, key, model, url
+                "   {} {:<12} {}{:<32}{} {}{}{}\n",
+                marker,
+                key,
+                crate::ui::TEXT_PRIMARY,
+                model,
+                crate::ui::RESET,
+                crate::ui::TEXT_MUTED,
+                url,
+                crate::ui::RESET
             ));
         }
 
-        out.push_str(
-            "\nQuick Switch: '/provider <name>' (e.g. '/provider strata' or '/provider nim')\n",
-        );
-        out.push_str("Help:         '/provider help'\n");
+        out.push_str(&format!(
+            "\n  {}Commands:{} {}/provider switch <name>{} · {}/provider model <name>{} · {}/provider add <name> <url>{}\n",
+            crate::ui::TEXT_MUTED,
+            crate::ui::RESET,
+            crate::ui::ACCENT_CYAN,
+            crate::ui::RESET,
+            crate::ui::ACCENT_CYAN,
+            crate::ui::RESET,
+            crate::ui::ACCENT_CYAN,
+            crate::ui::RESET,
+        ));
         out
     }
 

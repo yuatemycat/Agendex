@@ -217,20 +217,23 @@ impl SharedApprovalQueue {
                                         responder,
                                     });
                                 } else {
-                                    println!();
-                                    if subagent_id.is_empty() || subagent_id == "parent" {
-                                        println!(
-                                            "[Safety Gate] Command is classified as risky ({}):",
-                                            reason
-                                        );
-                                    } else {
-                                        println!(
-                                            "[Safety Gate: Subagent {}] Command is classified as risky ({}):",
-                                            subagent_id, reason
-                                        );
-                                    }
-                                    println!("  {}", command);
-                                    print!("Allow execution? [y/N]: ");
+                                    let card = crate::ui::format_safety_gate_card(
+                                        &command,
+                                        &reason,
+                                        if subagent_id.is_empty() || subagent_id == "parent" {
+                                            None
+                                        } else {
+                                            Some(&subagent_id)
+                                        },
+                                    );
+                                    print!("{}", card);
+                                    print!(
+                                        "  {}Allow execution? [y/N]{} {}❯{} ",
+                                        crate::ui::TEXT_PRIMARY,
+                                        crate::ui::RESET,
+                                        crate::ui::ACCENT_AMBER,
+                                        crate::ui::RESET
+                                    );
                                     let _ = std::io::stdout().flush();
                                     active_approval = Some(ActiveApproval::Command(responder));
                                 }
@@ -249,17 +252,15 @@ impl SharedApprovalQueue {
                                         responder,
                                     });
                                 } else {
-                                    println!();
-                                    if subagent_id.is_empty() || subagent_id == "parent" {
-                                        println!("[Diff Review] Proposed changes to '{}':", path);
-                                    } else {
-                                        println!(
-                                            "[Diff Review: Subagent {}] Proposed changes to '{}':",
-                                            subagent_id, path
-                                        );
-                                    }
-                                    println!("{}", diff);
-                                    print!("Apply this change? [y/N]: ");
+                                    let colored_diff = crate::ui::format_diff_colored(&path, &diff);
+                                    print!("{}", colored_diff);
+                                    print!(
+                                        "  {}Apply this change? [y/N]{} {}❯{} ",
+                                        crate::ui::TEXT_PRIMARY,
+                                        crate::ui::RESET,
+                                        crate::ui::ACCENT_CYAN,
+                                        crate::ui::RESET
+                                    );
                                     let _ = std::io::stdout().flush();
                                     active_approval = Some(ActiveApproval::Diff(responder));
                                 }

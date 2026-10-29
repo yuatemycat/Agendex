@@ -23,30 +23,24 @@ async fn main() -> anyhow::Result<()> {
         let _ = tracing_subscriber::fmt().try_init();
     }
 
-    if !parsed.json_mode {
-        println!("=======================================================");
-        println!(" Agendex Agent Runtime v0.1.0");
-        println!("=======================================================");
-    }
+    agendex_core::ui::init_terminal();
 
     let config = parsed.config;
     let prompt = parsed.prompt;
 
-    if !parsed.json_mode {
-        println!("[Agendex] Workspace: {}", config.workspace_dir.display());
-        println!("[Agendex] Session ID: {}", config.session_id);
-        if let Some(ref base) = config.model.base_url {
-            println!(
-                "[Agendex] Model: {} ({:?}) -> {}",
-                config.model.model_name, config.model.format, base
-            );
-        } else {
-            println!(
-                "[Agendex] Model: {} ({:?})",
-                config.model.model_name, config.model.format
-            );
-        }
-        println!("[Agendex] Compaction Ceiling: {:?}", config.model_tier);
+    let active_provider = if let Some(cfg) = agendex_core::config::load_default_config() {
+        cfg.active_provider.unwrap_or_else(|| "nim".to_string())
+    } else {
+        "nim".to_string()
+    };
+
+    if !parsed.json_mode && prompt.is_none() {
+        agendex_core::ui::print_banner(
+            &config.workspace_dir,
+            &config.model.model_name,
+            &active_provider,
+            config.model.base_url.as_deref(),
+        );
     }
 
     let agent = AgendexAgent::init(config.clone()).await?;
@@ -77,13 +71,11 @@ async fn main() -> anyhow::Result<()> {
                 let _ = io::stdout().flush();
             }))
             .with_tool_progress_handler(Arc::new(|msg| {
-                println!("{}", msg);
+                if let Some(clean) = agendex_core::ui::format_tool_notification(msg) {
+                    println!("{}", clean);
+                }
             }))
     };
-
-    if !parsed.json_mode {
-        println!("[Agendex] Ready. Skills, Rules, and Execution Core mounted.\n");
-    }
 
     // Helper: switch or create branch if requested
     if let Some(ref branch) = parsed.git_branch {
@@ -109,9 +101,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if let Some(p) = prompt {
-        if !parsed.json_mode {
-            println!("[User]: {}", p);
-        }
         let turn_res = agent.process_turn(&p).await;
         match turn_res {
             Ok(resp) => {
@@ -119,10 +108,10 @@ async fn main() -> anyhow::Result<()> {
                     if agent.streamed_tokens_in_last_turn() {
                         println!();
                     } else {
-                        println!("\n[Agendex]:\n{}", resp);
+                        println!("{}", resp);
                     }
                     if let Some(telemetry) = agent.format_telemetry().await {
-                        println!("{}", telemetry);
+                        println!("{}", agendex_core::ui::format_telemetry_footer(&telemetry));
                     }
                 }
 
@@ -154,16 +143,14 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     } else {
-        if !parsed.json_mode {
-            println!("Interactive REPL. Type '/help' for skills, '/provider' to switch models, '/compact' to compress, or 'exit' to quit.\n");
-        }
+        let prompt_str = agendex_core::ui::prompt_string();
 
         loop {
             let next_line = if let Some(queue) = &approval_queue {
-                queue.read_line("agendex> ").await
+                queue.read_line(&prompt_str).await
             } else {
                 if !parsed.json_mode {
-                    print!("agendex> ");
+                    print!("{}", prompt_str);
                     io::stdout().flush()?;
                 }
                 let mut line = String::new();
@@ -197,10 +184,13 @@ async fn main() -> anyhow::Result<()> {
                                 if agent.streamed_tokens_in_last_turn() {
                                     println!();
                                 } else {
-                                    println!("\n[Agendex]:\n{}\n", reply);
+                                    println!("{}", reply);
                                 }
                                 if let Some(telemetry) = agent.format_telemetry().await {
-                                    println!("{}\n", telemetry);
+                                    println!(
+                                        "{}",
+                                        agendex_core::ui::format_telemetry_footer(&telemetry)
+                                    );
                                 }
                             }
                             // Automated Git Commit helper in REPL
