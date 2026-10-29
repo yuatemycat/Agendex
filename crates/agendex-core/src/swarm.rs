@@ -156,33 +156,80 @@ enum ActiveApproval {
 /// concurrent subagents and the CLI REPL, guaranteeing exactly one reader on terminal stdin.
 pub struct SharedApprovalQueue {
     sender: std::sync::mpsc::Sender<ConsoleEvent>,
+    is_paused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SharedApprovalQueue {
     pub fn new() -> Arc<Self> {
         let (event_tx, event_rx) = std::sync::mpsc::channel::<ConsoleEvent>();
+        let is_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        // 1. Spawn dedicated Stdin Reader Thread that solely blocks on stdin.read_line()
+        // 1. Spawn dedicated Stdin Reader Thread that respects is_paused
         let stdin_tx = event_tx.clone();
+        let is_paused_reader = Arc::clone(&is_paused);
         std::thread::Builder::new()
             .name("agendex-stdin-reader".to_string())
             .spawn(move || {
-                let stdin = std::io::stdin();
-                loop {
-                    let mut line = String::new();
-                    match stdin.read_line(&mut line) {
-                        Ok(0) => {
-                            let _ = stdin_tx.send(ConsoleEvent::Eof);
-                            break;
+                use std::io::{IsTerminal, Write};
+                if std::io::stdin().is_terminal() {
+                    let mut line_buf = String::new();
+                    loop {
+                        if is_paused_reader.load(std::sync::atomic::Ordering::SeqCst) {
+                            std::thread::sleep(std::time::Duration::from_millis(40));
+                            continue;
                         }
-                        Ok(_) => {
-                            if stdin_tx.send(ConsoleEvent::Line(line)).is_err() {
-                                break;
+
+                        if crossterm::event::poll(std::time::Duration::from_millis(40))
+                            .unwrap_or(false)
+                        {
+                            if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read()
+                            {
+                                if key.kind == crossterm::event::KeyEventKind::Release {
+                                    continue;
+                                }
+
+                                match key.code {
+                                    crossterm::event::KeyCode::Enter => {
+                                        let line = std::mem::take(&mut line_buf);
+                                        println!();
+                                        if stdin_tx.send(ConsoleEvent::Line(line)).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    crossterm::event::KeyCode::Char(c) => {
+                                        line_buf.push(c);
+                                        print!("{}", c);
+                                        let _ = std::io::stdout().flush();
+                                    }
+                                    crossterm::event::KeyCode::Backspace
+                                        if line_buf.pop().is_some() =>
+                                    {
+                                        print!("\x08 \x08");
+                                        let _ = std::io::stdout().flush();
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
-                        Err(_) => {
-                            let _ = stdin_tx.send(ConsoleEvent::Eof);
-                            break;
+                    }
+                } else {
+                    let stdin = std::io::stdin();
+                    loop {
+                        let mut line = String::new();
+                        match stdin.read_line(&mut line) {
+                            Ok(0) => {
+                                let _ = stdin_tx.send(ConsoleEvent::Eof);
+                                break;
+                            }
+                            Ok(_) => {
+                                if stdin_tx.send(ConsoleEvent::Line(line)).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                let _ = stdin_tx.send(ConsoleEvent::Eof);
+                                break;
+                            }
                         }
                     }
                 }
@@ -383,7 +430,21 @@ impl SharedApprovalQueue {
             })
             .expect("Failed to spawn console coordinator thread");
 
-        Arc::new(Self { sender: event_tx })
+        Arc::new(Self {
+            sender: event_tx,
+            is_paused,
+        })
+    }
+
+    /// Temporarily pauses the background console reader so interactive menus have exclusive terminal access.
+    pub fn pause(&self) {
+        self.is_paused.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+    }
+
+    /// Resumes the background console reader.
+    pub fn resume(&self) {
+        self.is_paused.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Asynchronously wait for user approval ticket without blocking the async runtime

@@ -187,13 +187,24 @@ async fn main() -> anyhow::Result<()> {
                         && std::io::stdin().is_terminal()
                         && !parsed.json_mode
                     {
+                        if let Some(ref queue) = approval_queue {
+                            queue.pause();
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+
                         let active_prov = agent.active_provider_name.read().await.clone();
                         let active_mdl = agent.active_model_config.read().await.model_name.clone();
 
-                        match agendex_cli::model_selector::launch_model_selector(
+                        let selection_res = agendex_cli::model_selector::launch_model_selector(
                             &active_prov,
                             &active_mdl,
-                        ) {
+                        );
+
+                        if let Some(ref queue) = approval_queue {
+                            queue.resume();
+                        }
+
+                        match selection_res {
                             Ok(Some(choice)) => {
                                 match agent
                                     .switch_provider(&choice.provider_key, Some(&choice.model_name))
@@ -201,47 +212,25 @@ async fn main() -> anyhow::Result<()> {
                                 {
                                     Ok(_) => {
                                         println!(
-                                            "\n  {}╭──────────────────────────────────────────────────────────────────────────╮{}",
-                                            agendex_core::ui::TEXT_MUTED, agendex_core::ui::RESET
-                                        );
-                                        println!(
-                                            "  {}│{}  {}✔ Active Model:{} {}{:<49}{} {}│{}",
-                                            agendex_core::ui::TEXT_MUTED,
-                                            agendex_core::ui::RESET,
+                                            "  {}✔{} Switched to {}{}{} {}({}){}",
                                             agendex_core::ui::ACCENT_GREEN,
                                             agendex_core::ui::RESET,
                                             agendex_core::ui::TEXT_PRIMARY,
                                             choice.model_name,
                                             agendex_core::ui::RESET,
-                                            agendex_core::ui::TEXT_MUTED,
-                                            agendex_core::ui::RESET
-                                        );
-                                        println!(
-                                            "  {}│{}    Provider:    {}{:<50}{} {}│{}",
-                                            agendex_core::ui::TEXT_MUTED,
-                                            agendex_core::ui::RESET,
                                             agendex_core::ui::ACCENT_CYAN,
-                                            choice.provider_title,
-                                            agendex_core::ui::RESET,
-                                            agendex_core::ui::TEXT_MUTED,
+                                            choice.provider_tag,
                                             agendex_core::ui::RESET
                                         );
                                         if let Some(ref url) = choice.base_url {
                                             println!(
-                                                "  {}│{}    Endpoint:    {}{:<50}{} {}│{}",
+                                                "    {}Endpoint: {}{}",
                                                 agendex_core::ui::TEXT_MUTED,
-                                                agendex_core::ui::RESET,
-                                                agendex_core::ui::TEXT_SECONDARY,
                                                 url,
-                                                agendex_core::ui::RESET,
-                                                agendex_core::ui::TEXT_MUTED,
                                                 agendex_core::ui::RESET
                                             );
                                         }
-                                        println!(
-                                            "  {}╰──────────────────────────────────────────────────────────────────────────╯{}\n",
-                                            agendex_core::ui::TEXT_MUTED, agendex_core::ui::RESET
-                                        );
+                                        println!();
                                     }
                                     Err(err) => {
                                         eprintln!("\n[Error] Failed to switch model: {}\n", err);
@@ -249,7 +238,11 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                             Ok(None) => {
-                                println!();
+                                println!(
+                                    "  {}Selection cancelled.{}",
+                                    agendex_core::ui::TEXT_MUTED,
+                                    agendex_core::ui::RESET
+                                );
                             }
                             Err(err) => {
                                 eprintln!("\n[Error] Selector error: {}\n", err);

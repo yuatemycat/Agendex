@@ -52,6 +52,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "crossterm",
  "reqwest",
  "serde",
  "serde_json",
