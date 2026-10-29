@@ -347,24 +347,36 @@ impl TrajectoryLogger {
         let step_index = self.step_counter;
         let created_at = Utc::now().to_rfc3339();
 
-        // 1. Full representation (untruncated audit log)
+        // Sanitize and redact all secrets (API keys, .env values, tokens) before persistence
+        let content = crate::secrets::mask_secrets(&input.content);
+        let thinking = input.thinking.as_deref().map(crate::secrets::mask_secrets);
+        let tool_calls = input
+            .tool_calls
+            .as_ref()
+            .map(crate::secrets::redact_json_value);
+        let metadata = input
+            .metadata
+            .as_ref()
+            .map(crate::secrets::redact_json_value);
+
+        // 1. Full representation (untruncated audit log, with secrets masked)
         let full_step = TrajectoryStep {
             step_index,
             source: input.source.clone(),
             step_type: input.step_type.clone(),
             status: input.status.clone(),
             created_at: created_at.clone(),
-            content: input.content.clone(),
-            thinking: input.thinking.clone(),
-            tool_calls: input.tool_calls.clone(),
+            content: content.clone(),
+            thinking: thinking.clone(),
+            tool_calls: tool_calls.clone(),
             media: input.media.clone(),
-            metadata: input.metadata.clone(),
+            metadata: metadata.clone(),
             truncated_fields: None,
         };
 
         // 2. Compact representation (truncated if fields exceed compact threshold)
         let mut truncated_fields = Vec::new();
-        let mut compact_content = input.content.clone();
+        let mut compact_content = content.clone();
         if compact_content.len() > self.compact_char_limit {
             let orig_len = compact_content.len();
             let truncated_part: String = compact_content
@@ -379,8 +391,8 @@ impl TrajectoryLogger {
             truncated_fields.push("content".to_string());
         }
 
-        let mut compact_thinking = input.thinking.clone();
-        if let Some(ref th) = input.thinking {
+        let mut compact_thinking = thinking.clone();
+        if let Some(ref th) = thinking {
             if th.len() > self.compact_char_limit {
                 let orig_len = th.len();
                 let truncated_part: String = th.chars().take(self.compact_char_limit).collect();
@@ -401,9 +413,9 @@ impl TrajectoryLogger {
             created_at,
             content: compact_content,
             thinking: compact_thinking,
-            tool_calls: input.tool_calls,
+            tool_calls,
             media: input.media,
-            metadata: input.metadata,
+            metadata,
             truncated_fields: if truncated_fields.is_empty() {
                 None
             } else {

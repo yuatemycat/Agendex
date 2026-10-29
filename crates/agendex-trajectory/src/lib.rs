@@ -1,8 +1,11 @@
 pub mod compactor;
 pub mod search;
+pub mod secrets;
 pub mod snapshots;
 pub mod telemetry;
 pub mod trajectory;
+
+pub use secrets::{mask_secrets, redact_json_value};
 
 pub use compactor::{
     CompactedTrajectory, CompactorConfig, CompactorEngine, ContinuationSummarySections,

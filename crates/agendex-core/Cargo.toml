@@ -21,6 +21,7 @@ chrono = { workspace = true }
 reqwest = { workspace = true }
 toml = { workspace = true }
 crossterm = { workspace = true }
+regex = { workspace = true }
 
 [dev-dependencies]
 agendex-cli = { path = "../agendex-cli" }

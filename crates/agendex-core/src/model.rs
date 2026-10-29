@@ -174,8 +174,19 @@ pub struct ModelClient {
 
 impl ModelClient {
     pub fn new(config: ModelConfig) -> Self {
+        let timeout_secs = std::env::var("AGENDEX_REQUEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(120);
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
         Self {
-            client: reqwest::Client::new(),
+            client,
             config,
             token_callback: None,
         }

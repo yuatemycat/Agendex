@@ -208,8 +208,9 @@ impl TrajectorySearcher {
 
             let tool_calls = tool_calls_raw
                 .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok());
-            let snippet = create_snippet(&content, &query_lower);
+                .and_then(|s| serde_json::from_str(s).ok())
+                .map(|v| crate::secrets::redact_json_value(&v));
+            let snippet = crate::secrets::mask_secrets(&create_snippet(&content, &query_lower));
 
             results.push(HistorySearchResult {
                 session_id: session_id.to_string(),
@@ -270,7 +271,12 @@ impl TrajectorySearcher {
                 }
 
                 if !matched_in.is_empty() {
-                    let snippet = create_snippet(&step.content, query_lower);
+                    let snippet =
+                        crate::secrets::mask_secrets(&create_snippet(&step.content, query_lower));
+                    let tool_calls = step
+                        .tool_calls
+                        .as_ref()
+                        .map(crate::secrets::redact_json_value);
                     results.push(HistorySearchResult {
                         session_id: session_id.to_string(),
                         step_index: step.step_index,
@@ -278,7 +284,7 @@ impl TrajectorySearcher {
                         source: step.source,
                         created_at: step.created_at,
                         snippet,
-                        tool_calls: step.tool_calls,
+                        tool_calls,
                         matched_in,
                     });
                 }

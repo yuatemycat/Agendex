@@ -361,6 +361,11 @@ pub fn default_config_path() -> Option<PathBuf> {
             return Some(PathBuf::from(override_path));
         }
     }
+    if let Ok(home) = std::env::var("AGENDEX_HOME") {
+        if !home.trim().is_empty() {
+            return Some(PathBuf::from(home).join(".agendex").join("config.toml"));
+        }
+    }
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .ok()?;

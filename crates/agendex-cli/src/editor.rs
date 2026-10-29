@@ -164,19 +164,40 @@ impl Prompt for AgendexPrompt {
 /// Sanitizes history commands to prevent persisting sensitive API keys in ~/.agendex/history.txt
 pub fn sanitize_history_line(line: &str) -> String {
     let trimmed = line.trim();
-    if trimmed.starts_with("/provider add") {
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        // Syntax: /provider add <name> <base_url> [model] [format] [api_key]
-        if parts.len() >= 7 {
-            let key = parts[6];
-            if !key.starts_with('$') {
-                let mut rebuilt = parts[..6].join(" ");
-                rebuilt.push_str(" [REDACTED]");
-                return rebuilt;
+    let mut scrubbed =
+        if trimmed.starts_with("/provider add") || trimmed.starts_with("/providers add") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            // Syntax variations:
+            // 1. /provider add <name> <base_url> [model] [format] [api_key] (7 parts)
+            // 2. /provider add <name> <base_url> [model] [api_key] (6 parts)
+            // 3. /provider add <name> <base_url> [api_key] (5 parts)
+            // 4. /provider add <name> <api_key> (4 parts)
+            let mut new_parts = Vec::new();
+            for (idx, part) in parts.iter().enumerate() {
+                if idx >= 3 {
+                    let is_key_token = part.starts_with("sk-")
+                        || part.starts_with("nvapi-")
+                        || part.starts_with("AIza")
+                        || (idx == parts.len() - 1
+                            && !part.starts_with('$')
+                            && *part != "openai"
+                            && *part != "gemini"
+                            && *part != "anthropic");
+                    if is_key_token && !part.starts_with('$') {
+                        new_parts.push("[REDACTED]");
+                        continue;
+                    }
+                }
+                new_parts.push(*part);
             }
-        }
-    }
-    line.to_string()
+            new_parts.join(" ")
+        } else {
+            line.to_string()
+        };
+
+    // Apply global pattern-based secret masking on all history entries
+    scrubbed = agendex_trajectory::mask_secrets(&scrubbed);
+    scrubbed
 }
 
 /// History wrapper that strips plain-text credentials before persisting.
@@ -275,6 +296,26 @@ pub fn create_default_keybindings() -> Keybindings {
         ReedlineEvent::SearchHistory,
     );
 
+    // Typing '/' inserts '/' and immediately activates the command menu
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Char('/'),
+        ReedlineEvent::Multiple(vec![
+            ReedlineEvent::Edit(vec![EditCommand::InsertChar('/')]),
+            ReedlineEvent::Menu("ide_menu".into()),
+        ]),
+    );
+
+    // Typing '@' inserts '@' and immediately activates the @file completion menu
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Char('@'),
+        ReedlineEvent::Multiple(vec![
+            ReedlineEvent::Edit(vec![EditCommand::InsertChar('@')]),
+            ReedlineEvent::Menu("ide_menu".into()),
+        ]),
+    );
+
     keybindings
 }
 
@@ -283,7 +324,8 @@ pub fn create_reedline_editor(
     commands: Vec<SlashCommandInfo>,
 ) -> Result<Reedline> {
     // 1. History directory ~/.agendex/history.txt with restrictive permissions
-    let home_dir = std::env::var("USERPROFILE")
+    let home_dir = std::env::var("AGENDEX_HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
         .or_else(|_| std::env::var("HOME"))
         .unwrap_or_else(|_| ".".to_string());
     let agendex_dir = PathBuf::from(home_dir).join(".agendex");

@@ -1,4 +1,26 @@
+use std::io::IsTerminal;
 use std::path::Path;
+
+/// Returns true if stdout is an interactive terminal and NO_COLOR is not set.
+pub fn is_color_enabled() -> bool {
+    std::io::stdout().is_terminal() && std::env::var("NO_COLOR").is_err()
+}
+
+/// Strips ANSI escape sequences from text.
+pub fn strip_ansi(input: &str) -> String {
+    static ANSI_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = ANSI_REGEX.get_or_init(|| regex::Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").unwrap());
+    re.replace_all(input, "").to_string()
+}
+
+/// Returns text with ANSI styling if stdout is a terminal, or plain text if not.
+pub fn sanitize_output_color(input: &str) -> String {
+    if is_color_enabled() {
+        input.to_string()
+    } else {
+        strip_ansi(input)
+    }
+}
 
 /// Initialize console on Windows to support 24-bit ANSI color escape codes.
 #[cfg(windows)]
@@ -67,39 +89,61 @@ pub fn print_banner(
 
     println!();
     println!(
-        "  {}✦ Agendex{} {}v0.1.0{} {}(local-first autonomous agent){}",
-        BRAND_VIOLET, RESET, TEXT_MUTED, RESET, TEXT_MUTED, RESET,
+        "{}",
+        sanitize_output_color(&format!(
+            "  {}✦ Agendex{} {}v0.1.0{} {}(local-first autonomous agent){}",
+            BRAND_VIOLET, RESET, TEXT_MUTED, RESET, TEXT_MUTED, RESET,
+        ))
     );
     println!(
-        "  {}Model:     {} {}{}{} {}({}){}",
-        TEXT_MUTED, RESET, TEXT_PRIMARY, display_model, RESET, ACCENT_CYAN, provider_display, RESET,
+        "{}",
+        sanitize_output_color(&format!(
+            "  {}Model:     {} {}{}{} {}({}){}",
+            TEXT_MUTED,
+            RESET,
+            TEXT_PRIMARY,
+            display_model,
+            RESET,
+            ACCENT_CYAN,
+            provider_display,
+            RESET,
+        ))
     );
     if let Some(url) = base_url {
         if !url.is_empty() && !url.contains("googleapis") && !url.contains("anthropic") {
             println!(
-                "  {}Endpoint:  {} {}{}{}",
-                TEXT_MUTED, RESET, TEXT_SECONDARY, url, RESET,
+                "{}",
+                sanitize_output_color(&format!(
+                    "  {}Endpoint:  {} {}{}{}",
+                    TEXT_MUTED, RESET, TEXT_SECONDARY, url, RESET,
+                ))
             );
         }
     }
     println!(
-        "  {}Workspace: {} {}{}{}",
-        TEXT_MUTED, RESET, TEXT_SECONDARY, workspace_str, RESET,
+        "{}",
+        sanitize_output_color(&format!(
+            "  {}Workspace: {} {}{}{}",
+            TEXT_MUTED, RESET, TEXT_SECONDARY, workspace_str, RESET,
+        ))
     );
     println!();
     println!(
-        "  {}Type {}/model{} to switch models, {}/help{} for skills, or ask a question.{}",
-        TEXT_MUTED, ACCENT_CYAN, TEXT_MUTED, ACCENT_CYAN, TEXT_MUTED, RESET,
+        "{}",
+        sanitize_output_color(&format!(
+            "  {}Type {}/model{} to switch models, {}/help{} for skills, or ask a question.{}",
+            TEXT_MUTED, ACCENT_CYAN, TEXT_MUTED, ACCENT_CYAN, TEXT_MUTED, RESET,
+        ))
     );
     println!();
 }
 
 /// Returns the styled interactive REPL prompt string.
 pub fn prompt_string() -> String {
-    format!(
+    sanitize_output_color(&format!(
         "{}agendex{} {}❯{} ",
         BRAND_VIOLET, RESET, ACCENT_CYAN, RESET
-    )
+    ))
 }
 
 /// Formats a tool progress notification cleanly, suppressing internal runtime noise.
@@ -115,50 +159,50 @@ pub fn format_tool_notification(raw_msg: &str) -> Option<String> {
 
     if let Some(rest) = trimmed.strip_prefix("[Tool: run_command] Executing '") {
         let cmd = rest.strip_suffix('\'').unwrap_or(rest);
-        return Some(format!(
+        return Some(sanitize_output_color(&format!(
             "  {}⚡{} {}run_command{} {}{}{}",
             ACCENT_AMBER, RESET, TEXT_PRIMARY, RESET, TEXT_SECONDARY, cmd, RESET
-        ));
+        )));
     }
 
     if let Some(rest) = trimmed.strip_prefix("[Tool: edit_file] Patching '") {
         let path = rest.strip_suffix('\'').unwrap_or(rest);
-        return Some(format!(
+        return Some(sanitize_output_color(&format!(
             "  {}📝{} {}edit_file{}   {}{}{}",
             ACCENT_CYAN, RESET, TEXT_PRIMARY, RESET, TEXT_SECONDARY, path, RESET
-        ));
+        )));
     }
 
     if let Some(rest) = trimmed.strip_prefix("[Tool: write_file] Writing '") {
         let path = rest.strip_suffix('\'').unwrap_or(rest);
-        return Some(format!(
+        return Some(sanitize_output_color(&format!(
             "  {}📝{} {}write_file{}  {}{}{}",
             ACCENT_CYAN, RESET, TEXT_PRIMARY, RESET, TEXT_SECONDARY, path, RESET
-        ));
+        )));
     }
 
     if let Some(rest) = trimmed.strip_prefix("[Tool: read_file] Reading '") {
         let path = rest.strip_suffix('\'').unwrap_or(rest);
-        return Some(format!(
+        return Some(sanitize_output_color(&format!(
             "  {}📖{} {}read_file{}   {}{}{}",
             TEXT_MUTED, RESET, TEXT_PRIMARY, RESET, TEXT_SECONDARY, path, RESET
-        ));
+        )));
     }
 
     if let Some(rest) = trimmed.strip_prefix("[Tool: ") {
         if let Some((tool_name, rem)) = rest.split_once(']') {
             let action = rem.trim();
-            return Some(format!(
+            return Some(sanitize_output_color(&format!(
                 "  {}⚡{} {}{}{} {}{}{}",
                 ACCENT_AMBER, RESET, TEXT_PRIMARY, tool_name, RESET, TEXT_SECONDARY, action, RESET
-            ));
+            )));
         }
     }
 
-    Some(format!(
+    Some(sanitize_output_color(&format!(
         "  {}⚡{} {}{}{}",
         ACCENT_AMBER, RESET, TEXT_SECONDARY, trimmed, RESET
-    ))
+    )))
 }
 
 /// Formats a git diff with color highlights (red for deletions, green for additions).
@@ -196,7 +240,7 @@ pub fn format_diff_colored(path: &str, diff: &str) -> String {
         "{}╰────────────────────────────────────────────────────────────{}\n",
         TEXT_MUTED, RESET
     ));
-    out
+    sanitize_output_color(&out)
 }
 
 /// Formats safety warning card for risky shell command executions.
@@ -226,13 +270,13 @@ pub fn format_safety_gate_card(command: &str, reason: &str, subagent_id: Option<
         "{}╰────────────────────────────────────────────────────────────{}\n",
         ACCENT_AMBER, RESET
     ));
-    out
+    sanitize_output_color(&out)
 }
 
 /// Formats the final turn telemetry footer cleanly.
 pub fn format_telemetry_footer(telemetry: &str) -> String {
-    format!(
+    sanitize_output_color(&format!(
         "\n  {}────────────────────────────────────────────────────{}\n  {}{}{}\n",
         TEXT_MUTED, RESET, TEXT_MUTED, telemetry, RESET
-    )
+    ))
 }

@@ -1,9 +1,39 @@
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use agendex_core::agent::AgendexAgent;
+
+fn spawn_spinner(message: &'static str) -> (Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+    let running = Arc::new(AtomicBool::new(true));
+    let is_term = std::io::stdout().is_terminal() && env::var("NO_COLOR").is_err();
+    let r_clone = running.clone();
+
+    let handle = tokio::spawn(async move {
+        if !is_term {
+            return;
+        }
+        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let mut idx = 0;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        while r_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            let frame = frames[idx % frames.len()];
+            eprint!(
+                "\r  \x1b[38;2;129;140;248m{}\x1b[0m \x1b[38;2;148;163;184m{}\x1b[0m",
+                frame, message
+            );
+            let _ = io::stderr().flush();
+            idx += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        }
+        eprint!("\r\x1b[2K");
+        let _ = io::stderr().flush();
+    });
+
+    (running, handle)
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -67,7 +97,8 @@ async fn main() -> anyhow::Result<()> {
     } else {
         agent
             .with_token_stream_handler(Arc::new(|token| {
-                print!("{}", token);
+                let clean = agendex_trajectory::mask_secrets(token);
+                print!("{}", clean);
                 let _ = io::stdout().flush();
             }))
             .with_tool_progress_handler(Arc::new(|msg| {
@@ -105,10 +136,11 @@ async fn main() -> anyhow::Result<()> {
         match turn_res {
             Ok(resp) => {
                 if !parsed.json_mode {
+                    let clean_resp = agendex_trajectory::mask_secrets(&resp);
                     if agent.streamed_tokens_in_last_turn() {
                         println!();
                     } else {
-                        println!("{}", resp);
+                        println!("{}", clean_resp);
                     }
                     if let Some(telemetry) = agent.format_telemetry().await {
                         println!("{}", agendex_core::ui::format_telemetry_footer(&telemetry));
@@ -374,15 +406,21 @@ async fn main() -> anyhow::Result<()> {
                             trimmed,
                         );
 
+                        let (spinner_running, spinner_handle) = spawn_spinner("Thinking...");
                         tokio::select! {
                             turn_res = agent.process_turn(&expanded) => {
+                                spinner_running.store(false, std::sync::atomic::Ordering::Relaxed);
+                                let _ = spinner_handle.await;
                                 match turn_res {
                                     Ok(reply) => {
+                                        let clean_reply = agendex_trajectory::mask_secrets(&reply);
                                         if agent.streamed_tokens_in_last_turn() {
                                             println!();
-                                        } else {
+                                        } else if std::io::stdout().is_terminal() && env::var("NO_COLOR").is_err() {
                                             let skin = termimad::MadSkin::default();
-                                            skin.print_text(&reply);
+                                            skin.print_text(&clean_reply);
+                                        } else {
+                                            println!("{}", clean_reply);
                                         }
                                         if let Some(telemetry) = agent.format_telemetry().await {
                                             println!(
@@ -400,8 +438,11 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                             _ = tokio::signal::ctrl_c() => {
+                                spinner_running.store(false, std::sync::atomic::Ordering::Relaxed);
+                                let _ = spinner_handle.await;
+                                agent.record_interrupted_turn().await;
                                 println!(
-                                    "\n  {}⚡ Turn interrupted by user (Ctrl-C). Trajectory preserved.{}",
+                                    "\n  {}⚡ Turn interrupted by user (Ctrl-C). Trajectory and token cost preserved.{}",
                                     agendex_core::ui::ACCENT_AMBER,
                                     agendex_core::ui::RESET
                                 );
@@ -446,7 +487,7 @@ async fn main() -> anyhow::Result<()> {
                         match agent.process_turn(trimmed).await {
                             Ok(reply) => {
                                 if !parsed.json_mode {
-                                    println!("{}", reply);
+                                    println!("{}", agendex_trajectory::mask_secrets(&reply));
                                 }
                             }
                             Err(err) => {

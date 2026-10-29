@@ -261,7 +261,8 @@ impl SkillRegistry {
     }
 
     fn get_user_home() -> Option<PathBuf> {
-        std::env::var("USERPROFILE")
+        std::env::var("AGENDEX_HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
             .or_else(|_| std::env::var("HOME"))
             .ok()
             .map(PathBuf::from)

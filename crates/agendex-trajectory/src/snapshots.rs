@@ -38,7 +38,8 @@ pub fn state_dir_for_workspace(workspace_dir: &Path) -> PathBuf {
     }
 
     // Fall back to home folder
-    let home = std::env::var("USERPROFILE")
+    let home = std::env::var("AGENDEX_HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
         .or_else(|_| std::env::var("HOME"))
         .ok()
         .map(PathBuf::from)
@@ -426,25 +427,61 @@ impl SnapshotEngine {
     pub async fn rollback_turn(&mut self) -> anyhow::Result<Option<TurnRollbackResult>> {
         self.ensure_git_ready().await?;
 
-        // Find the index of the latest turn_start snapshot
-        let turn_start_idx = self.snapshots.iter().rposition(|s| {
-            s.label.starts_with("turn_start")
-                || s.metadata
-                    .as_ref()
-                    .and_then(|m| m.get("kind"))
-                    .and_then(|k| k.as_str())
-                    == Some("turn_start")
-        });
+        // 0. Stage into isolated index to get current tree hash so we can detect turns with no file changes
+        let mut add_cmd = Command::new("git");
+        add_cmd.args(["add", "-A"]).current_dir(&self.workspace_dir);
+        if !self.index_file.as_os_str().is_empty() {
+            add_cmd.env("GIT_INDEX_FILE", &self.index_file);
+        }
+        let _ = add_cmd.output().await;
 
-        let target_idx = match turn_start_idx {
-            Some(idx) => idx,
-            None => {
-                if self.snapshots.is_empty() {
-                    return Ok(None);
-                }
-                0
-            }
+        let mut wt_cmd = Command::new("git");
+        wt_cmd.args(["write-tree"]).current_dir(&self.workspace_dir);
+        if !self.index_file.as_os_str().is_empty() {
+            wt_cmd.env("GIT_INDEX_FILE", &self.index_file);
+        }
+        let current_tree = if let Ok(wt_out) = wt_cmd.output().await {
+            String::from_utf8_lossy(&wt_out.stdout).trim().to_string()
+        } else {
+            String::new()
         };
+
+        // Find turn_start snapshots in reverse, skipping turns that did not mutate files
+        let turn_start_indices: Vec<usize> = self
+            .snapshots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                s.label.starts_with("turn_start")
+                    || s.metadata
+                        .as_ref()
+                        .and_then(|m| m.get("kind"))
+                        .and_then(|k| k.as_str())
+                        == Some("turn_start")
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        if turn_start_indices.is_empty() && self.snapshots.is_empty() {
+            return Ok(None);
+        }
+
+        // Find the most recent turn that actually changed files or created files
+        let mut target_idx = *turn_start_indices.last().unwrap_or(&0);
+        for &idx in turn_start_indices.iter().rev() {
+            let snap = &self.snapshots[idx];
+            let has_created = snap
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("created_files"))
+                .and_then(|f| f.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            if snap.tree_hash != current_tree || has_created {
+                target_idx = idx;
+                break;
+            }
+        }
 
         let target_record = self.snapshots[target_idx].clone();
 

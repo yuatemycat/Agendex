@@ -77,6 +77,8 @@ pub struct AgendexAgent {
     pub touched_files: Arc<Mutex<std::collections::HashSet<String>>>,
     pub streamed_tokens_in_turn: Arc<std::sync::atomic::AtomicBool>,
     pub auto_approve_yolo: Arc<std::sync::atomic::AtomicBool>,
+    pub current_turn_prompt_tokens: Arc<std::sync::atomic::AtomicUsize>,
+    pub current_turn_completion_tokens: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl AgendexAgent {
@@ -230,12 +232,47 @@ impl AgendexAgent {
             auto_approve_yolo: Arc::new(std::sync::atomic::AtomicBool::new(
                 config.auto_approve_risky,
             )),
+            current_turn_prompt_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            current_turn_completion_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
     pub fn streamed_tokens_in_last_turn(&self) -> bool {
         self.streamed_tokens_in_turn
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Records token consumption for a user-interrupted turn (Ctrl-C) so session cost accounting remains accurate.
+    pub async fn record_interrupted_turn(&self) {
+        let p_tok = self
+            .current_turn_prompt_tokens
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let c_tok = self
+            .current_turn_completion_tokens
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if p_tok == 0 && c_tok == 0 {
+            return;
+        }
+
+        let model_name = self.config.model.model_name.clone();
+        let has_known = agendex_trajectory::is_known_pricing_model(&model_name);
+        let est_cost = agendex_trajectory::estimate_cost(&model_name, p_tok, c_tok);
+
+        let mut traj = self.trajectory.lock().await;
+        let _ = traj
+            .log_step(
+                "INTERRUPTED",
+                "USER",
+                "Turn interrupted by user (Ctrl-C)",
+                serde_json::json!({ "prompt_tokens": p_tok, "completion_tokens": c_tok }),
+            )
+            .await;
+        let _ = traj.record_token_usage(None, p_tok, c_tok, est_cost, has_known);
+
+        self.current_turn_prompt_tokens
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        self.current_turn_completion_tokens
+            .store(0, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn with_diff_approval_handler(mut self, handler: DiffApprovalHandler) -> Self {
@@ -255,7 +292,8 @@ impl AgendexAgent {
 
     pub fn notify_progress(&self, msg: &str) {
         if let Some(handler) = &self.tool_progress_handler {
-            handler(msg);
+            let masked = agendex_trajectory::mask_secrets(msg);
+            handler(&masked);
         }
     }
 
@@ -268,7 +306,8 @@ impl AgendexAgent {
             return true;
         }
         if let Some(handler) = &self.diff_approval_handler {
-            return handler(path, diff);
+            let masked_diff = agendex_trajectory::mask_secrets(diff);
+            return handler(path, &masked_diff);
         }
         if let Some(queue) = &self.approval_queue {
             let agent_id = self.agent_id.as_deref().unwrap_or("parent");
@@ -509,14 +548,136 @@ impl AgendexAgent {
                     let mut comp = self.compactor.lock().await;
                     let mut history = self.history.lock().await;
                     let before_count = history.len();
-                    let summary = comp.generate_continuation_summary(if rest_args.is_empty() {
-                        "Manual context compaction triggered."
-                    } else {
-                        rest_args
-                    });
                     comp.grant_immunity(1);
 
                     let safe_cut = find_safe_compaction_boundary(&history, 4);
+                    let evicted_slice: Vec<ChatMessage> =
+                        if safe_cut > 2 && safe_cut < history.len() {
+                            history[1..safe_cut].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+
+                    let mut summary = String::new();
+                    if !evicted_slice.is_empty() {
+                        // 1. Try real model-generated continuation summary
+                        let mut prompt_msgs = vec![
+                            ChatMessage::system(
+                                "You are an autonomous context compactor. Summarize the following evicted conversation turns into a concise, factual continuation summary.\n\
+                                Format your response with exactly three sections:\n\
+                                ### 1. Task Overview & Initial Objectives\n\
+                                - Core objectives and requirements requested by the user\n\
+                                ### 2. Key Decisions & Structural Changes Made\n\
+                                - Concrete files created or modified, tools called, and decisions\n\
+                                ### 3. Current State & Next Steps\n\
+                                - Active status of the codebase and immediate remaining tasks"
+                            ),
+                        ];
+                        prompt_msgs.extend(evicted_slice.iter().cloned());
+                        prompt_msgs.push(ChatMessage::user(
+                            "Generate the structured continuation summary for the above turns now.",
+                        ));
+
+                        if let Ok(client) = self.model_client.try_read() {
+                            if let Ok(resp) = client.chat(&prompt_msgs, &[]).await {
+                                if let Some(txt) = resp.text {
+                                    if !txt.trim().is_empty() {
+                                        summary = txt.trim().to_string();
+                                    }
+                                }
+                            }
+                        }
+
+                        // 2. Dynamic fallback: extract user requests and tool execution deltas
+                        if summary.is_empty() {
+                            let mut user_goals = Vec::new();
+                            let mut tools_used = Vec::new();
+                            let mut final_notes = Vec::new();
+
+                            for m in &evicted_slice {
+                                if m.role == "user" && !m.content.starts_with('/') {
+                                    let first_line = m.content.lines().next().unwrap_or("").trim();
+                                    if !first_line.is_empty() && user_goals.len() < 3 {
+                                        user_goals.push(first_line.to_string());
+                                    }
+                                } else if m.role == "assistant" {
+                                    if let Some(ref tcs) = m.tool_calls {
+                                        for tc in tcs {
+                                            let note = match tc.name.as_str() {
+                                                "write_file" | "edit_file" => {
+                                                    let path = tc
+                                                        .arguments
+                                                        .get("path")
+                                                        .and_then(|p| p.as_str())
+                                                        .unwrap_or("");
+                                                    format!("{}: {}", tc.name, path)
+                                                }
+                                                "run_command" => {
+                                                    let cmd = tc
+                                                        .arguments
+                                                        .get("command_line")
+                                                        .and_then(|c| c.as_str())
+                                                        .unwrap_or("");
+                                                    let short_cmd = cmd
+                                                        .split_whitespace()
+                                                        .take(4)
+                                                        .collect::<Vec<_>>()
+                                                        .join(" ");
+                                                    format!("run_command: {}", short_cmd)
+                                                }
+                                                _ => tc.name.clone(),
+                                            };
+                                            if !tools_used.contains(&note) && tools_used.len() < 6 {
+                                                tools_used.push(note);
+                                            }
+                                        }
+                                    } else if !m.content.is_empty() && final_notes.len() < 2 {
+                                        let first_line =
+                                            m.content.lines().next().unwrap_or("").trim();
+                                        if !first_line.is_empty() {
+                                            final_notes.push(first_line.to_string());
+                                        }
+                                    }
+                                }
+                            }
+
+                            let mut s = String::new();
+                            s.push_str("### 1. Task Overview & Initial Objectives\n");
+                            if user_goals.is_empty() {
+                                s.push_str("- Active autonomous software engineering session.\n");
+                            } else {
+                                for g in &user_goals {
+                                    s.push_str(&format!("- Goal: {}\n", g));
+                                }
+                            }
+                            s.push_str("\n### 2. Key Decisions & Structural Changes Made\n");
+                            if tools_used.is_empty() {
+                                s.push_str("- Initial repository inspection and baseline setup.\n");
+                            } else {
+                                for t in &tools_used {
+                                    s.push_str(&format!("- Executed {}\n", t));
+                                }
+                            }
+                            s.push_str("\n### 3. Current State & Next Steps\n");
+                            if final_notes.is_empty() {
+                                s.push_str(
+                                    "- Working tree verified; ready for subsequent instructions.\n",
+                                );
+                            } else {
+                                for n in &final_notes {
+                                    s.push_str(&format!("- State: {}\n", n));
+                                }
+                            }
+                            summary = s;
+                        }
+                    } else {
+                        summary = comp.generate_continuation_summary(if rest_args.is_empty() {
+                            "Manual context compaction triggered."
+                        } else {
+                            rest_args
+                        });
+                    }
+
                     let evicted_count = if safe_cut > 2 && safe_cut < history.len() {
                         let mut compacted = Vec::new();
                         compacted.push(history[0].clone()); // system prompt
@@ -775,13 +936,23 @@ impl AgendexAgent {
 
             // Call Model
             self.notify_progress("Generating response...");
+            let est_prompt = (history.iter().map(|m| m.content.len()).sum::<usize>() + 2000) / 4;
+            self.current_turn_prompt_tokens
+                .store(est_prompt, std::sync::atomic::Ordering::SeqCst);
+
             let stream_handler: Option<TokenStreamHandler> =
                 if let Some(handler) = &self.token_stream_handler {
                     let flag = Arc::clone(&self.streamed_tokens_in_turn);
                     let h = Arc::clone(handler);
+                    let comp_counter = Arc::clone(&self.current_turn_completion_tokens);
                     Some(Arc::new(move |token: &str| {
                         flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                        h(token);
+                        comp_counter.fetch_add(
+                            (token.len() / 4).max(1),
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                        let masked_token = agendex_trajectory::mask_secrets(token);
+                        h(&masked_token);
                     }))
                 } else {
                     None
@@ -796,6 +967,10 @@ impl AgendexAgent {
             turn_prompt_tokens += resp.prompt_tokens;
             turn_completion_tokens += resp.completion_tokens;
             total_tokens = resp.prompt_tokens + resp.completion_tokens;
+            self.current_turn_prompt_tokens
+                .store(turn_prompt_tokens, std::sync::atomic::Ordering::SeqCst);
+            self.current_turn_completion_tokens
+                .store(turn_completion_tokens, std::sync::atomic::Ordering::SeqCst);
 
             // If the model emitted tool calls, execute them
             if !resp.tool_calls.is_empty() {
@@ -1203,7 +1378,8 @@ impl AgendexAgent {
                 };
 
                 let content_preview = if content.len() > 400 {
-                    format!("{}...", content[..400].trim())
+                    let safe_idx = content.floor_char_boundary(400);
+                    format!("{}...", content[..safe_idx].trim())
                 } else {
                     content.trim().to_string()
                 };
@@ -1499,9 +1675,34 @@ impl AgendexAgent {
                 } else {
                     let name = parts[2];
                     let base_url = parts[3];
-                    let model = parts.get(4).copied();
-                    let format = parts.get(5).copied();
-                    let api_key = parts.get(6).copied();
+                    let (model, format, api_key) = match parts.len() {
+                        4 => (None, None, None),
+                        5 => {
+                            let arg = parts[4];
+                            if arg.starts_with("sk-")
+                                || arg.starts_with("nvapi-")
+                                || arg.starts_with('$')
+                            {
+                                (None, None, Some(arg))
+                            } else {
+                                (Some(arg), None, None)
+                            }
+                        }
+                        6 => {
+                            let arg4 = parts[4];
+                            let arg5 = parts[5];
+                            if arg5 == "openai" || arg5 == "gemini" || arg5 == "anthropic" {
+                                (Some(arg4), Some(arg5), None)
+                            } else {
+                                (Some(arg4), None, Some(arg5))
+                            }
+                        }
+                        _ => (
+                            parts.get(4).copied(),
+                            parts.get(5).copied(),
+                            parts.get(6).copied(),
+                        ),
+                    };
                     self.add_provider(name, base_url, model, format, api_key)
                         .await
                 }
@@ -1755,17 +1956,30 @@ impl AgendexAgent {
         let resolved_model = model.unwrap_or("default-model").to_string();
         let resolved_key = api_key.unwrap_or("").to_string();
 
+        let (stored_key_ref, key_display_note) = if resolved_key.is_empty() {
+            (None, String::new())
+        } else if resolved_key.starts_with('$') {
+            (
+                Some(resolved_key.clone()),
+                format!(" (key ref: {})", resolved_key),
+            )
+        } else {
+            let env_var = format!("{}_API_KEY", key.to_uppercase().replace('-', "_"));
+            std::env::set_var(&env_var, &resolved_key);
+            let env_ref = format!("${}", env_var);
+            (
+                Some(env_ref.clone()),
+                format!(" (key saved as env ref: {})", env_ref),
+            )
+        };
+
         cfg.providers.insert(
             key.clone(),
             crate::config::ProviderConfigEntry {
                 format: Some(resolved_format.clone()),
                 base_url: Some(base_url.to_string()),
                 model: Some(resolved_model.clone()),
-                api_key: if resolved_key.is_empty() {
-                    None
-                } else {
-                    Some(resolved_key)
-                },
+                api_key: stored_key_ref,
                 tier: Some("128k".to_string()),
             },
         );
@@ -1775,8 +1989,8 @@ impl AgendexAgent {
         }
 
         Ok(format!(
-            "[Agendex] Added provider '{}' (url: {}, model: {}, format: {}).\nTo activate: '/provider switch {}'",
-            key, base_url, resolved_model, resolved_format, key
+            "[Agendex] Added provider '{}' (url: {}, model: {}, format: {}){}.\nTo activate: '/provider switch {}'",
+            key, base_url, resolved_model, resolved_format, key_display_note, key
         ))
     }
 
@@ -1892,11 +2106,41 @@ impl AgendexAgent {
     /// Handles `/context` command.
     pub async fn handle_context_command(&self) -> String {
         let history = self.history.lock().await;
-        // Estimate token count of current active messages in context
-        let active_chars: usize = history.iter().map(|m| m.content.len()).sum();
-        // Standard rule of thumb: ~4 characters per token
-        let active_tokens = (active_chars / 4).max(1);
+        // Count active message text and tool calls JSON
+        let mut total_chars: usize = history
+            .iter()
+            .map(|m| {
+                let tc_len = m
+                    .tool_calls
+                    .as_ref()
+                    .and_then(|tcs| serde_json::to_string(tcs).ok())
+                    .map(|s| s.len())
+                    .unwrap_or(0);
+                m.content.len() + tc_len
+            })
+            .sum();
         drop(history);
+
+        // Include tool schema definitions injected into each LLM turn
+        for t in self.tool_registry.list_tool_definitions() {
+            if let Ok(s) = serde_json::to_string(&t) {
+                total_chars += s.len();
+            }
+        }
+
+        // Include MCP tool schemas
+        for t in self.mcp_registry.list_tools().await {
+            if let Ok(s) = serde_json::to_string(&t) {
+                total_chars += s.len();
+            }
+        }
+
+        // Include active rule definitions
+        let rule_blocks = self.rules_engine.generate_rule_blocks(None);
+        total_chars += rule_blocks.len();
+
+        // Standard estimation: ~4 characters per token
+        let active_tokens = (total_chars / 4).max(1);
 
         let tier = self.config.model_tier;
         let limit = tier.ceiling_tokens();
@@ -2088,7 +2332,8 @@ impl AgendexAgent {
 
     /// Handles `/config` command.
     pub fn handle_config_command(&self) -> String {
-        let home_dir = std::env::var("USERPROFILE")
+        let home_dir = std::env::var("AGENDEX_HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
             .or_else(|_| std::env::var("HOME"))
             .unwrap_or_else(|_| ".".to_string());
         let config_path = std::path::PathBuf::from(home_dir)
@@ -2147,12 +2392,29 @@ impl AgendexAgent {
         drop(snap);
 
         if !trimmed_arg.is_empty() {
+            if trimmed_arg.contains("..") || trimmed_arg.contains('/') || trimmed_arg.contains('\\')
+            {
+                return Ok(format!(
+                    "Invalid session ID '{}': directory traversal characters are prohibited.",
+                    trimmed_arg
+                ));
+            }
             let target_log_dir = logs_dir.join(trimmed_arg);
             if !target_log_dir.exists() {
                 return Ok(format!(
                     "Session '{}' not found in logs directory.",
                     trimmed_arg
                 ));
+            }
+            if let (Ok(canon_target), Ok(canon_logs)) =
+                (target_log_dir.canonicalize(), logs_dir.canonicalize())
+            {
+                if !canon_target.starts_with(&canon_logs) {
+                    return Ok(format!(
+                        "Invalid session ID '{}': target path resolves outside session logs directory.",
+                        trimmed_arg
+                    ));
+                }
             }
             let logger = agendex_trajectory::TrajectoryLogger::new(&target_log_dir)?;
             let steps = logger.get_steps().to_vec();
