@@ -141,98 +141,248 @@ enum ConsoleRequest {
     },
 }
 
+enum ConsoleEvent {
+    Request(ConsoleRequest),
+    Line(String),
+    Eof,
+}
+
+enum ActiveApproval {
+    Command(tokio::sync::oneshot::Sender<bool>),
+    Diff(tokio::sync::oneshot::Sender<bool>),
+}
+
 /// Shared console coordinator serializing all interactive prompts and standard input across
 /// concurrent subagents and the CLI REPL, guaranteeing exactly one reader on terminal stdin.
 pub struct SharedApprovalQueue {
-    sender: tokio::sync::mpsc::UnboundedSender<ConsoleRequest>,
+    sender: std::sync::mpsc::Sender<ConsoleEvent>,
 }
 
 impl SharedApprovalQueue {
     pub fn new() -> Arc<Self> {
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<ConsoleRequest>();
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<ConsoleEvent>();
 
+        // 1. Spawn dedicated Stdin Reader Thread that solely blocks on stdin.read_line()
+        let stdin_tx = event_tx.clone();
         std::thread::Builder::new()
-            .name("agendex-console-worker".to_string())
+            .name("agendex-stdin-reader".to_string())
             .spawn(move || {
-                use std::io::Write;
-                while let Some(req) = receiver.blocking_recv() {
-                    match req {
-                        ConsoleRequest::Approval {
-                            subagent_id,
-                            command,
-                            reason,
-                            responder,
-                        } => {
-                            println!();
-                            if subagent_id.is_empty() || subagent_id == "parent" {
-                                println!(
-                                    "[Safety Gate] Command is classified as risky ({}):",
-                                    reason
-                                );
-                            } else {
-                                println!(
-                                    "[Safety Gate: Subagent {}] Command is classified as risky ({}):",
-                                    subagent_id, reason
-                                );
-                            }
-                            println!("  {}", command);
-                            print!("Allow execution? [y/N]: ");
-                            let _ = std::io::stdout().flush();
-                            let mut input = String::new();
-                            let approved = if std::io::stdin().read_line(&mut input).is_ok() {
-                                let trimmed = input.trim().to_lowercase();
-                                trimmed == "y" || trimmed == "yes"
-                            } else {
-                                false
-                            };
-                            let _ = responder.send(approved);
+                let stdin = std::io::stdin();
+                loop {
+                    let mut line = String::new();
+                    match stdin.read_line(&mut line) {
+                        Ok(0) => {
+                            let _ = stdin_tx.send(ConsoleEvent::Eof);
+                            break;
                         }
-                        ConsoleRequest::DiffApproval {
-                            subagent_id,
-                            path,
-                            diff,
-                            responder,
-                        } => {
-                            println!();
-                            if subagent_id.is_empty() || subagent_id == "parent" {
-                                println!("[Diff Review] Proposed changes to '{}':", path);
-                            } else {
-                                println!(
-                                    "[Diff Review: Subagent {}] Proposed changes to '{}':",
-                                    subagent_id, path
-                                );
+                        Ok(_) => {
+                            if stdin_tx.send(ConsoleEvent::Line(line)).is_err() {
+                                break;
                             }
-                            println!("{}", diff);
-                            print!("Apply this change? [y/N]: ");
-                            let _ = std::io::stdout().flush();
-                            let mut input = String::new();
-                            let approved = if std::io::stdin().read_line(&mut input).is_ok() {
-                                let trimmed = input.trim().to_lowercase();
-                                trimmed == "y" || trimmed == "yes"
-                            } else {
-                                false
-                            };
-                            let _ = responder.send(approved);
                         }
-                        ConsoleRequest::ReadLine { prompt, responder } => {
-                            if !prompt.is_empty() {
-                                print!("{}", prompt);
-                                let _ = std::io::stdout().flush();
-                            }
-                            let mut input = String::new();
-                            let res = if std::io::stdin().read_line(&mut input).is_ok() {
-                                Some(input)
-                            } else {
-                                None
-                            };
-                            let _ = responder.send(res);
+                        Err(_) => {
+                            let _ = stdin_tx.send(ConsoleEvent::Eof);
+                            break;
                         }
                     }
                 }
             })
-            .expect("Failed to spawn shared console worker thread");
+            .expect("Failed to spawn stdin reader thread");
 
-        Arc::new(Self { sender })
+        // 2. Spawn dedicated Console Coordinator Thread that serializes all interactive prompts
+        std::thread::Builder::new()
+            .name("agendex-console-coordinator".to_string())
+            .spawn(move || {
+                use std::io::Write;
+                let mut active_approval: Option<ActiveApproval> = None;
+                let mut pending_approvals: std::collections::VecDeque<ConsoleRequest> =
+                    std::collections::VecDeque::new();
+                let mut active_readline: Option<(String, tokio::sync::oneshot::Sender<Option<String>>)> =
+                    None;
+
+                while let Ok(event) = event_rx.recv() {
+                    match event {
+                        ConsoleEvent::Request(req) => match req {
+                            ConsoleRequest::Approval {
+                                subagent_id,
+                                command,
+                                reason,
+                                responder,
+                            } => {
+                                if active_approval.is_some() {
+                                    pending_approvals.push_back(ConsoleRequest::Approval {
+                                        subagent_id,
+                                        command,
+                                        reason,
+                                        responder,
+                                    });
+                                } else {
+                                    println!();
+                                    if subagent_id.is_empty() || subagent_id == "parent" {
+                                        println!(
+                                            "[Safety Gate] Command is classified as risky ({}):",
+                                            reason
+                                        );
+                                    } else {
+                                        println!(
+                                            "[Safety Gate: Subagent {}] Command is classified as risky ({}):",
+                                            subagent_id, reason
+                                        );
+                                    }
+                                    println!("  {}", command);
+                                    print!("Allow execution? [y/N]: ");
+                                    let _ = std::io::stdout().flush();
+                                    active_approval = Some(ActiveApproval::Command(responder));
+                                }
+                            }
+                            ConsoleRequest::DiffApproval {
+                                subagent_id,
+                                path,
+                                diff,
+                                responder,
+                            } => {
+                                if active_approval.is_some() {
+                                    pending_approvals.push_back(ConsoleRequest::DiffApproval {
+                                        subagent_id,
+                                        path,
+                                        diff,
+                                        responder,
+                                    });
+                                } else {
+                                    println!();
+                                    if subagent_id.is_empty() || subagent_id == "parent" {
+                                        println!("[Diff Review] Proposed changes to '{}':", path);
+                                    } else {
+                                        println!(
+                                            "[Diff Review: Subagent {}] Proposed changes to '{}':",
+                                            subagent_id, path
+                                        );
+                                    }
+                                    println!("{}", diff);
+                                    print!("Apply this change? [y/N]: ");
+                                    let _ = std::io::stdout().flush();
+                                    active_approval = Some(ActiveApproval::Diff(responder));
+                                }
+                            }
+                            ConsoleRequest::ReadLine { prompt, responder } => {
+                                if active_approval.is_none() && !prompt.is_empty() {
+                                    print!("{}", prompt);
+                                    let _ = std::io::stdout().flush();
+                                }
+                                active_readline = Some((prompt, responder));
+                            }
+                        },
+                        ConsoleEvent::Line(input) => {
+                            if let Some(ticket) = active_approval.take() {
+                                let trimmed = input.trim().to_lowercase();
+                                let approved = trimmed == "y" || trimmed == "yes";
+                                match ticket {
+                                    ActiveApproval::Command(tx) => {
+                                        let _ = tx.send(approved);
+                                    }
+                                    ActiveApproval::Diff(tx) => {
+                                        let _ = tx.send(approved);
+                                    }
+                                }
+
+                                // If there are pending approvals, prompt the next one
+                                if let Some(next_req) = pending_approvals.pop_front() {
+                                    match next_req {
+                                        ConsoleRequest::Approval {
+                                            subagent_id,
+                                            command,
+                                            reason,
+                                            responder,
+                                        } => {
+                                            println!();
+                                            if subagent_id.is_empty() || subagent_id == "parent" {
+                                                println!(
+                                                    "[Safety Gate] Command is classified as risky ({}):",
+                                                    reason
+                                                );
+                                            } else {
+                                                println!(
+                                                    "[Safety Gate: Subagent {}] Command is classified as risky ({}):",
+                                                    subagent_id, reason
+                                                );
+                                            }
+                                            println!("  {}", command);
+                                            print!("Allow execution? [y/N]: ");
+                                            let _ = std::io::stdout().flush();
+                                            active_approval =
+                                                Some(ActiveApproval::Command(responder));
+                                        }
+                                        ConsoleRequest::DiffApproval {
+                                            subagent_id,
+                                            path,
+                                            diff,
+                                            responder,
+                                        } => {
+                                            println!();
+                                            if subagent_id.is_empty() || subagent_id == "parent" {
+                                                println!(
+                                                    "[Diff Review] Proposed changes to '{}':",
+                                                    path
+                                                );
+                                            } else {
+                                                println!(
+                                                    "[Diff Review: Subagent {}] Proposed changes to '{}':",
+                                                    subagent_id, path
+                                                );
+                                            }
+                                            println!("{}", diff);
+                                            print!("Apply this change? [y/N]: ");
+                                            let _ = std::io::stdout().flush();
+                                            active_approval = Some(ActiveApproval::Diff(responder));
+                                        }
+                                        _ => {}
+                                    }
+                                } else if let Some((ref prompt, _)) = active_readline {
+                                    // No pending approvals left, restore the REPL prompt
+                                    if !prompt.is_empty() {
+                                        print!("{}", prompt);
+                                        let _ = std::io::stdout().flush();
+                                    }
+                                }
+                            } else if let Some((_, responder)) = active_readline.take() {
+                                let _ = responder.send(Some(input));
+                            }
+                        }
+                        ConsoleEvent::Eof => {
+                            if let Some(ticket) = active_approval.take() {
+                                match ticket {
+                                    ActiveApproval::Command(tx) => {
+                                        let _ = tx.send(false);
+                                    }
+                                    ActiveApproval::Diff(tx) => {
+                                        let _ = tx.send(false);
+                                    }
+                                }
+                            }
+                            while let Some(req) = pending_approvals.pop_front() {
+                                match req {
+                                    ConsoleRequest::Approval { responder, .. } => {
+                                        let _ = responder.send(false);
+                                    }
+                                    ConsoleRequest::DiffApproval { responder, .. } => {
+                                        let _ = responder.send(false);
+                                    }
+                                    ConsoleRequest::ReadLine { responder, .. } => {
+                                        let _ = responder.send(None);
+                                    }
+                                }
+                            }
+                            if let Some((_, responder)) = active_readline.take() {
+                                let _ = responder.send(None);
+                            }
+                            break;
+                        }
+                    }
+                }
+            })
+            .expect("Failed to spawn console coordinator thread");
+
+        Arc::new(Self { sender: event_tx })
     }
 
     /// Asynchronously wait for user approval ticket without blocking the async runtime
@@ -245,7 +395,7 @@ impl SharedApprovalQueue {
             responder: tx,
         };
 
-        if self.sender.send(req).is_err() {
+        if self.sender.send(ConsoleEvent::Request(req)).is_err() {
             return false;
         }
 
@@ -262,7 +412,7 @@ impl SharedApprovalQueue {
             responder: tx,
         };
 
-        if self.sender.send(req).is_err() {
+        if self.sender.send(ConsoleEvent::Request(req)).is_err() {
             return false;
         }
 
@@ -277,7 +427,7 @@ impl SharedApprovalQueue {
             responder: tx,
         };
 
-        if self.sender.send(req).is_err() {
+        if self.sender.send(ConsoleEvent::Request(req)).is_err() {
             return None;
         }
 
@@ -315,13 +465,6 @@ impl SubagentManager {
         personas.insert(c.name.clone(), c);
         personas.insert(rev.name.clone(), rev);
 
-        use std::io::IsTerminal;
-        let approval_queue = if !base_config.auto_approve_risky && std::io::stdin().is_terminal() {
-            Some(SharedApprovalQueue::new())
-        } else {
-            None
-        };
-
         Self {
             parent_id: parent_id.into(),
             base_config,
@@ -331,7 +474,7 @@ impl SubagentManager {
             instances: Arc::new(RwLock::new(HashMap::new())),
             join_handles: Arc::new(Mutex::new(HashMap::new())),
             approval_handler: None,
-            approval_queue,
+            approval_queue: None,
         }
     }
 

@@ -309,8 +309,9 @@ impl ToolRegistry {
             strip_verbatim(&raw.canonicalize()?)
         } else {
             // Check the nearest existing parent folder before creating or accessing a new file
-            // to close parent directory symlink escape holes.
+            // to close parent directory symlink escape holes and correctly handle symlinked workspaces.
             let mut current = raw.parent();
+            let mut resolved_new_path = None;
             while let Some(parent) = current {
                 if parent.exists() {
                     let canon_parent = strip_verbatim(&parent.canonicalize()?);
@@ -322,14 +323,18 @@ impl ToolRegistry {
                             self.workspace_dir.display()
                         ));
                     }
+                    if let Ok(suffix) = raw.strip_prefix(parent) {
+                        resolved_new_path = Some(strip_verbatim(&canon_parent.join(suffix)));
+                    }
                     break;
                 }
                 current = parent.parent();
             }
-            strip_verbatim(&normalize_path(&raw))
+            resolved_new_path.unwrap_or_else(|| strip_verbatim(&normalize_path(&raw)))
         };
 
-        if !is_subpath(&normalized, &base) {
+        let workspace_norm = strip_verbatim(&normalize_path(&self.workspace_dir));
+        if !is_subpath(&normalized, &base) && !is_subpath(&normalized, &workspace_norm) {
             return Err(anyhow!(
                 "Path '{}' escapes workspace boundary '{}'",
                 p.display(),

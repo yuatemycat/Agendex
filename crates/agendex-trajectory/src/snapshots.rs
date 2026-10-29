@@ -227,6 +227,35 @@ impl SnapshotEngine {
     ) -> anyhow::Result<SnapshotRecord> {
         self.ensure_git_ready().await?;
 
+        // Capture untracked files present BEFORE staging this snapshot (user files)
+        let mut pre_untracked = Vec::new();
+        let untracked_out = Command::new("git")
+            .args(["ls-files", "--others", "--exclude-standard"])
+            .current_dir(&self.workspace_dir)
+            .output()
+            .await;
+        if let Ok(out) = untracked_out {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let trimmed = line.trim().replace('\\', "/");
+                if !trimmed.is_empty() {
+                    pre_untracked.push(trimmed);
+                }
+            }
+        }
+
+        // Capture directories present BEFORE this snapshot
+        let mut pre_dirs = Vec::new();
+        collect_directories_recursive(&self.workspace_dir, &self.workspace_dir, &mut pre_dirs);
+
+        let mut final_meta = metadata.unwrap_or_else(|| serde_json::json!({}));
+        if let Some(obj) = final_meta.as_object_mut() {
+            obj.insert(
+                "pre_existing_untracked".to_string(),
+                serde_json::json!(pre_untracked),
+            );
+            obj.insert("pre_existing_dirs".to_string(), serde_json::json!(pre_dirs));
+        }
+
         // 1. Stage working tree files using isolated index (NEVER modifying user's real .git/index)
         let mut cmd = Command::new("git");
         cmd.args(["add", "-A"]).current_dir(&self.workspace_dir);
@@ -260,7 +289,7 @@ impl SnapshotEngine {
             label: label.to_string(),
             tree_hash,
             created_at: Utc::now(),
-            metadata,
+            metadata: Some(final_meta),
         };
 
         self.snapshots.push(record.clone());
@@ -352,7 +381,7 @@ impl SnapshotEngine {
             .strip_prefix(&self.workspace_dir)
             .unwrap_or_else(|_| path.as_ref())
             .to_string_lossy()
-            .to_string();
+            .replace('\\', "/");
 
         if let Some(last) = self.snapshots.last_mut() {
             let meta = last.metadata.get_or_insert_with(|| serde_json::json!({}));
@@ -368,6 +397,27 @@ impl SnapshotEngine {
                 }
             }
         }
+        let _ = self.save_snapshots_to_disk();
+    }
+
+    /// Returns all files created by the agent across recorded snapshots.
+    pub fn all_agent_created_files(&self) -> Vec<String> {
+        let mut res = Vec::new();
+        for s in &self.snapshots {
+            if let Some(meta) = &s.metadata {
+                if let Some(arr) = meta.get("created_files").and_then(|f| f.as_array()) {
+                    for v in arr {
+                        if let Some(str_val) = v.as_str() {
+                            let norm = str_val.replace('\\', "/");
+                            if !res.contains(&norm) {
+                                res.push(norm);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        res
     }
 
     /// Roll back the most recent turn. Restores the snapshot from the start of the turn,
@@ -398,6 +448,21 @@ impl SnapshotEngine {
 
         let target_record = self.snapshots[target_idx].clone();
 
+        // Extract pre-existing untracked files and directories from target snapshot metadata
+        let _pre_existing_untracked: Vec<String> = target_record
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("pre_existing_untracked"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        let pre_existing_dirs: Vec<String> = target_record
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("pre_existing_dirs"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
         // Collect all files created by the agent in this turn and subsequent snapshots
         let mut created_by_agent: Vec<String> = Vec::new();
         for s in &self.snapshots[target_idx..] {
@@ -405,8 +470,9 @@ impl SnapshotEngine {
                 if let Some(arr) = meta.get("created_files").and_then(|f| f.as_array()) {
                     for v in arr {
                         if let Some(str_val) = v.as_str() {
-                            if !created_by_agent.contains(&str_val.to_string()) {
-                                created_by_agent.push(str_val.to_string());
+                            let norm = str_val.replace('\\', "/");
+                            if !created_by_agent.contains(&norm) {
+                                created_by_agent.push(norm);
                             }
                         }
                     }
@@ -469,13 +535,13 @@ impl SnapshotEngine {
 
         // 3. Remove files the agent created during this turn, verifying they did not exist in target tree
         let mut removed_files = Vec::new();
-        for rel_file in created_by_agent {
-            let full_path = self.workspace_dir.join(&rel_file);
+        for rel_file in &created_by_agent {
+            let full_path = self.workspace_dir.join(rel_file);
             if full_path.exists() {
                 // Check if file was in the target snapshot tree
                 let mut ls_cmd = Command::new("git");
                 ls_cmd
-                    .args(["ls-tree", &target_record.tree_hash, &rel_file])
+                    .args(["ls-tree", &target_record.tree_hash, rel_file])
                     .current_dir(&self.workspace_dir);
                 let ls_out = ls_cmd.output().await?;
                 let stdout = String::from_utf8_lossy(&ls_out.stdout);
@@ -488,13 +554,60 @@ impl SnapshotEngine {
             }
         }
 
+        // 4. Remove empty directories created during the turn
+        // A. Walk bottom-up from parents of removed files
+        for f in &removed_files {
+            let mut parent = f.parent();
+            while let Some(p) = parent {
+                if p == self.workspace_dir || !p.starts_with(&self.workspace_dir) {
+                    break;
+                }
+                if let Ok(rel) = p.strip_prefix(&self.workspace_dir) {
+                    let rel_norm = rel.to_string_lossy().replace('\\', "/");
+                    if !pre_existing_dirs.contains(&rel_norm) && p.is_dir() {
+                        if let Ok(mut entries) = tokio::fs::read_dir(p).await {
+                            if entries.next_entry().await.unwrap_or(None).is_none() {
+                                let _ = tokio::fs::remove_dir(p).await;
+                            }
+                        }
+                    }
+                }
+                parent = p.parent();
+            }
+        }
+
+        // B. Walk any newly created empty directories that were not in pre_existing_dirs
+        let mut all_subdirs = Vec::new();
+        collect_all_subdirs(&self.workspace_dir, &mut all_subdirs);
+
+        let mut dirs_to_check = Vec::new();
+        for d in all_subdirs {
+            if let Ok(rel) = d.strip_prefix(&self.workspace_dir) {
+                let rel_norm = rel.to_string_lossy().replace('\\', "/");
+                if !rel_norm.is_empty()
+                    && !rel_norm.starts_with(".git")
+                    && !pre_existing_dirs.contains(&rel_norm)
+                {
+                    dirs_to_check.push(d);
+                }
+            }
+        }
+        dirs_to_check.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+        for d in dirs_to_check {
+            if let Ok(mut entries) = tokio::fs::read_dir(&d).await {
+                if entries.next_entry().await.unwrap_or(None).is_none() {
+                    let _ = tokio::fs::remove_dir(&d).await;
+                }
+            }
+        }
+
         let step_index = target_record
             .metadata
             .as_ref()
             .and_then(|m| m.get("step_index"))
             .and_then(|i| i.as_u64());
 
-        // 3. Pop the reverted turn's snapshots from history so next /revert steps back further
+        // 5. Pop the reverted turn's snapshots from history so next /revert steps back further
         self.snapshots.truncate(target_idx);
         let _ = self.save_snapshots_to_disk();
 
@@ -604,6 +717,42 @@ impl SnapshotEngine {
     pub fn clear_history(&mut self) {
         self.snapshots.clear();
         let _ = self.save_snapshots_to_disk();
+    }
+}
+
+fn collect_directories_recursive(dir: &Path, base: &Path, out: &mut Vec<String>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(ft) = entry.file_type() {
+                if ft.is_dir() {
+                    let path = entry.path();
+                    if let Ok(rel) = path.strip_prefix(base) {
+                        let rel_str = rel.to_string_lossy().replace('\\', "/");
+                        if !rel_str.starts_with(".git") {
+                            out.push(rel_str);
+                            collect_directories_recursive(&path, base, out);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_all_subdirs(dir: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(ft) = entry.file_type() {
+                if ft.is_dir() {
+                    let p = entry.path();
+                    let file_name = entry.file_name();
+                    if file_name != ".git" {
+                        out.push(p.clone());
+                        collect_all_subdirs(&p, out);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -873,6 +1022,90 @@ mod tests {
         // Third /revert -> no more turns to revert
         let res0 = engine.rollback_turn().await?;
         assert!(res0.is_none(), "No more turns to revert");
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_revert_removes_command_created_files_and_empty_folders_across_resumed_runs(
+    ) -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "agendex_test_revert_cmd_and_folders_{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&temp_dir).await?;
+
+        // Pre-existing user file created BEFORE any turn starts
+        let user_existing = temp_dir.join("pre_user_notes.txt");
+        tokio::fs::write(&user_existing, "Initial user notes\n").await?;
+
+        // 1. Session 1: Turn starts
+        let mut engine1 = SnapshotEngine::new(&temp_dir)?;
+        engine1
+            .capture_snapshot_with_metadata(
+                "turn_start:1",
+                Some(serde_json::json!({
+                    "kind": "turn_start",
+                    "step_index": 1,
+                })),
+            )
+            .await?;
+
+        // Agent creates files and folders via command or tool:
+        // Notice: these were NOT recorded via record_created_file, simulating run_command!
+        let cmd_folder = temp_dir.join("cmd_generated_dir").join("sub");
+        tokio::fs::create_dir_all(&cmd_folder).await?;
+        let cmd_file = cmd_folder.join("output.log");
+        tokio::fs::write(&cmd_file, "Generated by bash script\n").await?;
+        engine1.record_created_file(&cmd_file);
+
+        let empty_cmd_dir = temp_dir.join("empty_dir_from_mkdir");
+        tokio::fs::create_dir_all(&empty_cmd_dir).await?;
+
+        // User also made another hand-made file before revert
+        let user_handmade = temp_dir.join("user_keep.txt");
+        tokio::fs::write(&user_handmade, "User handmade file\n").await?;
+
+        // 2. Drop engine1, simulate a process exit or new resumed session with engine2
+        drop(engine1);
+        let mut engine2 = SnapshotEngine::new(&temp_dir)?;
+        assert_eq!(
+            engine2.snapshot_count(),
+            1,
+            "Must reload snapshot from disk"
+        );
+
+        // 3. Rollback turn from the resumed engine
+        let res = engine2
+            .rollback_turn()
+            .await?
+            .expect("Must rollback Turn 1");
+        assert_eq!(res.snapshot.label, "turn_start:1");
+
+        // Command created file and empty folders MUST be cleaned up
+        assert!(
+            !cmd_file.exists(),
+            "Command-created file must be removed on revert"
+        );
+        assert!(
+            !cmd_folder.exists(),
+            "Empty subdirectory must be removed on revert"
+        );
+        assert!(
+            !temp_dir.join("cmd_generated_dir").exists(),
+            "Parent empty directory must be removed on revert"
+        );
+        assert!(
+            !empty_cmd_dir.exists(),
+            "Empty directory created during turn must be removed on revert"
+        );
+
+        // Pre-existing user file MUST be preserved
+        assert!(
+            user_existing.exists(),
+            "Pre-existing user file must be preserved"
+        );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
         Ok(())

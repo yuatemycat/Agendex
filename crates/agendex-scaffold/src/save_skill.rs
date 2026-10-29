@@ -13,6 +13,9 @@ pub struct SaveSkillArgs {
     pub description: String,
     /// Markdown documentation, instructions, or step-by-step guidelines.
     pub content: String,
+    /// Whether to permit overwriting an existing skill with the same name.
+    #[serde(default)]
+    pub overwrite: bool,
 }
 
 /// Output metadata returned after saving a skill.
@@ -89,6 +92,10 @@ pub fn save_skill_tool_definition() -> serde_json::Value {
                 "content": {
                     "type": "string",
                     "description": "Complete markdown instructions, protocols, or guidelines"
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "description": "Whether to permit overwriting an existing skill with the same name (default: false)"
                 }
             },
             "required": ["name", "description", "content"]
@@ -124,6 +131,14 @@ impl SkillSaver {
     pub fn save_skill_direct(&self, args: &SaveSkillArgs) -> anyhow::Result<SaveSkillResult> {
         let safe_name = sanitize_skill_name(&args.name)?;
         let target_path = self.resolve_skill_path(&safe_name)?;
+
+        if target_path.exists() && !args.overwrite {
+            anyhow::bail!(
+                "Skill '{}' already exists at '{}'. Overwriting an existing skill requires explicit overwrite approval.",
+                safe_name,
+                target_path.display()
+            );
+        }
 
         if let Some(parent) = target_path.parent() {
             fs::create_dir_all(parent)?;
@@ -203,10 +218,11 @@ mod tests {
             std::env::temp_dir().join(format!("agendex_save_skill_{}", uuid::Uuid::new_v4()));
         let saver = SkillSaver::new(&temp_dir);
 
-        let args = SaveSkillArgs {
+        let mut args = SaveSkillArgs {
             name: "test-recorder".to_string(),
             description: "Records diagnostic metrics".to_string(),
             content: "## Instructions\nRun probe and record stats.".to_string(),
+            overwrite: false,
         };
 
         // 1. Rejection case
@@ -227,6 +243,26 @@ mod tests {
         let loaded = fs::read_to_string(&target_path)?;
         assert!(loaded.contains("name: test-recorder"));
         assert!(loaded.contains("Records diagnostic metrics"));
+
+        // 3. Overwrite without overwrite flag must fail
+        args.description = "Updated description".to_string();
+        let overwrite_err = saver
+            .save_skill_with_approval(&args, |_action, _reason| async { true })
+            .await;
+        assert!(overwrite_err.is_err());
+        assert!(overwrite_err
+            .unwrap_err()
+            .to_string()
+            .contains("already exists"));
+
+        // 4. Overwrite with explicit overwrite flag succeeds
+        args.overwrite = true;
+        let overwrite_ok = saver
+            .save_skill_with_approval(&args, |_action, _reason| async { true })
+            .await?;
+        assert!(overwrite_ok.approved);
+        let updated = fs::read_to_string(&target_path)?;
+        assert!(updated.contains("Updated description"));
 
         let _ = fs::remove_dir_all(temp_dir);
         Ok(())

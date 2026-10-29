@@ -91,6 +91,7 @@ async fn test_battle_picks_passing_diff() -> anyhow::Result<()> {
     let base_config = AgentConfig {
         workspace_dir: base_repo.clone(),
         session_id: "arena_parent".to_string(),
+        auto_approve_risky: true,
         model: ModelConfig {
             format: ModelFormat::OpenAi,
             model_name: "gpt-4o".to_string(),

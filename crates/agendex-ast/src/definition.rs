@@ -108,18 +108,17 @@ pub fn find_definition(
         .filter_entry(|entry| {
             let file_name = entry.file_name().to_string_lossy();
             // Skip common build, cache, and dependency folders
-            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
-                if file_name == "target"
+            if entry.file_type().is_some_and(|ft| ft.is_dir())
+                && (file_name == "target"
                     || file_name == "node_modules"
                     || file_name == ".git"
                     || file_name == "vendor"
                     || file_name == ".venv"
                     || file_name == "dist"
                     || file_name == "build"
-                    || file_name == "__pycache__"
-                {
-                    return false;
-                }
+                    || file_name == "__pycache__")
+            {
+                return false;
             }
             true
         })
@@ -131,7 +130,7 @@ pub fn find_definition(
             Err(_) => continue,
         };
 
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
 

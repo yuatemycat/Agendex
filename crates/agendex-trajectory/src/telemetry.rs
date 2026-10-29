@@ -41,6 +41,7 @@ impl SessionUsage {
 }
 
 /// Estimates dollar cost based on model name and token volume.
+/// Unknown models (e.g. self-hosted NIM, Ollama, local models) default to $0.00.
 pub fn estimate_cost(model_name: &str, prompt_tokens: usize, completion_tokens: usize) -> f64 {
     let lower = model_name.to_lowercase();
     let (prompt_rate, completion_rate) = match lower.as_str() {
@@ -51,7 +52,10 @@ pub fn estimate_cost(model_name: &str, prompt_tokens: usize, completion_tokens: 
             // $0.15 / 1M prompt, $0.60 / 1M completion
             (0.00000015, 0.00000060)
         }
-        m if m.contains("gemini") => {
+        m if m.contains("gemini-2.5-pro")
+            || m.contains("gemini-1.5-pro")
+            || m.contains("gemini-pro") =>
+        {
             // $1.25 / 1M prompt, $5.00 / 1M completion
             (0.00000125, 0.00000500)
         }
@@ -59,11 +63,14 @@ pub fn estimate_cost(model_name: &str, prompt_tokens: usize, completion_tokens: 
             // $0.15 / 1M prompt, $0.60 / 1M completion
             (0.00000015, 0.00000060)
         }
-        m if m.contains("gpt-4o") || m.contains("gpt-4") => {
+        m if m.contains("gpt-4o") || m.contains("gpt-4-turbo") || m.contains("gpt-4") => {
             // $2.50 / 1M prompt, $10.00 / 1M completion
             (0.00000250, 0.00001000)
         }
-        m if m.contains("claude-3-5-sonnet") || m.contains("claude-3-sonnet") => {
+        m if m.contains("claude-3-5-sonnet")
+            || m.contains("claude-3-7-sonnet")
+            || m.contains("claude-3-sonnet") =>
+        {
             // $3.00 / 1M prompt, $15.00 / 1M completion
             (0.00000300, 0.00001500)
         }
@@ -71,9 +78,13 @@ pub fn estimate_cost(model_name: &str, prompt_tokens: usize, completion_tokens: 
             // $0.80 / 1M prompt, $4.00 / 1M completion
             (0.00000080, 0.00000400)
         }
+        m if m.contains("claude-3-opus") => {
+            // $15.00 / 1M prompt, $75.00 / 1M completion
+            (0.00001500, 0.00007500)
+        }
         _ => {
-            // Default baseline pricing (~$2.50 / 1M prompt, $10.00 / 1M completion)
-            (0.00000250, 0.00001000)
+            // Unknown or self-hosted / local / NIM models default to $0.00 (not arbitrarily billed as GPT-4o)
+            (0.0, 0.0)
         }
     };
 
@@ -86,7 +97,7 @@ pub fn format_comma(n: usize) -> String {
     let mut result = String::new();
     let len = s.len();
     for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
+        if i > 0 && (len - i).is_multiple_of(3) {
             result.push(',');
         }
         result.push(ch);
@@ -119,6 +130,14 @@ mod tests {
     }
 
     #[test]
+    fn test_unknown_models_default_to_zero_cost() {
+        let cost = estimate_cost("meta/llama-3.1-70b-instruct", 1000, 500);
+        assert_eq!(cost, 0.0);
+        let local_cost = estimate_cost("ollama/mistral", 2000, 1000);
+        assert_eq!(local_cost, 0.0);
+    }
+
+    #[test]
     fn test_estimate_cost_and_format_telemetry() {
         let prompt_tokens = 412;
         let completion_tokens = 85;
@@ -127,10 +146,12 @@ mod tests {
         assert!((cost - 0.00188).abs() < 1e-6);
 
         let turn = TokenUsage::new(prompt_tokens, completion_tokens, cost);
-        let mut session = SessionUsage::default();
-        session.total_tokens = 1230;
-        session.total_cost = cost;
-        session.turn_count = 1;
+        let session = SessionUsage {
+            total_tokens: 1230,
+            total_cost: cost,
+            turn_count: 1,
+            ..Default::default()
+        };
 
         let display = format_telemetry(&turn, &session);
         assert_eq!(

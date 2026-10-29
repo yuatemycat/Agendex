@@ -300,11 +300,11 @@ fn create_snippet(content: &str, query_lower: &str) -> String {
         let end = (pos + query_lower.len() + 100).min(content.len());
         let prefix = if start > 0 { "..." } else { "" };
         let suffix = if end < content.len() { "..." } else { "" };
-        format!("{}{}{}", prefix, &content[start..end].trim(), suffix)
+        format!("{}{}{}", prefix, content[start..end].trim(), suffix)
     } else {
         // Fallback to first 160 characters
         if content.len() > 160 {
-            format!("{}...", &content[..160].trim())
+            format!("{}...", content[..160].trim())
         } else {
             content.to_string()
         }

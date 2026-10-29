@@ -109,7 +109,11 @@ async fn main() -> anyhow::Result<()> {
         match turn_res {
             Ok(resp) => {
                 if !parsed.json_mode {
-                    println!("\n[Agendex]:\n{}", resp);
+                    if agent.streamed_tokens_in_last_turn() {
+                        println!();
+                    } else {
+                        println!("\n[Agendex]:\n{}", resp);
+                    }
                     if let Some(telemetry) = agent.format_telemetry().await {
                         println!("{}", telemetry);
                     }
@@ -183,7 +187,11 @@ async fn main() -> anyhow::Result<()> {
                     match agent.process_turn(trimmed).await {
                         Ok(reply) => {
                             if !parsed.json_mode {
-                                println!("\n[Agendex]:\n{}\n", reply);
+                                if agent.streamed_tokens_in_last_turn() {
+                                    println!();
+                                } else {
+                                    println!("\n[Agendex]:\n{}\n", reply);
+                                }
                                 if let Some(telemetry) = agent.format_telemetry().await {
                                     println!("{}\n", telemetry);
                                 }

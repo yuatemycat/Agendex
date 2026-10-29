@@ -72,6 +72,8 @@ pub struct AgendexAgent {
     pub event_handler: Option<crate::events::AgentEventHandler>,
     pub tool_progress_handler: Option<ToolProgressHandler>,
     pub token_stream_handler: Option<TokenStreamHandler>,
+    pub touched_files: Arc<Mutex<std::collections::HashSet<String>>>,
+    pub streamed_tokens_in_turn: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AgendexAgent {
@@ -208,7 +210,14 @@ impl AgendexAgent {
             event_handler: None,
             tool_progress_handler: None,
             token_stream_handler: None,
+            touched_files: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            streamed_tokens_in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    pub fn streamed_tokens_in_last_turn(&self) -> bool {
+        self.streamed_tokens_in_turn
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn with_diff_approval_handler(mut self, handler: DiffApprovalHandler) -> Self {
@@ -257,7 +266,8 @@ impl AgendexAgent {
             }
             return false;
         }
-        true
+        // Non-terminal execution without -y refuses edits, matching risky command policy
+        false
     }
 
     pub fn with_event_handler(mut self, handler: crate::events::AgentEventHandler) -> Self {
@@ -275,7 +285,29 @@ impl AgendexAgent {
         &self,
         summary: &str,
     ) -> anyhow::Result<Option<crate::git::GitCommitResult>> {
-        let res = crate::git::commit_task_changes(&self.config.workspace_dir, summary).await?;
+        let mut touched = {
+            let files = self.touched_files.lock().await;
+            files.iter().cloned().collect::<Vec<_>>()
+        };
+        {
+            let snap = self.snapshot_engine.lock().await;
+            for f in snap.all_agent_created_files() {
+                if !touched.contains(&f) {
+                    touched.push(f);
+                }
+            }
+        }
+        let target_files = if !touched.is_empty() {
+            Some(touched)
+        } else {
+            None
+        };
+        let res = crate::git::commit_task_changes(
+            &self.config.workspace_dir,
+            summary,
+            target_files.as_deref(),
+        )
+        .await?;
         if let Some(ref c) = res {
             self.emit_event(crate::events::AgentEvent::GitCommit {
                 commit_sha: c.commit_sha.clone(),
@@ -380,6 +412,8 @@ impl AgendexAgent {
     }
 
     async fn process_turn_inner(&self, user_input: &str) -> anyhow::Result<String> {
+        self.streamed_tokens_in_turn
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         self.emit_event(crate::events::AgentEvent::TurnStart {
             session_id: self.config.session_id.clone(),
             prompt: user_input.to_string(),
@@ -634,9 +668,20 @@ impl AgendexAgent {
 
             // Call Model
             self.notify_progress("Generating response...");
+            let stream_handler: Option<TokenStreamHandler> =
+                if let Some(handler) = &self.token_stream_handler {
+                    let flag = Arc::clone(&self.streamed_tokens_in_turn);
+                    let h = Arc::clone(handler);
+                    Some(Arc::new(move |token: &str| {
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        h(token);
+                    }))
+                } else {
+                    None
+                };
             let resp = self
                 .model_client
-                .chat_with_stream(&history, &tools, self.token_stream_handler.clone())
+                .chat_with_stream(&history, &tools, stream_handler)
                 .await?;
 
             turn_prompt_tokens += resp.prompt_tokens;
@@ -982,10 +1027,16 @@ impl AgendexAgent {
                     .ast_patcher
                     .patch_file(&target_path, target, replacement)
                 {
-                    Ok(res) => format!(
-                        "Successfully replaced {} occurrences in {}",
-                        res.occurrences, path
-                    ),
+                    Ok(res) => {
+                        self.touched_files
+                            .lock()
+                            .await
+                            .insert(path.replace('\\', "/"));
+                        format!(
+                            "Successfully replaced {} occurrences in {}",
+                            res.occurrences, path
+                        )
+                    }
                     Err(e) => format!("Failed to edit {}: {}", path, e),
                 };
                 self.notify_progress(&format!("[Tool: edit_file] Completed: {}", path));
@@ -1018,10 +1069,35 @@ impl AgendexAgent {
                     Err(e) => return format!("Failed to save skill: {}", e),
                 };
 
-                let action = format!("save_skill: {}", safe_name);
+                let saver = agendex_scaffold::SkillSaver::new(&self.config.workspace_dir);
+                let target_path = match saver.resolve_skill_path(&safe_name) {
+                    Ok(p) => p,
+                    Err(e) => return format!("Failed to save skill: {}", e),
+                };
+                let already_exists = target_path.exists();
+
+                let action = if already_exists {
+                    format!("save_skill (OVERWRITE): {}", safe_name)
+                } else {
+                    format!("save_skill: {}", safe_name)
+                };
+
+                let content_preview = if content.len() > 400 {
+                    format!("{}...", content[..400].trim())
+                } else {
+                    content.trim().to_string()
+                };
+
                 let reason = format!(
-                    "Writing persistent skill to .agenda/skills/{}/SKILL.md",
-                    safe_name
+                    "{}\nPath: {}\nDescription: {}\nProposed Content Preview:\n---\n{}\n---",
+                    if already_exists {
+                        "WARNING: Overwriting existing skill file! Check instructions carefully to prevent prompt injection."
+                    } else {
+                        "Writing persistent skill playbook"
+                    },
+                    target_path.display(),
+                    description,
+                    content_preview
                 );
 
                 let approved = if let Some(queue) = &self.approval_queue {
@@ -1040,16 +1116,16 @@ impl AgendexAgent {
                         reason
                     );
                     return format!(
-                        "Skill creation for '{}' blocked: requires user approval ({})",
-                        safe_name, reason
+                        "Skill creation for '{}' blocked: requires user approval",
+                        safe_name
                     );
                 }
 
-                let saver = agendex_scaffold::SkillSaver::new(&self.config.workspace_dir);
                 let args = agendex_scaffold::SaveSkillArgs {
                     name: safe_name.clone(),
                     description: description.to_string(),
                     content: content.to_string(),
+                    overwrite: already_exists,
                 };
 
                 match saver.save_skill_direct(&args) {
@@ -1128,25 +1204,81 @@ impl AgendexAgent {
                                     }
                                 }
                             }
+                        } else if !target_path.exists() {
+                            // Review diff for proposed new file creation
+                            let diff =
+                                agendex_ast::diff::generate_unified_diff(path_str, "", content);
+                            if !diff.is_empty() {
+                                let approved = self.request_diff_approval(path_str, &diff).await;
+                                if !approved {
+                                    self.notify_progress(&format!(
+                                        "[Tool: write_file] File creation of '{}' rejected by user.",
+                                        path_str
+                                    ));
+                                    return "File creation rejected by user".to_string();
+                                }
+                            }
                         }
                     }
                 }
+
+                let pre_cmd_untracked = if tc.name == "run_command" {
+                    let out = tokio::process::Command::new("git")
+                        .args(["ls-files", "--others", "--exclude-standard"])
+                        .current_dir(&self.config.workspace_dir)
+                        .output()
+                        .await;
+                    out.ok().map(|o| {
+                        String::from_utf8_lossy(&o.stdout)
+                            .lines()
+                            .map(|l| l.trim().replace('\\', "/"))
+                            .filter(|l| !l.is_empty())
+                            .collect::<Vec<String>>()
+                    })
+                } else {
+                    None
+                };
 
                 let res_val = self
                     .tool_registry
                     .execute_tool(&tc.name, tc.arguments.clone())
                     .await;
+
+                if let Some(pre_files) = pre_cmd_untracked {
+                    let post_out = tokio::process::Command::new("git")
+                        .args(["ls-files", "--others", "--exclude-standard"])
+                        .current_dir(&self.config.workspace_dir)
+                        .output()
+                        .await;
+                    if let Ok(o) = post_out {
+                        let mut snap = self.snapshot_engine.lock().await;
+                        let mut touched = self.touched_files.lock().await;
+                        for line in String::from_utf8_lossy(&o.stdout).lines() {
+                            let trimmed = line.trim().replace('\\', "/");
+                            if !trimmed.is_empty() && !pre_files.contains(&trimmed) {
+                                snap.record_created_file(&trimmed);
+                                touched.insert(trimmed);
+                            }
+                        }
+                    }
+                }
+
                 match res_val {
                     Ok(res) => {
-                        if tc.name == "write_file"
-                            && res
-                                .get("created")
-                                .and_then(|c| c.as_bool())
-                                .unwrap_or(false)
-                        {
+                        if tc.name == "write_file" {
                             if let Some(path_str) = res.get("path").and_then(|p| p.as_str()) {
-                                let mut snap = self.snapshot_engine.lock().await;
-                                snap.record_created_file(path_str);
+                                self.touched_files
+                                    .lock()
+                                    .await
+                                    .insert(path_str.replace('\\', "/"));
+                                if res
+                                    .get("created")
+                                    .and_then(|c| c.as_bool())
+                                    .unwrap_or(false)
+                                {
+                                    let mut snap = self.snapshot_engine.lock().await;
+                                    snap.record_created_file(path_str);
+                                }
                             }
                         }
                         self.notify_progress(&format!("[Tool: {}] Completed.", tc.name));

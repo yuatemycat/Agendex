@@ -18,6 +18,13 @@ pub struct CliParsedArgs {
 }
 
 pub fn parse_cli_args(args: &[String], current_dir: PathBuf) -> CliParsedArgs {
+    try_parse_cli_args(args, current_dir).unwrap_or_else(|e| {
+        eprintln!("[Error] {}", e);
+        std::process::exit(1);
+    })
+}
+
+pub fn try_parse_cli_args(args: &[String], current_dir: PathBuf) -> anyhow::Result<CliParsedArgs> {
     let mut session_id = uuid::Uuid::new_v4().to_string();
     let mut prompt: Option<String> = None;
     let mut tier = ModelTier::Standard128k;
@@ -41,7 +48,9 @@ pub fn parse_cli_args(args: &[String], current_dir: PathBuf) -> CliParsedArgs {
 
     // Load base configuration from config file if present
     let loaded_cfg = if let Some(ref p) = explicit_config_path {
-        load_config_from_path(p).ok()
+        Some(load_config_from_path(p).map_err(|e| {
+            anyhow::anyhow!("Failed to load configuration file '{}': {}", p.display(), e)
+        })?)
     } else {
         load_default_config()
     };
@@ -162,7 +171,7 @@ pub fn parse_cli_args(args: &[String], current_dir: PathBuf) -> CliParsedArgs {
         auto_approve_risky: auto_approve,
     };
 
-    CliParsedArgs {
+    Ok(CliParsedArgs {
         prompt,
         session_id,
         config,
@@ -170,5 +179,5 @@ pub fn parse_cli_args(args: &[String], current_dir: PathBuf) -> CliParsedArgs {
         json_mode,
         git_commit,
         git_branch,
-    }
+    })
 }

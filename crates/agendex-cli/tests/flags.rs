@@ -1,4 +1,4 @@
-use agendex_cli::parse_cli_args;
+use agendex_cli::{parse_cli_args, try_parse_cli_args};
 use agendex_core::model::ModelFormat;
 use agendex_trajectory::compactor::ModelTier;
 use std::path::PathBuf;
@@ -123,4 +123,22 @@ fn test_cli_provider_proxymateur_flag() {
         Some("http://127.0.0.1:8045/v1")
     );
     assert_eq!(parsed.config.model.model_name, "gemini-2.5-flash");
+}
+
+#[test]
+fn test_bad_config_file_returns_error() {
+    let args = vec![
+        "agendex".to_string(),
+        "--config".to_string(),
+        "non_existent_config_file_12345.toml".to_string(),
+    ];
+
+    let res = try_parse_cli_args(&args, PathBuf::from("."));
+    assert!(res.is_err(), "Expected error on bad --config file path");
+    let err_str = res.unwrap_err().to_string();
+    assert!(
+        err_str.contains("Failed to load configuration file"),
+        "Unexpected error: {}",
+        err_str
+    );
 }

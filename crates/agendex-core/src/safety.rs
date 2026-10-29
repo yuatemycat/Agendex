@@ -334,6 +334,11 @@ impl CommandSafetyAssessor {
                 {
                     idx += 1;
                 }
+            } else if t == "busybox" {
+                idx += 1;
+                while idx < tokens.len() && tokens[idx].starts_with('-') {
+                    idx += 1;
+                }
             } else if TRANSPARENT_WRAPPERS.contains(&t.as_str()) || is_assignment(&tokens[idx]) {
                 idx += 1;
             } else {
@@ -352,7 +357,7 @@ impl CommandSafetyAssessor {
         let args = &tokens[idx + 1..];
 
         // ---- Hard blocks: catastrophic, never allowed ----
-        if let Some(v) = Self::hard_block(&bin_name, args) {
+        if let Some(v) = Self::hard_block(&bin_name, args, depth) {
             return v;
         }
 
@@ -394,7 +399,10 @@ impl CommandSafetyAssessor {
         approval(format!("'{}' is not on the safe-command list", bin_name))
     }
 
-    fn hard_block(bin_name: &str, args: &[String]) -> Option<CommandSafetyVerdict> {
+    fn hard_block(bin_name: &str, args: &[String], depth: usize) -> Option<CommandSafetyVerdict> {
+        if depth > 10 {
+            return None;
+        }
         // Host power actions. Approval must not be able to turn these into a live process.
         if is_host_power_bin(bin_name) {
             return Some(blocked(format!(
@@ -410,19 +418,6 @@ impl CommandSafetyAssessor {
                 bin_name,
                 args.join(" ")
             )));
-        }
-        if bin_name == "busybox" {
-            let mut i = 0;
-            while i < args.len() && args[i].starts_with('-') {
-                i += 1;
-            }
-            if i < args.len() {
-                let sub_bin = normalize_bin(&args[i]);
-                let sub_args = &args[i + 1..];
-                if let Some(v) = Self::hard_block(&sub_bin, sub_args) {
-                    return Some(v);
-                }
-            }
         }
         if bin_name == "xargs" || bin_name == "parallel" {
             let mut i = 0;
@@ -443,7 +438,7 @@ impl CommandSafetyAssessor {
             if i < args.len() {
                 let target_bin = normalize_bin(&args[i]);
                 let target_args = &args[i + 1..];
-                if let Some(v) = Self::hard_block(&target_bin, target_args) {
+                if let Some(v) = Self::hard_block(&target_bin, target_args, depth + 1) {
                     return Some(v);
                 }
             }
@@ -495,22 +490,22 @@ impl CommandSafetyAssessor {
             if i < args.len() {
                 let target_bin = normalize_bin(&args[i]);
                 let target_args = &args[i + 1..];
-                if let Some(v) = Self::hard_block(&target_bin, target_args) {
+                if let Some(v) = Self::hard_block(&target_bin, target_args, depth + 1) {
                     return Some(v);
                 }
             }
         }
-        if bin_name == "dbus-send"
+        if (bin_name == "dbus-send" || bin_name == "gdbus")
             && args.iter().any(|a| {
                 let l = a.to_lowercase();
                 l.contains("poweroff")
                     || l.contains("reboot")
                     || l.contains("suspend")
                     || l.contains("hibernate")
-                    || l.ends_with(".halt")
+                    || l.contains("halt")
             })
         {
-            return Some(blocked("dbus-send host power command"));
+            return Some(blocked(format!("{} host power command", bin_name)));
         }
 
         // Recursive deletion of critical roots
@@ -1095,6 +1090,9 @@ mod tests {
             "loginctl reboot",
             "echo shutdown | sh",
             "echo reboot | bash",
+            "busybox sh -c reboot",
+            "busybox sh -c \"echo shutdown | sh\"",
+            "gdbus call --system --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 --method org.freedesktop.login1.Manager.Reboot true",
             "systemd-run shutdown",
             "dbus-send --system --print-reply --dest=org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager.PowerOff",
         ] {

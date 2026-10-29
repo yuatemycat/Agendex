@@ -141,10 +141,16 @@ impl AgendexConfigFile {
             }
         }
         if let Some(b) = self.resolved_base_url() {
-            config.model.base_url = Some(b.to_string());
+            let expanded = expand_env_var_or_literal(b);
+            if !expanded.is_empty() {
+                config.model.base_url = Some(expanded);
+            }
         }
         if let Some(k) = self.resolved_api_key() {
-            config.model.api_key = k.to_string();
+            let expanded = expand_env_var_or_literal(k);
+            if !expanded.is_empty() {
+                config.model.api_key = expanded;
+            }
         }
         if let Some(t) = self.resolved_tier() {
             config.model_tier = parse_tier_string(t);
@@ -152,6 +158,22 @@ impl AgendexConfigFile {
         if let Some(a) = self.resolved_auto_approve_risky() {
             config.auto_approve_risky = a;
         }
+    }
+}
+
+/// Expands environment variable expressions like `${KEY}`, `$KEY`, or `env:KEY`,
+/// falling back to the literal string if not referencing an environment variable.
+pub fn expand_env_var_or_literal(val: &str) -> String {
+    let trimmed = val.trim();
+    if trimmed.starts_with("${") && trimmed.ends_with('}') && trimmed.len() > 3 {
+        let var_name = &trimmed[2..trimmed.len() - 1];
+        std::env::var(var_name).unwrap_or_default()
+    } else if let Some(var_name) = trimmed.strip_prefix('$') {
+        std::env::var(var_name).unwrap_or_default()
+    } else if let Some(var_name) = trimmed.strip_prefix("env:") {
+        std::env::var(var_name).unwrap_or_default()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -297,5 +319,20 @@ mod tests {
         assert_eq!(agent_cfg.model.format, ModelFormat::Anthropic);
         assert_eq!(agent_cfg.model_tier, ModelTier::Extended840k);
         assert!(!agent_cfg.auto_approve_risky);
+    }
+
+    #[test]
+    fn test_env_var_expansion_for_api_key() {
+        std::env::set_var("TEST_AGENDEX_SECRET_KEY", "nvapi-secret-12345");
+        let toml_str = r#"
+            format = "openai"
+            api_key = "${TEST_AGENDEX_SECRET_KEY}"
+        "#;
+        let cfg = load_config_from_str(toml_str).unwrap();
+        let mut agent_cfg = AgentConfig::default();
+        cfg.apply_to_agent_config(&mut agent_cfg);
+
+        assert_eq!(agent_cfg.model.api_key, "nvapi-secret-12345");
+        std::env::remove_var("TEST_AGENDEX_SECRET_KEY");
     }
 }
