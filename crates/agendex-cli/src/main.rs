@@ -143,157 +143,306 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     } else {
-        let prompt_str = agendex_core::ui::prompt_string();
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() && !parsed.json_mode {
+            let mut commands = vec![
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/help".into(),
+                    description: "Show all built-in commands and discovered skills".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/model".into(),
+                    description: "Open interactive model and provider selector".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/provider".into(),
+                    description: "Switch model or view provider list".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/diff".into(),
+                    description: "View git diff of agent modifications this session".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/undo".into(),
+                    description: "Undo the last turn and restore snapshot".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/revert".into(),
+                    description: "Undo the last turn and restore snapshot".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/yolo".into(),
+                    description: "Toggle auto-approval mode on/off dynamically".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/cost".into(),
+                    description: "Show session token cost breakdown in USD".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/tokens".into(),
+                    description: "Show detailed token usage breakdown".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/context".into(),
+                    description: "Display visual context window capacity gauge".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/clear".into(),
+                    description: "Clear terminal screen".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/new".into(),
+                    description: "Start a fresh conversation session".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/resume".into(),
+                    description: "List or resume past session trajectories".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/config".into(),
+                    description: "Display current configuration parameters".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/skills".into(),
+                    description: "List all discovered skills and their source paths".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/mcp".into(),
+                    description: "List connected MCP servers and available tools".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/tools".into(),
+                    description: "List all available native harness and MCP tools".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/init".into(),
+                    description: "Scan project layout and bootstrap AGENTS.md".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/compact".into(),
+                    description: "Manually trigger context compaction".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/def".into(),
+                    description: "Find AST symbol definition in codebase".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/exit".into(),
+                    description: "Exit interactive session".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/quit".into(),
+                    description: "Exit interactive session".into(),
+                },
+            ];
 
-        loop {
-            let next_line = if let Some(queue) = &approval_queue {
-                queue.read_line(&prompt_str).await
-            } else {
-                if !parsed.json_mode {
-                    print!("{}", prompt_str);
-                    io::stdout().flush()?;
+            if let Ok(reg) = agent.skill_registry.read() {
+                for s in reg.list_skills() {
+                    commands.push(agendex_cli::editor::SlashCommandInfo {
+                        name: s.command.clone(),
+                        description: s.description.clone(),
+                    });
                 }
-                let mut line = String::new();
-                if std::io::stdin().read_line(&mut line).is_ok() {
-                    Some(line)
-                } else {
-                    None
-                }
-            };
+            }
 
-            match next_line {
-                Some(line) => {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    if trimmed == "exit"
-                        || trimmed == "quit"
-                        || trimmed == "/exit"
-                        || trimmed == "/quit"
-                    {
-                        if !parsed.json_mode {
+            let mut line_editor = agendex_cli::editor::create_reedline_editor(
+                &config.workspace_dir,
+                commands,
+            )?;
+
+            loop {
+                let prompt = agendex_cli::editor::AgendexPrompt {
+                    model_name: agent.active_model_config.read().await.model_name.clone(),
+                    git_branch: agendex_cli::editor::detect_git_branch(&config.workspace_dir),
+                    yolo_mode: agent.auto_approve_yolo.load(std::sync::atomic::Ordering::SeqCst),
+                };
+
+                if let Some(ref queue) = approval_queue {
+                    queue.pause();
+                }
+
+                let sig = line_editor.read_line(&prompt);
+
+                if let Some(ref queue) = approval_queue {
+                    queue.resume();
+                }
+
+                match sig {
+                    Ok(reedline::Signal::Success(line)) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if trimmed == "exit"
+                            || trimmed == "quit"
+                            || trimmed == "/exit"
+                            || trimmed == "/quit"
+                        {
                             println!("Exiting Agendex session.");
-                        }
-                        break;
-                    }
-
-                    if (trimmed == "/model"
-                        || trimmed == "/models"
-                        || trimmed == "/provider"
-                        || trimmed == "/providers"
-                        || trimmed == "/model select"
-                        || trimmed == "/provider select")
-                        && std::io::stdin().is_terminal()
-                        && !parsed.json_mode
-                    {
-                        if let Some(ref queue) = approval_queue {
-                            queue.pause();
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-
-                        let active_prov = agent.active_provider_name.read().await.clone();
-                        let active_mdl = agent.active_model_config.read().await.model_name.clone();
-
-                        let selection_res = agendex_cli::model_selector::launch_model_selector(
-                            &active_prov,
-                            &active_mdl,
-                        );
-
-                        if let Some(ref queue) = approval_queue {
-                            queue.resume();
+                            break;
                         }
 
-                        match selection_res {
-                            Ok(Some(choice)) => {
-                                match agent
-                                    .switch_provider(&choice.provider_key, Some(&choice.model_name))
-                                    .await
-                                {
-                                    Ok(_) => {
-                                        println!(
-                                            "  {}✔{} Switched to {}{}{} {}({}){}",
-                                            agendex_core::ui::ACCENT_GREEN,
-                                            agendex_core::ui::RESET,
-                                            agendex_core::ui::TEXT_PRIMARY,
-                                            choice.model_name,
-                                            agendex_core::ui::RESET,
-                                            agendex_core::ui::ACCENT_CYAN,
-                                            choice.provider_tag,
-                                            agendex_core::ui::RESET
-                                        );
-                                        if let Some(ref url) = choice.base_url {
+                        if trimmed == "/clear" {
+                            let _ = crossterm::execute!(
+                                std::io::stdout(),
+                                crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                                crossterm::cursor::MoveTo(0, 0)
+                            );
+                            continue;
+                        }
+
+                        if trimmed == "/model"
+                            || trimmed == "/models"
+                            || trimmed == "/provider"
+                            || trimmed == "/providers"
+                            || trimmed == "/model select"
+                            || trimmed == "/provider select"
+                        {
+                            if let Some(ref queue) = approval_queue {
+                                queue.pause();
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+
+                            let active_prov = agent.active_provider_name.read().await.clone();
+                            let active_mdl = agent.active_model_config.read().await.model_name.clone();
+
+                            let selection_res = agendex_cli::model_selector::launch_model_selector(
+                                &active_prov,
+                                &active_mdl,
+                            );
+
+                            if let Some(ref queue) = approval_queue {
+                                queue.resume();
+                            }
+
+                            match selection_res {
+                                Ok(Some(choice)) => {
+                                    match agent
+                                        .switch_provider(&choice.provider_key, Some(&choice.model_name))
+                                        .await
+                                    {
+                                        Ok(_) => {
                                             println!(
-                                                "    {}Endpoint: {}{}",
-                                                agendex_core::ui::TEXT_MUTED,
-                                                url,
+                                                "  {}✔{} Switched to {}{}{} {}({}){}",
+                                                agendex_core::ui::ACCENT_GREEN,
+                                                agendex_core::ui::RESET,
+                                                agendex_core::ui::TEXT_PRIMARY,
+                                                choice.model_name,
+                                                agendex_core::ui::RESET,
+                                                agendex_core::ui::ACCENT_CYAN,
+                                                choice.provider_tag,
                                                 agendex_core::ui::RESET
                                             );
+                                            if let Some(ref url) = choice.base_url {
+                                                println!(
+                                                    "    {}Endpoint: {}{}",
+                                                    agendex_core::ui::TEXT_MUTED,
+                                                    url,
+                                                    agendex_core::ui::RESET
+                                                );
+                                            }
+                                            println!();
                                         }
-                                        println!();
+                                        Err(err) => {
+                                            eprintln!("\n[Error] Failed to switch model: {}\n", err);
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    println!(
+                                        "  {}Selection cancelled.{}",
+                                        agendex_core::ui::TEXT_MUTED,
+                                        agendex_core::ui::RESET
+                                    );
+                                }
+                                Err(err) => {
+                                    eprintln!("\n[Error] Selector error: {}\n", err);
+                                }
+                            }
+                            continue;
+                        }
+
+                        let expanded = agendex_cli::editor::expand_file_mentions(
+                            &config.workspace_dir,
+                            trimmed,
+                        );
+
+                        tokio::select! {
+                            turn_res = agent.process_turn(&expanded) => {
+                                match turn_res {
+                                    Ok(reply) => {
+                                        if agent.streamed_tokens_in_last_turn() {
+                                            println!();
+                                        } else {
+                                            let skin = termimad::MadSkin::default();
+                                            skin.print_text(&reply);
+                                        }
+                                        if let Some(telemetry) = agent.format_telemetry().await {
+                                            println!(
+                                                "{}",
+                                                agendex_core::ui::format_telemetry_footer(&telemetry)
+                                            );
+                                        }
+                                        if parsed.git_commit {
+                                            let _ = agent.commit_workspace_changes(trimmed).await;
+                                        }
                                     }
                                     Err(err) => {
-                                        eprintln!("\n[Error] Failed to switch model: {}\n", err);
+                                        eprintln!("\n[Error]: {}\n", err);
                                     }
                                 }
                             }
-                            Ok(None) => {
+                            _ = tokio::signal::ctrl_c() => {
                                 println!(
-                                    "  {}Selection cancelled.{}",
-                                    agendex_core::ui::TEXT_MUTED,
+                                    "\n  {}⚡ Turn interrupted by user (Ctrl-C). Trajectory preserved.{}",
+                                    agendex_core::ui::ACCENT_AMBER,
                                     agendex_core::ui::RESET
                                 );
                             }
-                            Err(err) => {
-                                eprintln!("\n[Error] Selector error: {}\n", err);
-                            }
                         }
+                    }
+                    Ok(reedline::Signal::CtrlC) => {
+                        println!();
                         continue;
                     }
-
-                    match agent.process_turn(trimmed).await {
-                        Ok(reply) => {
-                            if !parsed.json_mode {
-                                if agent.streamed_tokens_in_last_turn() {
-                                    println!();
-                                } else {
-                                    println!("{}", reply);
-                                }
-                                if let Some(telemetry) = agent.format_telemetry().await {
-                                    println!(
-                                        "{}",
-                                        agendex_core::ui::format_telemetry_footer(&telemetry)
-                                    );
-                                }
-                            }
-                            // Automated Git Commit helper in REPL
-                            if parsed.git_commit {
-                                match agent.commit_workspace_changes(trimmed).await {
-                                    Ok(Some(commit)) => {
-                                        if !parsed.json_mode {
-                                            println!(
-                                                "[Agendex] Committed: {} ({})",
-                                                commit.commit_sha, commit.message
-                                            );
-                                        }
-                                    }
-                                    Ok(None) => {}
-                                    Err(err) => {
-                                        if !parsed.json_mode {
-                                            eprintln!("[Error] Git commit failed: {}", err);
-                                        }
-                                    }
-                                }
-                            }
+                    Ok(reedline::Signal::CtrlD) => {
+                        println!("Exiting Agendex session.");
+                        break;
+                    }
+                    Ok(_) => {
+                        continue;
+                    }
+                    Err(err) => {
+                        eprintln!("[Editor Error]: {}", err);
+                        break;
+                    }
+                }
+            }
+        } else {
+            let _prompt_str = agendex_core::ui::prompt_string();
+            let mut line = String::new();
+            while std::io::stdin().read_line(&mut line).is_ok() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    line.clear();
+                    continue;
+                }
+                if trimmed == "exit" || trimmed == "quit" {
+                    break;
+                }
+                match agent.process_turn(trimmed).await {
+                    Ok(reply) => {
+                        if !parsed.json_mode {
+                            println!("{}", reply);
                         }
-                        Err(err) => {
-                            if !parsed.json_mode {
-                                eprintln!("\n[Error]: {}\n", err);
-                            }
+                    }
+                    Err(err) => {
+                        if !parsed.json_mode {
+                            eprintln!("[Error]: {}", err);
                         }
                     }
                 }
-                None => break,
+                line.clear();
             }
         }
     }

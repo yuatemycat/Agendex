@@ -6,6 +6,7 @@ use agendex_core::model::ModelConfig;
 use agendex_trajectory::compactor::ModelTier;
 use std::path::PathBuf;
 
+pub mod editor;
 pub mod model_selector;
 
 #[derive(Debug, Clone)]

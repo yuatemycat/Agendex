@@ -25,4 +25,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+walkdir = { workspace = true }
 crossterm = "0.28"
+reedline = "0.52.1"
+termimad = "0.35.5"

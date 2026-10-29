@@ -76,6 +76,7 @@ pub struct AgendexAgent {
     pub token_stream_handler: Option<TokenStreamHandler>,
     pub touched_files: Arc<Mutex<std::collections::HashSet<String>>>,
     pub streamed_tokens_in_turn: Arc<std::sync::atomic::AtomicBool>,
+    pub auto_approve_yolo: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AgendexAgent {
@@ -226,6 +227,7 @@ impl AgendexAgent {
             token_stream_handler: None,
             touched_files: Arc::new(Mutex::new(std::collections::HashSet::new())),
             streamed_tokens_in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            auto_approve_yolo: Arc::new(std::sync::atomic::AtomicBool::new(config.auto_approve_risky)),
         })
     }
 
@@ -256,7 +258,9 @@ impl AgendexAgent {
     }
 
     pub async fn request_diff_approval(&self, path: &str, diff: &str) -> bool {
-        if self.config.auto_approve_risky {
+        if self.config.auto_approve_risky
+            || self.auto_approve_yolo.load(std::sync::atomic::Ordering::SeqCst)
+        {
             return true;
         }
         if let Some(handler) = &self.diff_approval_handler {
@@ -438,14 +442,55 @@ impl AgendexAgent {
 
         // 1. Check for slash command resolution
         if user_input.starts_with('/') {
-            let cmd = user_input.split_whitespace().next().unwrap_or("");
+            let mut parts = user_input.split_whitespace();
+            let cmd = parts.next().unwrap_or("");
+            let rest_args = user_input.strip_prefix(cmd).unwrap_or("").trim();
             match cmd {
                 "/help" => {
-                    return Ok(self
-                        .skill_registry
-                        .read()
-                        .map(|r| r.format_slash_commands_prompt())
-                        .unwrap_or_default());
+                    return Ok(self.handle_help_command());
+                }
+                "/cost" => {
+                    return Ok(self.handle_cost_command().await);
+                }
+                "/tokens" => {
+                    return Ok(self.handle_tokens_command().await);
+                }
+                "/context" => {
+                    return Ok(self.handle_context_command().await);
+                }
+                "/diff" => {
+                    return self.handle_diff_command().await;
+                }
+                "/skills" => {
+                    return Ok(self.handle_skills_command());
+                }
+                "/mcp" => {
+                    return Ok(self.handle_mcp_command().await);
+                }
+                "/tools" => {
+                    return Ok(self.handle_tools_command().await);
+                }
+                "/init" => {
+                    return self.handle_init_command().await;
+                }
+                "/config" => {
+                    return Ok(self.handle_config_command());
+                }
+                "/yolo" => {
+                    let cur = self.auto_approve_yolo.load(std::sync::atomic::Ordering::SeqCst);
+                    let nxt = !cur;
+                    self.auto_approve_yolo.store(nxt, std::sync::atomic::Ordering::SeqCst);
+                    if nxt {
+                        return Ok("⚡ YOLO mode ENABLED: commands and file edits will execute without interactive approval prompts.".to_string());
+                    } else {
+                        return Ok("🛡️ YOLO mode DISABLED: requiring interactive approval for commands and edits.".to_string());
+                    }
+                }
+                "/new" => {
+                    return self.handle_new_command().await;
+                }
+                "/resume" => {
+                    return self.handle_resume_command(rest_args).await;
                 }
                 "/compact" => {
                     let mut comp = self.compactor.lock().await;
@@ -457,7 +502,7 @@ impl AgendexAgent {
                     ));
                 }
                 "/def" | "/definition" => {
-                    let sym = user_input.split_whitespace().nth(1).unwrap_or("");
+                    let sym = rest_args;
                     if sym.is_empty() {
                         return Ok("Usage: /def <symbol_name>".to_string());
                     }
@@ -486,7 +531,7 @@ impl AgendexAgent {
                     }
                     return Ok(out);
                 }
-                "/revert" => {
+                "/undo" | "/revert" => {
                     let mut snap = self.snapshot_engine.lock().await;
                     match snap.rollback_turn().await? {
                         Some(res) => {
@@ -914,7 +959,13 @@ impl AgendexAgent {
                     return format!("Command denied by safety policy: {}", reason);
                 }
                 crate::safety::CommandSafetyVerdict::NeedsApproval { risk_reason } => {
-                    let approved = if let Some(queue) = &self.approval_queue {
+                    let approved = if self
+                        .auto_approve_yolo
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        || self.config.auto_approve_risky
+                    {
+                        true
+                    } else if let Some(queue) = &self.approval_queue {
                         let agent_id = self.agent_id.as_deref().unwrap_or("parent");
                         queue
                             .request_approval(agent_id, cmd_str, &risk_reason)
@@ -1645,6 +1696,403 @@ impl AgendexAgent {
             key, base_url, resolved_model, resolved_format, key
         ))
     }
+
+    /// Handles `/help` slash command, listing all core commands, tools, and dynamic skills.
+    pub fn handle_help_command(&self) -> String {
+        let mut out = String::new();
+        out.push_str("✦ Agendex Command & Skill Switchboard ✦\n\n");
+        out.push_str("Core Interactive Commands:\n");
+        out.push_str("  /model, /provider    Open interactive model and provider selector\n");
+        out.push_str("  /diff                Show git diff of all agent changes this session\n");
+        out.push_str("  /undo, /revert       Undo the last turn and restore snapshot\n");
+        out.push_str("  /yolo                Toggle auto-approve on/off dynamically\n");
+        out.push_str("  /cost                Show token cost breakdown in USD\n");
+        out.push_str("  /tokens              Show prompt, completion, and cached token metrics\n");
+        out.push_str("  /context             Display visual context window capacity gauge\n");
+        out.push_str("  /compact             Manually trigger context compaction\n");
+        out.push_str("  /clear               Clear the terminal screen\n");
+        out.push_str("  /new                 Start a fresh conversation session\n");
+        out.push_str("  /resume [id]         List or resume past session trajectories\n");
+        out.push_str("  /config              Display current configuration file parameters\n");
+        out.push_str("  /def <symbol>        Jump to AST symbol definition in codebase\n");
+        out.push_str("  /exit, /quit         Exit interactive session\n\n");
+
+        out.push_str("Scaffolding & Capabilities:\n");
+        out.push_str("  /skills              List all discovered skills and their source paths\n");
+        out.push_str("  /mcp                 List registered MCP servers and tool counts\n");
+        out.push_str("  /tools               List all available native harness and MCP tools\n");
+        out.push_str("  /init                Scan project layout and bootstrap AGENTS.md\n\n");
+
+        if let Ok(reg) = self.skill_registry.read() {
+            let skills = reg.list_skills();
+            if !skills.is_empty() {
+                out.push_str("Discovered Skills:\n");
+                for s in skills {
+                    out.push_str(&format!("  {:<20} {}\n", s.command, s.description));
+                }
+            }
+        }
+        out
+    }
+
+    /// Handles `/cost` command.
+    pub async fn handle_cost_command(&self) -> String {
+        let usage = self.session_usage().await;
+        let last = self.last_turn_usage().await;
+        let mut out = String::new();
+        out.push_str("Session Cost Breakdown:\n");
+        if let Some(l) = last {
+            out.push_str(&format!(
+                "  • Last Turn Cost:    ${:.4} ({} in, {} out)\n",
+                l.estimated_cost, l.prompt_tokens, l.completion_tokens
+            ));
+        }
+        out.push_str(&format!(
+            "  • Cumulative Cost:   ${:.4} across {} turn(s)\n",
+            usage.total_cost, usage.turn_count
+        ));
+        out.push_str(&format!(
+            "  • Total Volume:      {} prompt + {} completion = {} tokens\n",
+            format_num(usage.total_prompt_tokens),
+            format_num(usage.total_completion_tokens),
+            format_num(usage.total_tokens)
+        ));
+        out
+    }
+
+    /// Handles `/tokens` command.
+    pub async fn handle_tokens_command(&self) -> String {
+        let usage = self.session_usage().await;
+        let last = self.last_turn_usage().await;
+        let mut out = String::new();
+        out.push_str("Session Token Telemetry:\n");
+        if let Some(l) = last {
+            out.push_str(&format!(
+                "  • Last Turn Input:      {}\n",
+                format_num(l.prompt_tokens)
+            ));
+            out.push_str(&format!(
+                "  • Last Turn Output:     {}\n",
+                format_num(l.completion_tokens)
+            ));
+            out.push_str(&format!(
+                "  • Last Turn Total:      {}\n",
+                format_num(l.total_tokens)
+            ));
+        }
+        out.push_str(&format!(
+            "  • Cumulative Input:     {}\n",
+            format_num(usage.total_prompt_tokens)
+        ));
+        out.push_str(&format!(
+            "  • Cumulative Output:    {}\n",
+            format_num(usage.total_completion_tokens)
+        ));
+        out.push_str(&format!(
+            "  • Cumulative Total:     {}\n",
+            format_num(usage.total_tokens)
+        ));
+        out.push_str(&format!("  • Completed Turns:      {}\n", usage.turn_count));
+        out
+    }
+
+    /// Handles `/context` command.
+    pub async fn handle_context_command(&self) -> String {
+        let usage = self.session_usage().await;
+        let tier = self.config.model_tier;
+        let limit = tier.ceiling_tokens();
+        let active_tokens = {
+            let traj = self.trajectory.lock().await;
+            (traj.step_count() * 120 + usage.total_tokens).min(limit)
+        };
+        let ratio = (active_tokens as f64 / limit as f64).clamp(0.0, 1.0);
+        let bar_len: usize = 24;
+        let filled = (ratio * bar_len as f64).round() as usize;
+        let empty = bar_len.saturating_sub(filled);
+        let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
+        let pct = ratio * 100.0;
+        let model_name = self.active_model_config.read().await.model_name.clone();
+
+        format!(
+            "Context Window Gauge [{}]:\n  [{}] {:>5.1}% ({} / {} tokens)\n  Compaction Tier: {:?} (triggers at ceiling)",
+            model_name,
+            bar,
+            pct,
+            format_num(active_tokens),
+            format_num(limit),
+            tier
+        )
+    }
+
+    /// Handles `/diff` command.
+    pub async fn handle_diff_command(&self) -> anyhow::Result<String> {
+        let snap = self.snapshot_engine.lock().await;
+        let snapshots = snap.list_snapshots();
+        if let Some(first) = snapshots.first() {
+            let diff = snap.diff_snapshot(&first.tree_hash).await?;
+            if diff.trim().is_empty() {
+                Ok("No workspace modifications made in this session (working tree matches baseline).".to_string())
+            } else {
+                Ok(diff)
+            }
+        } else {
+            Ok("No baseline snapshot available to diff against.".to_string())
+        }
+    }
+
+    /// Handles `/skills` command.
+    pub fn handle_skills_command(&self) -> String {
+        let mut out = String::new();
+        if let Ok(reg) = self.skill_registry.read() {
+            let skills = reg.list_skills();
+            if skills.is_empty() {
+                return "No skills currently discovered in .agents/skills/ or .agenda/skills/.".to_string();
+            }
+            out.push_str(&format!("Discovered Skills ({} total):\n\n", skills.len()));
+            for s in skills {
+                out.push_str(&format!(
+                    "• {:<16} ({})\n  Description: {}\n  Source:      {}\n\n",
+                    s.name, s.command, s.description, s.path.display()
+                ));
+            }
+        }
+        out
+    }
+
+    /// Handles `/mcp` command.
+    pub async fn handle_mcp_command(&self) -> String {
+        let tools = self.mcp_registry.list_tools().await;
+        if tools.is_empty() {
+            return "No MCP servers connected or declared in .agendex/mcp.json.".to_string();
+        }
+        let mut out = format!("Connected MCP Tools ({} total):\n\n", tools.len());
+        for t in &tools {
+            out.push_str(&format!(
+                "• [{}] {}\n  Description: {}\n",
+                t.server_name.as_deref().unwrap_or("mcp"),
+                t.name,
+                t.description.as_deref().unwrap_or("No description")
+            ));
+        }
+        out
+    }
+
+    /// Handles `/tools` command.
+    pub async fn handle_tools_command(&self) -> String {
+        let mut out = String::new();
+        out.push_str("Registered Agent Execution Tools:\n\n");
+        out.push_str("Native Harness Tools:\n");
+        out.push_str("  • read_file         Read file contents with optional line boundaries\n");
+        out.push_str("  • write_file        Create or overwrite files in the workspace\n");
+        out.push_str("  • edit_file         Exact AST/text replacement with syntax gate validation\n");
+        out.push_str("  • run_command       Execute shell commands with safety policy gate\n");
+        out.push_str("  • find_definition   Find AST symbol definition (functions, classes, types)\n");
+        out.push_str("  • search_history    Search past conversation trajectories across sessions\n");
+        out.push_str("  • save_skill        Persist multi-turn procedural instructions to SKILL.md\n");
+        out.push_str("  • synthesize_tool   Synthesize and sandbox ad-hoc executable tools\n");
+
+        let mcp_tools = self.mcp_registry.list_tools().await;
+        if !mcp_tools.is_empty() {
+            out.push_str(&format!("\nMCP Tools ({}):\n", mcp_tools.len()));
+            for t in &mcp_tools {
+                out.push_str(&format!(
+                    "  • [{}] {:<20} {}\n",
+                    t.server_name.as_deref().unwrap_or("mcp"),
+                    t.name,
+                    t.description.as_deref().unwrap_or("No description")
+                ));
+            }
+        }
+        out
+    }
+
+    /// Handles `/init` command.
+    pub async fn handle_init_command(&self) -> anyhow::Result<String> {
+        let agents_md_path = self.config.workspace_dir.join("AGENTS.md");
+        if agents_md_path.exists() {
+            return Ok(format!(
+                "AGENTS.md already exists at {}. Scaffolding verified.",
+                agents_md_path.display()
+            ));
+        }
+
+        let mut tech_stack = Vec::new();
+        if self.config.workspace_dir.join("Cargo.toml").exists() {
+            tech_stack.push("Rust (Cargo)");
+        }
+        if self.config.workspace_dir.join("package.json").exists() {
+            tech_stack.push("JavaScript / TypeScript (Node)");
+        }
+        if self.config.workspace_dir.join("pyproject.toml").exists()
+            || self.config.workspace_dir.join("requirements.txt").exists()
+        {
+            tech_stack.push("Python");
+        }
+        if self.config.workspace_dir.join("go.mod").exists() {
+            tech_stack.push("Go");
+        }
+        let stack_desc = if tech_stack.is_empty() {
+            "General Codebase".to_string()
+        } else {
+            tech_stack.join(", ")
+        };
+
+        let project_name = self
+            .config
+            .workspace_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Project");
+
+        let content = format!(
+            "# Agent Guidelines & Project Routing Hub (`AGENTS.md`)\n\n\
+            > **Tier 1 Context Router** — Operational directives and architecture switchboard for autonomous agents.\n\n\
+            ---\n\n\
+            ## 1. Project Mission & Technology Stack\n\n\
+            **{project_name}** is developed in {stack_desc}.\n\
+            - **Workspace Root**: `{workspace}`\n\
+            - **Verification Law**: Every modification must compile and pass existing test suites cleanly before committing.\n\
+            - **Snapshot Integrity**: Mutating edits must be verified against snapshots or git working tree.\n\n\
+            ---\n\n\
+            ## 2. Operational Rules & DoD\n\n\
+            1. **Verify Before Declaring Done**: Execute tests and build commands directly; never report work done without affirmative terminal proof.\n\
+            2. **Deterministic Tool Results**: Handle tool errors with structured output; avoid unverified assumptions.\n\
+            3. **Clean Code & Commits**: Keep edits modular and bounded; write code >10 lines to concrete files.\n\n\
+            ---\n\n\
+            ## 3. Directory Layout & Key Entrypoints\n\n\
+            Review workspace files and add key architecture entrypoints here.\n",
+            project_name = project_name,
+            stack_desc = stack_desc,
+            workspace = self.config.workspace_dir.display()
+        );
+
+        tokio::fs::write(&agents_md_path, content).await?;
+        let _ = tokio::fs::create_dir_all(self.config.workspace_dir.join(".agents").join("skills")).await;
+        let _ = tokio::fs::create_dir_all(self.config.workspace_dir.join(".agents").join("rules")).await;
+
+        Ok(format!(
+            "Successfully initialized AGENTS.md and .agents/ scaffolding at {}.",
+            self.config.workspace_dir.display()
+        ))
+    }
+
+    /// Handles `/config` command.
+    pub fn handle_config_command(&self) -> String {
+        let home_dir = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_else(|_| ".".to_string());
+        let config_path = std::path::PathBuf::from(home_dir).join(".agendex").join("config.toml");
+        let active_prov = self
+            .active_provider_name
+            .try_read()
+            .map(|p| p.clone())
+            .unwrap_or_else(|_| "unknown".to_string());
+        let active_mdl = self
+            .active_model_config
+            .try_read()
+            .map(|m| m.model_name.clone())
+            .unwrap_or_else(|_| self.config.model.model_name.clone());
+        let yolo = self.auto_approve_yolo.load(std::sync::atomic::Ordering::SeqCst);
+
+        format!(
+            "Agendex Configuration:\n  Config Path:        {}\n  Active Provider:    {}\n  Active Model:       {}\n  Model Tier Ceiling: {:?}\n  Auto-Approve (YOLO):{}\n  Workspace:          {}",
+            config_path.display(),
+            active_prov,
+            active_mdl,
+            self.config.model_tier,
+            if yolo { " ENABLED" } else { " DISABLED" },
+            self.config.workspace_dir.display()
+        )
+    }
+
+    /// Handles `/new` command.
+    pub async fn handle_new_command(&self) -> anyhow::Result<String> {
+        let new_session_id = uuid::Uuid::new_v4().to_string();
+        let snap = self.snapshot_engine.lock().await;
+        let new_log_dir = snap.state_dir().join("logs").join(&new_session_id);
+        drop(snap);
+
+        tokio::fs::create_dir_all(&new_log_dir).await?;
+        let mut traj = self.trajectory.lock().await;
+        *traj = agendex_trajectory::TrajectoryLogger::new(&new_log_dir)?;
+
+        self.touched_files.lock().await.clear();
+
+        Ok(format!(
+            "Started fresh session: {}\nTrajectory logs streaming to: {}",
+            new_session_id,
+            new_log_dir.display()
+        ))
+    }
+
+    /// Handles `/resume` command.
+    pub async fn handle_resume_command(&self, args: &str) -> anyhow::Result<String> {
+        let trimmed_arg = args.trim();
+        let snap = self.snapshot_engine.lock().await;
+        let logs_dir = snap.state_dir().join("logs");
+        drop(snap);
+
+        if !trimmed_arg.is_empty() {
+            let target_log_dir = logs_dir.join(trimmed_arg);
+            if !target_log_dir.exists() {
+                return Ok(format!("Session '{}' not found in logs directory.", trimmed_arg));
+            }
+            let mut traj = self.trajectory.lock().await;
+            *traj = agendex_trajectory::TrajectoryLogger::new(&target_log_dir)?;
+            return Ok(format!("Resumed session '{}'. Trajectory reconnected.", trimmed_arg));
+        }
+
+        if !logs_dir.exists() {
+            return Ok("No past sessions found in state directory.".to_string());
+        }
+
+        let mut entries = tokio::fs::read_dir(&logs_dir).await?;
+        let mut session_summaries = Vec::new();
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                let session_name = entry.file_name().to_string_lossy().to_string();
+                let traj_file = entry.path().join("trajectory.jsonl");
+                let mut preview = "No prompt recorded".to_string();
+                let mut step_count = 0;
+                if traj_file.exists() {
+                    if let Ok(content) = tokio::fs::read_to_string(&traj_file).await {
+                        let lines: Vec<&str> = content.lines().collect();
+                        step_count = lines.len();
+                        for line in &lines {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                                if val.get("type").and_then(|t| t.as_str()) == Some("USER_INPUT") {
+                                    if let Some(c) = val.get("content").and_then(|c| c.as_str()) {
+                                        preview = c.chars().take(60).collect();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                session_summaries.push((session_name, step_count, preview));
+            }
+        }
+
+        if session_summaries.is_empty() {
+            return Ok("No recorded sessions found in workspace.".to_string());
+        }
+
+        session_summaries.sort_by_key(|a| std::cmp::Reverse(a.1));
+        let mut out = String::new();
+        out.push_str("Recent Trajectory Sessions in Workspace:\n\n");
+        for (name, steps, prev) in session_summaries.iter().take(10) {
+            let is_current = name == &self.config.session_id;
+            let current_marker = if is_current { " [Active]" } else { "" };
+            out.push_str(&format!(
+                "• {:<36} ({} steps){} - \"{}\"\n",
+                name, steps, current_marker, prev
+            ));
+        }
+        out.push_str("\nTo resume a past session, type: /resume <session_id>");
+        Ok(out)
+    }
 }
 
 /// Identifies a safe split index for context compaction that guarantees
@@ -1677,4 +2125,18 @@ fn find_safe_compaction_boundary(messages: &[ChatMessage], desired_tail: usize) 
         cut += 1;
     }
     cut
+}
+
+fn format_num(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    for (i, c) in chars.into_iter().enumerate() {
+        if i > 0 && (len - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }

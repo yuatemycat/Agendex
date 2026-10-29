@@ -148,8 +148,14 @@ enum ConsoleEvent {
 }
 
 enum ActiveApproval {
-    Command(tokio::sync::oneshot::Sender<bool>),
-    Diff(tokio::sync::oneshot::Sender<bool>),
+    Command {
+        tx: tokio::sync::oneshot::Sender<bool>,
+        command: String,
+    },
+    Diff {
+        tx: tokio::sync::oneshot::Sender<bool>,
+        path: String,
+    },
 }
 
 /// Shared console coordinator serializing all interactive prompts and standard input across
@@ -157,12 +163,19 @@ enum ActiveApproval {
 pub struct SharedApprovalQueue {
     sender: std::sync::mpsc::Sender<ConsoleEvent>,
     is_paused: Arc<std::sync::atomic::AtomicBool>,
+    allowed_commands: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    allowed_diffs: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl SharedApprovalQueue {
     pub fn new() -> Arc<Self> {
         let (event_tx, event_rx) = std::sync::mpsc::channel::<ConsoleEvent>();
         let is_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let allowed_commands = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let allowed_diffs = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+
+        let allowed_cmds_thread = Arc::clone(&allowed_commands);
+        let allowed_diffs_thread = Arc::clone(&allowed_diffs);
 
         // 1. Spawn dedicated Stdin Reader Thread that respects is_paused
         let stdin_tx = event_tx.clone();
@@ -275,14 +288,17 @@ impl SharedApprovalQueue {
                                     );
                                     print!("{}", card);
                                     print!(
-                                        "  {}Allow execution? [y/N]{} {}❯{} ",
+                                        "  {}Allow execution? [y]es / [n]o / [a]lways allow{} {}❯{} ",
                                         crate::ui::TEXT_PRIMARY,
                                         crate::ui::RESET,
                                         crate::ui::ACCENT_AMBER,
                                         crate::ui::RESET
                                     );
                                     let _ = std::io::stdout().flush();
-                                    active_approval = Some(ActiveApproval::Command(responder));
+                                    active_approval = Some(ActiveApproval::Command {
+                                        tx: responder,
+                                        command,
+                                    });
                                 }
                             }
                             ConsoleRequest::DiffApproval {
@@ -302,14 +318,17 @@ impl SharedApprovalQueue {
                                     let colored_diff = crate::ui::format_diff_colored(&path, &diff);
                                     print!("{}", colored_diff);
                                     print!(
-                                        "  {}Apply this change? [y/N]{} {}❯{} ",
+                                        "  {}Apply this change? [y]es / [n]o / [a]lways allow{} {}❯{} ",
                                         crate::ui::TEXT_PRIMARY,
                                         crate::ui::RESET,
                                         crate::ui::ACCENT_CYAN,
                                         crate::ui::RESET
                                     );
                                     let _ = std::io::stdout().flush();
-                                    active_approval = Some(ActiveApproval::Diff(responder));
+                                    active_approval = Some(ActiveApproval::Diff {
+                                        tx: responder,
+                                        path,
+                                    });
                                 }
                             }
                             ConsoleRequest::ReadLine { prompt, responder } => {
@@ -323,12 +342,25 @@ impl SharedApprovalQueue {
                         ConsoleEvent::Line(input) => {
                             if let Some(ticket) = active_approval.take() {
                                 let trimmed = input.trim().to_lowercase();
-                                let approved = trimmed == "y" || trimmed == "yes";
+                                let is_always = trimmed == "a" || trimmed == "always";
+                                let approved = is_always || trimmed == "y" || trimmed == "yes";
                                 match ticket {
-                                    ActiveApproval::Command(tx) => {
+                                    ActiveApproval::Command { tx, command } => {
+                                        if is_always {
+                                            allowed_cmds_thread
+                                                .lock()
+                                                .unwrap()
+                                                .insert(command);
+                                        }
                                         let _ = tx.send(approved);
                                     }
-                                    ActiveApproval::Diff(tx) => {
+                                    ActiveApproval::Diff { tx, path } => {
+                                        if is_always {
+                                            allowed_diffs_thread
+                                                .lock()
+                                                .unwrap()
+                                                .insert(path);
+                                        }
                                         let _ = tx.send(approved);
                                     }
                                 }
@@ -355,10 +387,12 @@ impl SharedApprovalQueue {
                                                 );
                                             }
                                             println!("  {}", command);
-                                            print!("Allow execution? [y/N]: ");
+                                            print!("Allow execution? [y]es / [n]o / [a]lways allow: ");
                                             let _ = std::io::stdout().flush();
-                                            active_approval =
-                                                Some(ActiveApproval::Command(responder));
+                                            active_approval = Some(ActiveApproval::Command {
+                                                tx: responder,
+                                                command,
+                                            });
                                         }
                                         ConsoleRequest::DiffApproval {
                                             subagent_id,
@@ -379,9 +413,12 @@ impl SharedApprovalQueue {
                                                 );
                                             }
                                             println!("{}", diff);
-                                            print!("Apply this change? [y/N]: ");
+                                            print!("Apply this change? [y]es / [n]o / [a]lways allow: ");
                                             let _ = std::io::stdout().flush();
-                                            active_approval = Some(ActiveApproval::Diff(responder));
+                                            active_approval = Some(ActiveApproval::Diff {
+                                                tx: responder,
+                                                path,
+                                            });
                                         }
                                         _ => {}
                                     }
@@ -399,10 +436,10 @@ impl SharedApprovalQueue {
                         ConsoleEvent::Eof => {
                             if let Some(ticket) = active_approval.take() {
                                 match ticket {
-                                    ActiveApproval::Command(tx) => {
+                                    ActiveApproval::Command { tx, .. } => {
                                         let _ = tx.send(false);
                                     }
-                                    ActiveApproval::Diff(tx) => {
+                                    ActiveApproval::Diff { tx, .. } => {
                                         let _ = tx.send(false);
                                     }
                                 }
@@ -433,6 +470,8 @@ impl SharedApprovalQueue {
         Arc::new(Self {
             sender: event_tx,
             is_paused,
+            allowed_commands,
+            allowed_diffs,
         })
     }
 
@@ -449,6 +488,13 @@ impl SharedApprovalQueue {
 
     /// Asynchronously wait for user approval ticket without blocking the async runtime
     pub async fn request_approval(&self, subagent_id: &str, command: &str, reason: &str) -> bool {
+        if self.is_paused.load(std::sync::atomic::Ordering::SeqCst) {
+            return true;
+        }
+        if self.allowed_commands.lock().unwrap().contains(command) {
+            return true;
+        }
+
         let (tx, rx) = tokio::sync::oneshot::channel();
         let req = ConsoleRequest::Approval {
             subagent_id: subagent_id.to_string(),
@@ -466,6 +512,13 @@ impl SharedApprovalQueue {
 
     /// Asynchronously wait for user approval on proposed file diff
     pub async fn request_diff_approval(&self, subagent_id: &str, path: &str, diff: &str) -> bool {
+        if self.is_paused.load(std::sync::atomic::Ordering::SeqCst) {
+            return true;
+        }
+        if self.allowed_diffs.lock().unwrap().contains(path) {
+            return true;
+        }
+
         let (tx, rx) = tokio::sync::oneshot::channel();
         let req = ConsoleRequest::DiffApproval {
             subagent_id: subagent_id.to_string(),
