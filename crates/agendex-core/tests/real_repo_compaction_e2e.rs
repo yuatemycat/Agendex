@@ -322,7 +322,7 @@ async fn test_medium_repo_execution_with_context_compaction_and_revert() -> anyh
 
     // 5. Test /revert rollback to restore repository cleanly
     let revert_reply = agent.process_turn("/revert").await?;
-    assert!(revert_reply.contains("Reverted workspace to latest snapshot checkpoint"));
+    assert!(revert_reply.contains("Reverted workspace to checkpoint"));
 
     // Verify src/auth.rs was restored to pre-turn baseline
     let auth_reverted = tokio::fs::read_to_string(test_dir.join("src/auth.rs")).await?;

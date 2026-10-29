@@ -727,6 +727,55 @@ fn is_host_power_invocation(command: &str) -> bool {
                 }
                 continue;
             }
+            if name == "systemd-run" {
+                i += 1;
+                while i < tokens.len() {
+                    let a = &tokens[i];
+                    if a == "--" {
+                        i += 1;
+                        break;
+                    }
+                    if a.starts_with('-') {
+                        let takes_val = matches!(
+                            a.as_str(),
+                            "-u" | "--unit" | "-p" | "--property" | "--description" | "--slice"
+                        );
+                        i += if takes_val { 2 } else { 1 };
+                    } else {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if name == "loginctl" {
+                if let Some(arg) = tokens.get(i + 1) {
+                    if matches!(
+                        arg.to_lowercase().as_str(),
+                        "poweroff"
+                            | "reboot"
+                            | "halt"
+                            | "suspend"
+                            | "hibernate"
+                            | "hybrid-sleep"
+                            | "lock-session"
+                    ) {
+                        return true;
+                    }
+                }
+            }
+            if name == "dbus-send" {
+                for arg in &tokens[i + 1..] {
+                    let l = arg.to_lowercase();
+                    if l.contains("poweroff")
+                        || l.contains("reboot")
+                        || l.contains("suspend")
+                        || l.contains("hibernate")
+                        || l.ends_with(".halt")
+                    {
+                        return true;
+                    }
+                }
+            }
             if name == "init" || name == "telinit" {
                 if let Some(arg) = tokens.get(i + 1) {
                     if arg == "0" || arg == "6" {
@@ -738,6 +787,33 @@ fn is_host_power_invocation(command: &str) -> bool {
         }
         false
     }
+
+    if command.contains('|') {
+        let parts: Vec<&str> = command.split('|').collect();
+        for (idx, part) in parts.iter().enumerate() {
+            if idx > 0 {
+                let sub_tokens = split_cmd(part);
+                if let Some(first) = sub_tokens.first() {
+                    let bin = normalize(first);
+                    if matches!(bin.as_str(), "sh" | "bash" | "zsh") {
+                        let prev_tokens = split_cmd(parts[idx - 1]);
+                        if let Some(prev_first) = prev_tokens.first() {
+                            let prev_bin = normalize(prev_first);
+                            if matches!(prev_bin.as_str(), "echo" | "printf")
+                                && prev_tokens.len() > 1
+                            {
+                                let payload = prev_tokens[1..].join(" ");
+                                if is_host_power_invocation(&payload) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     at_command_position(&split_cmd(command))
 }
 
@@ -757,6 +833,12 @@ mod tests {
         assert!(is_host_power_invocation("busybox reboot"));
         assert!(is_host_power_invocation("xargs shutdown"));
         assert!(is_host_power_invocation("sudo xargs shutdown"));
+        assert!(is_host_power_invocation("loginctl poweroff"));
+        assert!(is_host_power_invocation("loginctl reboot"));
+        assert!(is_host_power_invocation("echo shutdown | sh"));
+        assert!(is_host_power_invocation("echo reboot | bash"));
+        assert!(is_host_power_invocation("systemd-run shutdown"));
+        assert!(is_host_power_invocation("dbus-send --system --dest=org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager.PowerOff"));
         assert!(!is_host_power_invocation("grep shutdown log.txt"));
         assert!(!is_host_power_invocation("echo shutdown"));
     }

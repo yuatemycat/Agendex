@@ -121,55 +121,83 @@ pub struct SubagentInstance {
     pub error: Option<String>,
 }
 
-/// Shared approval request message sent across threads to the dedicated console worker.
-struct ApprovalTicket {
-    subagent_id: String,
-    command: String,
-    reason: String,
-    responder: tokio::sync::oneshot::Sender<bool>,
+/// Shared console request message sent across threads to the dedicated terminal worker.
+enum ConsoleRequest {
+    Approval {
+        subagent_id: String,
+        command: String,
+        reason: String,
+        responder: tokio::sync::oneshot::Sender<bool>,
+    },
+    ReadLine {
+        prompt: String,
+        responder: tokio::sync::oneshot::Sender<Option<String>>,
+    },
 }
 
-/// Shared approval queue serializing interactive prompts across concurrent subagents
-/// and delegating blocking stdin I/O to a dedicated thread so async runtime workers are never blocked.
+/// Shared console coordinator serializing all interactive prompts and standard input across
+/// concurrent subagents and the CLI REPL, guaranteeing exactly one reader on terminal stdin.
 pub struct SharedApprovalQueue {
-    sender: tokio::sync::mpsc::UnboundedSender<ApprovalTicket>,
+    sender: tokio::sync::mpsc::UnboundedSender<ConsoleRequest>,
 }
 
 impl SharedApprovalQueue {
     pub fn new() -> Arc<Self> {
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<ApprovalTicket>();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<ConsoleRequest>();
 
         std::thread::Builder::new()
-            .name("agendex-swarm-approval".to_string())
+            .name("agendex-console-worker".to_string())
             .spawn(move || {
                 use std::io::Write;
-                while let Some(ticket) = receiver.blocking_recv() {
-                    println!();
-                    if ticket.subagent_id.is_empty() || ticket.subagent_id == "parent" {
-                        println!(
-                            "[Safety Gate] Command is classified as risky ({}):",
-                            ticket.reason
-                        );
-                    } else {
-                        println!(
-                            "[Safety Gate: Subagent {}] Command is classified as risky ({}):",
-                            ticket.subagent_id, ticket.reason
-                        );
+                while let Some(req) = receiver.blocking_recv() {
+                    match req {
+                        ConsoleRequest::Approval {
+                            subagent_id,
+                            command,
+                            reason,
+                            responder,
+                        } => {
+                            println!();
+                            if subagent_id.is_empty() || subagent_id == "parent" {
+                                println!(
+                                    "[Safety Gate] Command is classified as risky ({}):",
+                                    reason
+                                );
+                            } else {
+                                println!(
+                                    "[Safety Gate: Subagent {}] Command is classified as risky ({}):",
+                                    subagent_id, reason
+                                );
+                            }
+                            println!("  {}", command);
+                            print!("Allow execution? [y/N]: ");
+                            let _ = std::io::stdout().flush();
+                            let mut input = String::new();
+                            let approved = if std::io::stdin().read_line(&mut input).is_ok() {
+                                let trimmed = input.trim().to_lowercase();
+                                trimmed == "y" || trimmed == "yes"
+                            } else {
+                                false
+                            };
+                            let _ = responder.send(approved);
+                        }
+                        ConsoleRequest::ReadLine { prompt, responder } => {
+                            if !prompt.is_empty() {
+                                print!("{}", prompt);
+                                let _ = std::io::stdout().flush();
+                            }
+                            let mut input = String::new();
+                            let res = if std::io::stdin().read_line(&mut input).is_ok() {
+                                Some(input)
+                            } else {
+                                None
+                            };
+                            let _ = responder.send(res);
+                        }
                     }
-                    println!("  {}", ticket.command);
-                    print!("Allow execution? [y/N]: ");
-                    let _ = std::io::stdout().flush();
-                    let mut input = String::new();
-                    let approved = if std::io::stdin().read_line(&mut input).is_ok() {
-                        let trimmed = input.trim().to_lowercase();
-                        trimmed == "y" || trimmed == "yes"
-                    } else {
-                        false
-                    };
-                    let _ = ticket.responder.send(approved);
                 }
             })
-            .expect("Failed to spawn shared approval worker thread");
+            .expect("Failed to spawn shared console worker thread");
 
         Arc::new(Self { sender })
     }
@@ -177,18 +205,33 @@ impl SharedApprovalQueue {
     /// Asynchronously wait for user approval ticket without blocking the async runtime
     pub async fn request_approval(&self, subagent_id: &str, command: &str, reason: &str) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let ticket = ApprovalTicket {
+        let req = ConsoleRequest::Approval {
             subagent_id: subagent_id.to_string(),
             command: command.to_string(),
             reason: reason.to_string(),
             responder: tx,
         };
 
-        if self.sender.send(ticket).is_err() {
+        if self.sender.send(req).is_err() {
             return false;
         }
 
         rx.await.unwrap_or(false)
+    }
+
+    /// Asynchronously read a line of input from terminal stdin through the unified reader
+    pub async fn read_line(&self, prompt: &str) -> Option<String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let req = ConsoleRequest::ReadLine {
+            prompt: prompt.to_string(),
+            responder: tx,
+        };
+
+        if self.sender.send(req).is_err() {
+            return None;
+        }
+
+        rx.await.unwrap_or(None)
     }
 }
 

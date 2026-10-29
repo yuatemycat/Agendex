@@ -130,8 +130,38 @@ impl CommandSafetyAssessor {
         }
 
         let mut verdict = CommandSafetyVerdict::Safe;
-        for sub in Self::split_pipeline(trimmed) {
-            let v = Self::evaluate_single_command(&sub, depth);
+        let stages = Self::split_pipeline(trimmed);
+        for (idx, sub) in stages.iter().enumerate() {
+            // Check if this stage is an interpreter receiving input from a previous stage
+            if idx > 0 {
+                let tokens = Self::tokenize(sub);
+                if let Some(first) = tokens.first() {
+                    let bin = normalize_bin(first);
+                    if INTERPRETERS.contains(&bin.as_str()) {
+                        // Check if previous stage produced a command that is hard-blocked
+                        let prev_cmd = &stages[idx - 1];
+                        let prev_tokens = Self::tokenize(prev_cmd);
+                        if let Some(prev_first) = prev_tokens.first() {
+                            let prev_bin = normalize_bin(prev_first);
+                            if matches!(prev_bin.as_str(), "echo" | "printf")
+                                && prev_tokens.len() > 1
+                            {
+                                let payload = prev_tokens[1..].join(" ");
+                                let cleaned = payload.trim_matches('"').trim_matches('\'').trim();
+                                if let CommandSafetyVerdict::Blocked { reason } =
+                                    Self::evaluate_depth(cleaned, depth + 1)
+                                {
+                                    return blocked(format!(
+                                        "piped {} into {}: {}",
+                                        reason, bin, cleaned
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let v = Self::evaluate_single_command(sub, depth);
             verdict = worst(verdict, v);
             if matches!(verdict, CommandSafetyVerdict::Blocked { .. }) {
                 return verdict;
@@ -427,6 +457,60 @@ impl CommandSafetyAssessor {
             })
         {
             return Some(blocked("systemctl host power command"));
+        }
+        if bin_name == "loginctl"
+            && args.iter().any(|a| {
+                matches!(
+                    a.to_lowercase().as_str(),
+                    "poweroff"
+                        | "reboot"
+                        | "halt"
+                        | "suspend"
+                        | "hibernate"
+                        | "hybrid-sleep"
+                        | "lock-session"
+                )
+            })
+        {
+            return Some(blocked("loginctl host power command"));
+        }
+        if bin_name == "systemd-run" {
+            let mut i = 0;
+            while i < args.len() {
+                let a = &args[i];
+                if a == "--" {
+                    i += 1;
+                    break;
+                }
+                if a.starts_with('-') {
+                    let takes_val = matches!(
+                        a.as_str(),
+                        "-u" | "--unit" | "-p" | "--property" | "--description" | "--slice"
+                    );
+                    i += if takes_val { 2 } else { 1 };
+                } else {
+                    break;
+                }
+            }
+            if i < args.len() {
+                let target_bin = normalize_bin(&args[i]);
+                let target_args = &args[i + 1..];
+                if let Some(v) = Self::hard_block(&target_bin, target_args) {
+                    return Some(v);
+                }
+            }
+        }
+        if bin_name == "dbus-send"
+            && args.iter().any(|a| {
+                let l = a.to_lowercase();
+                l.contains("poweroff")
+                    || l.contains("reboot")
+                    || l.contains("suspend")
+                    || l.contains("hibernate")
+                    || l.ends_with(".halt")
+            })
+        {
+            return Some(blocked("dbus-send host power command"));
         }
 
         // Recursive deletion of critical roots
@@ -1007,6 +1091,12 @@ mod tests {
             "sudo xargs shutdown",
             "xargs -n 1 reboot",
             "parallel shutdown",
+            "loginctl poweroff",
+            "loginctl reboot",
+            "echo shutdown | sh",
+            "echo reboot | bash",
+            "systemd-run shutdown",
+            "dbus-send --system --print-reply --dest=org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager.PowerOff",
         ] {
             assert!(
                 is_blocked(c),

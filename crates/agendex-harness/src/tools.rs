@@ -249,8 +249,30 @@ impl ToolRegistry {
         } else {
             self.workspace_dir.join(p)
         };
-        let normalized =
-            strip_verbatim(&raw.canonicalize().unwrap_or_else(|_| normalize_path(&raw)));
+
+        let normalized = if raw.exists() {
+            strip_verbatim(&raw.canonicalize()?)
+        } else {
+            // Check the nearest existing parent folder before creating or accessing a new file
+            // to close parent directory symlink escape holes.
+            let mut current = raw.parent();
+            while let Some(parent) = current {
+                if parent.exists() {
+                    let canon_parent = strip_verbatim(&parent.canonicalize()?);
+                    if !is_subpath(&canon_parent, &base) {
+                        return Err(anyhow!(
+                            "Parent directory '{}' resolves to '{}', which escapes workspace boundary '{}'",
+                            parent.display(),
+                            canon_parent.display(),
+                            self.workspace_dir.display()
+                        ));
+                    }
+                    break;
+                }
+                current = parent.parent();
+            }
+            strip_verbatim(&normalize_path(&raw))
+        };
 
         if !is_subpath(&normalized, &base) {
             return Err(anyhow!(
@@ -273,6 +295,26 @@ impl ToolRegistry {
                 "Path is a directory, not a file: '{}'",
                 resolved.display()
             ));
+        }
+
+        // Check file symlinks to verify target remains inside workspace
+        if let Ok(meta) = tokio::fs::symlink_metadata(&resolved).await {
+            if meta.file_type().is_symlink() {
+                let canon = strip_verbatim(&resolved.canonicalize()?);
+                let base = strip_verbatim(
+                    &self
+                        .workspace_dir
+                        .canonicalize()
+                        .unwrap_or_else(|_| normalize_path(&self.workspace_dir)),
+                );
+                if !is_subpath(&canon, &base) {
+                    return Err(anyhow!(
+                        "File symlink '{}' resolves to '{}', which escapes workspace boundary",
+                        resolved.display(),
+                        canon.display()
+                    ));
+                }
+            }
         }
 
         // Check file extension against prohibited binary list
@@ -623,7 +665,8 @@ impl ToolRegistry {
             .git_ignore(true)
             .git_global(true)
             .git_exclude(true)
-            .require_git(false);
+            .require_git(false)
+            .follow_links(false);
 
         for result in builder.build() {
             let entry = match result {
@@ -699,13 +742,19 @@ impl ToolRegistry {
             .git_ignore(true)
             .git_global(true)
             .git_exclude(true)
-            .require_git(false);
+            .require_git(false)
+            .follow_links(false);
 
         for result in walker_builder.build() {
             let entry = match result {
                 Ok(e) => e,
                 Err(_) => continue,
             };
+
+            // Stop grep from traversing directory symlinks or reading through file symlinks
+            if entry.path_is_symlink() {
+                continue;
+            }
 
             if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
                 continue;
@@ -1472,6 +1521,67 @@ mod tests {
 
         assert_eq!(glob_res.total_matches, 1);
         assert!(glob_res.matches[0].ends_with("main.rs"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_symlink_hole_rejection_and_grep_symlink_skipping() {
+        let tmp = std::env::temp_dir().join(format!(
+            "agendex_symlink_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let ws_dir = tmp.join("workspace");
+        let outside_dir = tmp.join("outside");
+        tokio::fs::create_dir_all(&ws_dir).await.unwrap();
+        tokio::fs::create_dir_all(&outside_dir).await.unwrap();
+
+        let task_manager = Arc::new(TaskManager::new(tmp.join("tasks")));
+        let registry = ToolRegistry::new(ws_dir.clone(), task_manager);
+
+        let outside_file = outside_dir.join("secret_outside.txt");
+        tokio::fs::write(&outside_file, "SECRET_TOKEN_42\n")
+            .await
+            .unwrap();
+
+        #[cfg(windows)]
+        let symlink_res =
+            std::os::windows::fs::symlink_file(&outside_file, ws_dir.join("link_to_secret.txt"));
+        #[cfg(not(windows))]
+        let symlink_res =
+            std::os::unix::fs::symlink(&outside_file, ws_dir.join("link_to_secret.txt"));
+
+        if symlink_res.is_ok() {
+            let read_res = registry
+                .read_file(ReadFileArgs {
+                    path: PathBuf::from("link_to_secret.txt"),
+                    start_line: None,
+                    end_line: None,
+                    byte_offset: None,
+                    max_bytes: None,
+                })
+                .await;
+            assert!(
+                read_res.is_err(),
+                "Reading file symlink pointing outside workspace must fail"
+            );
+
+            let grep_res = registry
+                .grep(GrepArgs {
+                    pattern: "SECRET_TOKEN_42".to_string(),
+                    path: None,
+                    glob: None,
+                    case_insensitive: false,
+                    max_results: None,
+                    context_lines: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                grep_res.total_matches, 0,
+                "Grep must not follow file symlink"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

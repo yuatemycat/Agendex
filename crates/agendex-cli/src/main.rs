@@ -1,7 +1,6 @@
 use std::env;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use tokio::io::{AsyncBufReadExt, BufReader};
 
 use agendex_core::agent::AgendexAgent;
 
@@ -38,11 +37,14 @@ async fn main() -> anyhow::Result<()> {
     // one-shot `-p` runs. Without a terminal (CI, pipes), risky commands are
     // refused unless `--yes` was passed.
     use std::io::IsTerminal;
-    let agent = if !config.auto_approve_risky && std::io::stdin().is_terminal() {
+    let (agent, approval_queue) = if !config.auto_approve_risky && std::io::stdin().is_terminal() {
         let queue = agendex_core::swarm::SharedApprovalQueue::new();
-        agent.with_approval_queue(queue)
+        (
+            agent.with_approval_queue(std::sync::Arc::clone(&queue)),
+            Some(queue),
+        )
     } else {
-        agent
+        (agent, None)
     };
     println!("[Agendex] Ready. Skills, Rules, and Execution Core mounted.\n");
 
@@ -52,15 +54,23 @@ async fn main() -> anyhow::Result<()> {
         println!("\n[Agendex]:\n{}", resp);
     } else {
         println!("Interactive REPL. Type '/help' for skills, '/compact' to compress, or 'exit' to quit.\n");
-        let stdin = tokio::io::stdin();
-        let mut reader = BufReader::new(stdin).lines();
 
         loop {
-            print!("agendex> ");
-            io::stdout().flush()?;
+            let next_line = if let Some(queue) = &approval_queue {
+                queue.read_line("agendex> ").await
+            } else {
+                print!("agendex> ");
+                io::stdout().flush()?;
+                let mut line = String::new();
+                if std::io::stdin().read_line(&mut line).is_ok() {
+                    Some(line)
+                } else {
+                    None
+                }
+            };
 
-            match reader.next_line().await {
-                Ok(Some(line)) => {
+            match next_line {
+                Some(line) => {
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
                         continue;
@@ -83,11 +93,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                Ok(None) => break,
-                Err(e) => {
-                    eprintln!("Error reading stdin: {}", e);
-                    break;
-                }
+                None => break,
             }
         }
     }

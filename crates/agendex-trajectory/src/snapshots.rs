@@ -62,6 +62,14 @@ pub fn state_dir_for_workspace(workspace_dir: &Path) -> PathBuf {
         .join(format!("{folder_name}-{hash_val}"))
 }
 
+/// Result of a multi-turn rollback operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnRollbackResult {
+    pub snapshot: SnapshotRecord,
+    pub step_index: Option<u64>,
+    pub removed_files: Vec<PathBuf>,
+}
+
 /// Record representing a workspace tree snapshot at a discrete point in time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SnapshotRecord {
@@ -335,6 +343,166 @@ impl SnapshotEngine {
             .ok_or_else(|| anyhow::anyhow!("No snapshots available to roll back"))?;
 
         self.rollback(&latest_hash).await
+    }
+
+    /// Record a file created by the agent during the current turn.
+    pub fn record_created_file(&mut self, path: impl AsRef<Path>) {
+        let rel_path = path
+            .as_ref()
+            .strip_prefix(&self.workspace_dir)
+            .unwrap_or_else(|_| path.as_ref())
+            .to_string_lossy()
+            .to_string();
+
+        if let Some(last) = self.snapshots.last_mut() {
+            let meta = last.metadata.get_or_insert_with(|| serde_json::json!({}));
+            if let Some(obj) = meta.as_object_mut() {
+                let list = obj
+                    .entry("created_files".to_string())
+                    .or_insert_with(|| serde_json::json!([]));
+                if let Some(arr) = list.as_array_mut() {
+                    let val = serde_json::json!(rel_path);
+                    if !arr.contains(&val) {
+                        arr.push(val);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Roll back the most recent turn. Restores the snapshot from the start of the turn,
+    /// removes files the agent created during that turn while preserving user files, and
+    /// pops snapshots so subsequent calls to `rollback_turn()` step back further turn by turn.
+    pub async fn rollback_turn(&mut self) -> anyhow::Result<Option<TurnRollbackResult>> {
+        self.ensure_git_ready().await?;
+
+        // Find the index of the latest turn_start snapshot
+        let turn_start_idx = self.snapshots.iter().rposition(|s| {
+            s.label.starts_with("turn_start")
+                || s.metadata
+                    .as_ref()
+                    .and_then(|m| m.get("kind"))
+                    .and_then(|k| k.as_str())
+                    == Some("turn_start")
+        });
+
+        let target_idx = match turn_start_idx {
+            Some(idx) => idx,
+            None => {
+                if self.snapshots.is_empty() {
+                    return Ok(None);
+                }
+                0
+            }
+        };
+
+        let target_record = self.snapshots[target_idx].clone();
+
+        // Collect all files created by the agent in this turn and subsequent snapshots
+        let mut created_by_agent: Vec<String> = Vec::new();
+        for s in &self.snapshots[target_idx..] {
+            if let Some(meta) = &s.metadata {
+                if let Some(arr) = meta.get("created_files").and_then(|f| f.as_array()) {
+                    for v in arr {
+                        if let Some(str_val) = v.as_str() {
+                            if !created_by_agent.contains(&str_val.to_string()) {
+                                created_by_agent.push(str_val.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 1. Unstage any user-created files from isolated index so git read-tree does not delete them
+        let mut ls_files_cmd = Command::new("git");
+        ls_files_cmd
+            .args(["ls-files"])
+            .current_dir(&self.workspace_dir);
+        if !self.index_file.as_os_str().is_empty() {
+            ls_files_cmd.env("GIT_INDEX_FILE", &self.index_file);
+        }
+        let ls_files_out = ls_files_cmd.output().await?;
+        let index_files = String::from_utf8_lossy(&ls_files_out.stdout);
+
+        for line in index_files.lines() {
+            let file = line.trim();
+            if file.is_empty() {
+                continue;
+            }
+            let mut ls_tree_cmd = Command::new("git");
+            ls_tree_cmd
+                .args(["ls-tree", &target_record.tree_hash, file])
+                .current_dir(&self.workspace_dir);
+            let ls_tree_out = ls_tree_cmd.output().await?;
+            let in_target = !String::from_utf8_lossy(&ls_tree_out.stdout)
+                .trim()
+                .is_empty();
+
+            if !in_target {
+                let is_agent_created = created_by_agent.iter().any(|c| c == file);
+                if !is_agent_created {
+                    // User file created outside agent tools: unstage from isolated index
+                    // so git read-tree treats it as untracked and preserves it completely!
+                    let mut rm_cached = Command::new("git");
+                    rm_cached
+                        .args(["rm", "--cached", "--quiet", "--force", "--", file])
+                        .current_dir(&self.workspace_dir);
+                    if !self.index_file.as_os_str().is_empty() {
+                        rm_cached.env("GIT_INDEX_FILE", &self.index_file);
+                    }
+                    let _ = rm_cached.output().await;
+                }
+            }
+        }
+
+        // 2. Rollback workspace files using git read-tree
+        let mut read_cmd = Command::new("git");
+        read_cmd
+            .args(["read-tree", "-u", "--reset", &target_record.tree_hash])
+            .current_dir(&self.workspace_dir);
+        if !self.index_file.as_os_str().is_empty() {
+            read_cmd.env("GIT_INDEX_FILE", &self.index_file);
+        }
+        let read_out = read_cmd.output().await?;
+        Self::check_output(&read_out, "git read-tree -u --reset")?;
+
+        // 3. Remove files the agent created during this turn, verifying they did not exist in target tree
+        let mut removed_files = Vec::new();
+        for rel_file in created_by_agent {
+            let full_path = self.workspace_dir.join(&rel_file);
+            if full_path.exists() {
+                // Check if file was in the target snapshot tree
+                let mut ls_cmd = Command::new("git");
+                ls_cmd
+                    .args(["ls-tree", &target_record.tree_hash, &rel_file])
+                    .current_dir(&self.workspace_dir);
+                let ls_out = ls_cmd.output().await?;
+                let stdout = String::from_utf8_lossy(&ls_out.stdout);
+                if stdout.trim().is_empty() {
+                    // File did not exist at the start of the turn: safe to delete
+                    if let Ok(()) = tokio::fs::remove_file(&full_path).await {
+                        removed_files.push(full_path);
+                    }
+                }
+            }
+        }
+
+        let step_index = target_record
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("step_index"))
+            .and_then(|i| i.as_u64());
+
+        // 3. Pop the reverted turn's snapshots from history so next /revert steps back further
+        self.snapshots.truncate(target_idx);
+        let _ = self.save_snapshots_to_disk();
+
+        Ok(Some(TurnRollbackResult {
+            snapshot: target_record,
+            step_index,
+            removed_files,
+        }))
     }
 
     /// Generate unified diff comparing working tree to a recorded snapshot.
@@ -628,6 +796,83 @@ mod tests {
         let status_after_revert_str =
             String::from_utf8_lossy(&status_after_revert.stdout).to_string();
         assert!(status_after_revert_str.contains("A  user_staged.txt"));
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_multi_turn_rollback_steps_back_and_removes_agent_files_while_preserving_user_files(
+    ) -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "agendex_test_turn_rollback_{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&temp_dir).await?;
+
+        let mut engine = SnapshotEngine::new(&temp_dir)?;
+        let base_file = temp_dir.join("base.txt");
+        tokio::fs::write(&base_file, "Base version\n").await?;
+
+        // Turn 1 starts
+        engine
+            .capture_snapshot_with_metadata(
+                "turn_start:1",
+                Some(serde_json::json!({
+                    "kind": "turn_start",
+                    "step_index": 1,
+                    "created_files": []
+                })),
+            )
+            .await?;
+
+        // Agent creates agent_turn1.txt in Turn 1
+        let agent_file1 = temp_dir.join("agent_turn1.txt");
+        tokio::fs::write(&agent_file1, "Agent generated turn 1\n").await?;
+        engine.record_created_file(&agent_file1);
+
+        // User independently creates user_notes.txt by hand
+        let user_file = temp_dir.join("user_notes.txt");
+        tokio::fs::write(&user_file, "User hand-made notes\n").await?;
+
+        // Turn 2 starts
+        engine
+            .capture_snapshot_with_metadata(
+                "turn_start:2",
+                Some(serde_json::json!({
+                    "kind": "turn_start",
+                    "step_index": 4,
+                    "created_files": []
+                })),
+            )
+            .await?;
+
+        // Agent creates agent_turn2.txt in Turn 2
+        let agent_file2 = temp_dir.join("agent_turn2.txt");
+        tokio::fs::write(&agent_file2, "Agent generated turn 2\n").await?;
+        engine.record_created_file(&agent_file2);
+
+        // User runs first /revert -> reverts Turn 2
+        let res2 = engine.rollback_turn().await?.expect("Must rollback Turn 2");
+        assert_eq!(res2.snapshot.label, "turn_start:2");
+        assert_eq!(res2.step_index, Some(4));
+        assert!(!agent_file2.exists(), "Agent turn 2 file must be removed");
+        assert!(agent_file1.exists(), "Agent turn 1 file must still exist");
+        assert!(user_file.exists(), "User file must be preserved");
+
+        // User runs second /revert -> steps back further to revert Turn 1
+        let res1 = engine.rollback_turn().await?.expect("Must rollback Turn 1");
+        assert_eq!(res1.snapshot.label, "turn_start:1");
+        assert_eq!(res1.step_index, Some(1));
+        assert!(
+            !agent_file1.exists(),
+            "Agent turn 1 file must now be removed"
+        );
+        assert!(user_file.exists(), "User file must STILL be preserved");
+
+        // Third /revert -> no more turns to revert
+        let res0 = engine.rollback_turn().await?;
+        assert!(res0.is_none(), "No more turns to revert");
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
         Ok(())

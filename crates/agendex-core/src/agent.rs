@@ -293,8 +293,30 @@ impl AgendexAgent {
                 }
                 "/revert" => {
                     let mut snap = self.snapshot_engine.lock().await;
-                    snap.rollback_latest().await?;
-                    return Ok("Reverted workspace to latest snapshot checkpoint.".to_string());
+                    match snap.rollback_turn().await? {
+                        Some(res) => {
+                            if let Some(step_idx) = res.step_index {
+                                let mut traj = self.trajectory.lock().await;
+                                let _ = traj.truncate_after(step_idx.saturating_sub(1));
+                            }
+                            let msg = if res.removed_files.is_empty() {
+                                format!(
+                                    "Reverted workspace to checkpoint [{}] (all changes in turn undone).",
+                                    res.snapshot.label
+                                )
+                            } else {
+                                format!(
+                                    "Reverted workspace to checkpoint [{}] (undone turn, removed {} agent-created file(s)).",
+                                    res.snapshot.label,
+                                    res.removed_files.len()
+                                )
+                            };
+                            return Ok(msg);
+                        }
+                        None => {
+                            return Ok("No previous turn snapshot available to revert.".to_string());
+                        }
+                    }
                 }
                 _ => {
                     if let Some(skill) = self.skill_registry.get_skill_by_command(cmd) {
@@ -312,9 +334,21 @@ impl AgendexAgent {
         self.hook_dispatcher.trigger_pre_turn(user_input).await?;
 
         // 3. Workspace Snapshot before turn
+        let start_step_count = { self.trajectory.lock().await.step_count() };
+        let turn_step_index = start_step_count + 1;
+        let turn_label = format!("turn_start:{}", turn_step_index);
         {
             let mut snap = self.snapshot_engine.lock().await;
-            let _ = snap.capture_snapshot("pre-turn").await;
+            let _ = snap
+                .capture_snapshot_with_metadata(
+                    &turn_label,
+                    Some(serde_json::json!({
+                        "kind": "turn_start",
+                        "step_index": turn_step_index,
+                        "created_files": []
+                    })),
+                )
+                .await;
         }
 
         // 4. Record User Input into Trajectory
@@ -658,12 +692,23 @@ impl AgendexAgent {
                 }
             }
             _ => {
-                match self
+                let res_val = self
                     .tool_registry
                     .execute_tool(&tc.name, tc.arguments.clone())
-                    .await
-                {
+                    .await;
+                match res_val {
                     Ok(res) => {
+                        if tc.name == "write_file"
+                            && res
+                                .get("created")
+                                .and_then(|c| c.as_bool())
+                                .unwrap_or(false)
+                        {
+                            if let Some(path_str) = res.get("path").and_then(|p| p.as_str()) {
+                                let mut snap = self.snapshot_engine.lock().await;
+                                snap.record_created_file(path_str);
+                            }
+                        }
                         serde_json::to_string_pretty(&res).unwrap_or_else(|_| "{}".to_string())
                     }
                     Err(e) => format!("Tool execution error for '{}': {}", tc.name, e),
