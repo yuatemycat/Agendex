@@ -161,6 +161,28 @@ pub struct GrepResult {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SearchHistoryArgs {
+    pub query: String,
+    pub session_id: Option<String>,
+    pub step_type: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindDefinitionArgs {
+    pub symbol: String,
+    pub path: Option<PathBuf>,
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindDefinitionResult {
+    pub symbol: String,
+    pub definitions: Vec<agendex_ast::DefinitionMatch>,
+    pub total_found: usize,
+}
+
 // ============================================================================
 // ToolRegistry
 // ============================================================================
@@ -218,14 +240,27 @@ fn is_subpath(path: &Path, base: &Path) -> bool {
 pub struct ToolRegistry {
     workspace_dir: PathBuf,
     task_manager: Arc<TaskManager>,
+    logs_dir: Option<PathBuf>,
 }
 
 impl ToolRegistry {
     pub fn new(workspace_dir: PathBuf, task_manager: Arc<TaskManager>) -> Self {
+        let default_logs_dir =
+            agendex_trajectory::state_dir_for_workspace(&workspace_dir).join("logs");
         Self {
             workspace_dir,
             task_manager,
+            logs_dir: Some(default_logs_dir),
         }
+    }
+
+    pub fn with_logs_dir(mut self, logs_dir: PathBuf) -> Self {
+        self.logs_dir = Some(logs_dir);
+        self
+    }
+
+    pub fn logs_dir(&self) -> Option<&Path> {
+        self.logs_dir.as_deref()
     }
 
     pub fn workspace_dir(&self) -> &Path {
@@ -234,6 +269,26 @@ impl ToolRegistry {
 
     pub fn task_manager(&self) -> &Arc<TaskManager> {
         &self.task_manager
+    }
+
+    /// Searches past conversation sessions for matching goals, tool calls, or outputs.
+    pub async fn search_history(
+        &self,
+        args: SearchHistoryArgs,
+    ) -> Result<Vec<agendex_trajectory::HistorySearchResult>> {
+        let logs_dir = self.logs_dir.clone().unwrap_or_else(|| {
+            agendex_trajectory::state_dir_for_workspace(&self.workspace_dir).join("logs")
+        });
+
+        let query = agendex_trajectory::HistorySearchQuery {
+            query: args.query,
+            session_id: args.session_id,
+            step_type: args.step_type,
+            limit: args.limit,
+        };
+
+        let results = agendex_trajectory::TrajectorySearcher::search(&logs_dir, &query)?;
+        Ok(results)
     }
 
     /// Resolves a path safely against workspace directory and verifies it does not escape.
@@ -840,6 +895,36 @@ impl ToolRegistry {
         })
     }
 
+    /// Locates AST definitions for a symbol across workspace files (Rust, Go, Python, TypeScript, JavaScript).
+    pub async fn find_definition(&self, args: FindDefinitionArgs) -> Result<FindDefinitionResult> {
+        let search_path = match args.path {
+            Some(ref p) => self.resolve_path(p)?,
+            None => self.workspace_dir.clone(),
+        };
+
+        let mut defs = agendex_ast::find_definition(&args.symbol, Some(&search_path))
+            .map_err(|e| anyhow!("AST find_definition error: {}", e))?;
+
+        if let Some(ref k) = args.kind {
+            let k_lower = k.to_lowercase();
+            defs.retain(|d| d.kind.to_string().to_lowercase() == k_lower);
+        }
+
+        // Strip workspace prefix for relative file paths
+        for d in &mut defs {
+            if let Ok(rel) = d.path.strip_prefix(&self.workspace_dir) {
+                d.path = rel.to_path_buf();
+            }
+        }
+
+        let total = defs.len();
+        Ok(FindDefinitionResult {
+            symbol: args.symbol,
+            definitions: defs,
+            total_found: total,
+        })
+    }
+
     /// Dispatches dynamic tool execution from JSON-RPC / tool-call payload.
     pub async fn execute_tool(
         &self,
@@ -879,6 +964,16 @@ impl ToolRegistry {
             "grep" => {
                 let params: GrepArgs = serde_json::from_value(args)?;
                 let res = self.grep(params).await?;
+                Ok(serde_json::to_value(res)?)
+            }
+            "search_history" => {
+                let params: SearchHistoryArgs = serde_json::from_value(args)?;
+                let res = self.search_history(params).await?;
+                Ok(serde_json::to_value(res)?)
+            }
+            "find_definition" => {
+                let params: FindDefinitionArgs = serde_json::from_value(args)?;
+                let res = self.find_definition(params).await?;
                 Ok(serde_json::to_value(res)?)
             }
             other => Err(anyhow!("Unknown tool name: '{}'", other)),
@@ -988,6 +1083,33 @@ impl ToolRegistry {
                         "context_lines": { "type": "integer", "description": "Number of context lines before and after matches" }
                     },
                     "required": ["pattern"]
+                }
+            }),
+            json!({
+                "name": "search_history",
+                "description": "Search past conversation session goals, tool calls, and execution outputs across past trajectory history.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Keyword or text phrase to search for" },
+                        "session_id": { "type": "string", "description": "Optional specific session ID to narrow search" },
+                        "step_type": { "type": "string", "description": "Optional step type filter (e.g. 'USER_INPUT', 'TOOL_RESULT', 'PLANNER_RESPONSE', 'ASSISTANT')" },
+                        "limit": { "type": "integer", "description": "Maximum number of matching steps to return (default 20)" }
+                    },
+                    "required": ["query"]
+                }
+            }),
+            json!({
+                "name": "find_definition",
+                "description": "Locate AST definitions (function, struct, class, enum, interface, trait, type) for a symbol across workspace files (Rust, Go, Python, TypeScript, JavaScript).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "symbol": { "type": "string", "description": "Symbol or identifier name to locate" },
+                        "path": { "type": "string", "description": "Optional file or directory path to search within" },
+                        "kind": { "type": "string", "description": "Optional definition kind filter (e.g. 'function', 'struct', 'class', 'enum', 'interface', 'trait', 'type_alias')" }
+                    },
+                    "required": ["symbol"]
                 }
             }),
         ]
@@ -1235,7 +1357,9 @@ mod tests {
 
         // Definitions
         let defs = registry.list_tool_definitions();
-        assert_eq!(defs.len(), 7);
+        assert_eq!(defs.len(), 9);
+        assert!(defs.iter().any(|d| d["name"] == "search_history"));
+        assert!(defs.iter().any(|d| d["name"] == "find_definition"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1582,6 +1706,99 @@ mod tests {
                 "Grep must not follow file symlink"
             );
         }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_search_history_tool() {
+        let tmp =
+            std::env::temp_dir().join(format!("agendex_search_tool_test_{}", uuid::Uuid::new_v4()));
+        let logs_dir = tmp.join("logs");
+        let session_dir = logs_dir.join("test_session_123");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        // Create a trajectory entry in test_session_123
+        let mut logger = agendex_trajectory::TrajectoryLogger::new(&session_dir).unwrap();
+        logger
+            .log_step(
+                "USER_INPUT",
+                "USER",
+                "Deploy production Kubernetes cluster",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+
+        let task_manager = Arc::new(TaskManager::new(tmp.join("tasks")));
+        let registry = ToolRegistry::new(tmp.clone(), task_manager).with_logs_dir(logs_dir);
+
+        let res = registry
+            .execute_tool(
+                "search_history",
+                serde_json::json!({
+                    "query": "Kubernetes"
+                }),
+            )
+            .await
+            .expect("Failed to execute search_history");
+
+        let matches: Vec<agendex_trajectory::HistorySearchResult> =
+            serde_json::from_value(res).expect("Failed to deserialize search results");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].session_id, "test_session_123");
+        assert!(matches[0].snippet.contains("Kubernetes"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_find_definition_tool() {
+        let tmp = std::env::temp_dir().join(format!(
+            "agendex_def_tool_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let src_dir = tmp.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let rust_code = "pub struct QueryRouter {\n    pub routes: Vec<String>,\n}\n\npub fn handle_request() {}\n";
+        std::fs::write(src_dir.join("router.rs"), rust_code).unwrap();
+
+        let py_code = "class WorkerPool:\n    def dispatch(self):\n        pass\n";
+        std::fs::write(src_dir.join("pool.py"), py_code).unwrap();
+
+        let task_manager = Arc::new(TaskManager::new(tmp.join("tasks")));
+        let registry = ToolRegistry::new(tmp.clone(), task_manager);
+
+        // 1. Direct call
+        let res = registry
+            .find_definition(FindDefinitionArgs {
+                symbol: "QueryRouter".to_string(),
+                path: None,
+                kind: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(res.total_found, 1);
+        assert_eq!(res.definitions[0].symbol, "QueryRouter");
+        assert_eq!(res.definitions[0].line, 1);
+
+        // 2. JSON execution via execute_tool
+        let json_val = registry
+            .execute_tool(
+                "find_definition",
+                serde_json::json!({
+                    "symbol": "WorkerPool"
+                }),
+            )
+            .await
+            .unwrap();
+
+        let json_res: FindDefinitionResult = serde_json::from_value(json_val).unwrap();
+        assert_eq!(json_res.total_found, 1);
+        assert_eq!(json_res.definitions[0].symbol, "WorkerPool");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

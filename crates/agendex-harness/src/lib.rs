@@ -21,7 +21,7 @@ pub use terminal::{
     TerminalConfig, TerminalManager, TerminalOutputBuffer, TerminalSession, TerminalSessionInfo,
 };
 pub use tools::{
-    DirEntryInfo, ListDirArgs, ListDirResult, ManageTaskArgs, ReadFileArgs, ReadFileResult,
-    RunCommandArgs, ToolRegistry, WriteFileArgs, WriteFileResult, DEFAULT_MAX_READ_BYTES,
-    DEFAULT_MAX_READ_LINES,
+    DirEntryInfo, FindDefinitionArgs, FindDefinitionResult, ListDirArgs, ListDirResult,
+    ManageTaskArgs, ReadFileArgs, ReadFileResult, RunCommandArgs, ToolRegistry, WriteFileArgs,
+    WriteFileResult, DEFAULT_MAX_READ_BYTES, DEFAULT_MAX_READ_LINES,
 };

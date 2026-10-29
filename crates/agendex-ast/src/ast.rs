@@ -787,14 +787,14 @@ fn parse_js_ts(
 ) -> Result<Vec<AstNode>, AstError> {
     let mut nodes = Vec::new();
     let re_decl = regex::Regex::new(
-        r"(?m)^(?P<indent>[ \t]*)(?:export[ \t]+)?(?:default[ \t]+)?(?:async[ \t]+)?(?P<kw>function|class|interface|type)[ \t]+(?P<ident>[a-zA-Z_$][a-zA-Z0-9_$]*)"
+        r"(?m)^(?P<indent>[ \t]*)(?:export[ \t]+)?(?:default[ \t]+)?(?:const[ \t]+)?(?:async[ \t]+)?(?P<kw>function|class|interface|type|enum)[ \t]+(?P<ident>[a-zA-Z_$][a-zA-Z0-9_$]*)"
     ).map_err(|e| AstError::ParseError {
         language,
         message: e.to_string(),
     })?;
 
     let re_method = regex::Regex::new(
-        r"(?m)^[ \t]*(?:public[ \t]+|private[ \t]+|protected[ \t]+)?(?:static[ \t]+)?(?:async[ \t]+)?(?P<mname>[a-zA-Z_$][a-zA-Z0-9_$]*)[ \t]*\([^)]*\)[ \t]*\{"
+        r"(?m)^[ \t]*(?:public[ \t]+|private[ \t]+|protected[ \t]+)?(?:static[ \t]+)?(?:async[ \t]+)?(?P<mname>[a-zA-Z_$][a-zA-Z0-9_$]*)[ \t]*\([^)]*\)[ \t]*(?::[ \t]*[^{]+)?[ \t]*\{"
     ).map_err(|e| AstError::ParseError {
         language,
         message: e.to_string(),
@@ -841,6 +841,7 @@ fn parse_js_ts(
             "class" => NodeKind::Class,
             "interface" => NodeKind::Interface,
             "type" => NodeKind::TypeAlias,
+            "enum" => NodeKind::Enum,
             _ => continue,
         };
 
@@ -939,6 +940,30 @@ fn parse_go(content: &str, index: &LineIndex) -> Result<Vec<AstNode>, AstError> 
                 body: content[start..end].to_string(),
             });
         }
+    }
+
+    // Go type aliases and non-struct/interface types (e.g. type ID string or type IntAlias = int)
+    let re_type_alias = regex::Regex::new(
+        r"(?m)^type[ \t]+(?P<name>[a-zA-Z0-9_]+)[ \t]+(?:=[ \t]+)?(?P<target>[a-zA-Z0-9_.*\[\]]+)[ \t]*(?://.*)?$",
+    )
+    .unwrap();
+    for cap in re_type_alias.captures_iter(content) {
+        let full = cap.get(0).unwrap();
+        let start = full.start();
+        let end = full.end();
+        let name = cap.name("name").unwrap().as_str();
+        if nodes.iter().any(|n| n.name == name) {
+            continue;
+        }
+        nodes.push(AstNode {
+            kind: NodeKind::TypeAlias,
+            name: name.to_string(),
+            language: SupportedLanguage::Go,
+            span: index.span(start, end),
+            parent_path: None,
+            signature: Some(content[start..end].trim().to_string()),
+            body: content[start..end].to_string(),
+        });
     }
 
     // 3. Functions and Methods

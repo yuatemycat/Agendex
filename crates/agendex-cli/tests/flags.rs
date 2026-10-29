@@ -44,4 +44,83 @@ fn test_cli_flags_parsing() {
     );
     assert!(parsed.config.auto_approve_risky);
     assert!(!parsed.show_help);
+    assert!(!parsed.json_mode);
+    assert!(!parsed.git_commit);
+    assert!(parsed.git_branch.is_none());
+}
+
+#[test]
+fn test_cli_advanced_tooling_flags() {
+    let args = vec![
+        "agendex".to_string(),
+        "--json".to_string(),
+        "--git-commit".to_string(),
+        "--git-branch".to_string(),
+        "feat/tooling".to_string(),
+        "-p".to_string(),
+        "run headless".to_string(),
+    ];
+
+    let parsed = parse_cli_args(&args, PathBuf::from("."));
+
+    assert!(parsed.json_mode);
+    assert!(parsed.git_commit);
+    assert_eq!(parsed.git_branch.as_deref(), Some("feat/tooling"));
+    assert_eq!(parsed.prompt.as_deref(), Some("run headless"));
+}
+
+#[test]
+fn test_cli_config_file_and_proxymateur_preset() {
+    let tmp_dir = std::env::temp_dir().join(format!("agendex_cli_cfg_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let cfg_file = tmp_dir.join("config.toml");
+    std::fs::write(
+        &cfg_file,
+        r#"
+            provider = "proxymateur"
+            model = "gpt-4o"
+            tier = "256k"
+            auto_approve_risky = true
+        "#,
+    )
+    .unwrap();
+
+    let args = vec![
+        "agendex".to_string(),
+        "--config".to_string(),
+        cfg_file.to_string_lossy().to_string(),
+    ];
+
+    let parsed = parse_cli_args(&args, PathBuf::from("."));
+
+    assert_eq!(parsed.config.model.format, ModelFormat::OpenAi);
+    assert_eq!(
+        parsed.config.model.base_url.as_deref(),
+        Some("http://127.0.0.1:8045/v1")
+    );
+    assert_eq!(parsed.config.model.model_name, "gpt-4o");
+    assert_eq!(parsed.config.model_tier, ModelTier::HighTier256k);
+    assert!(parsed.config.auto_approve_risky);
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn test_cli_provider_proxymateur_flag() {
+    let args = vec![
+        "agendex".to_string(),
+        "--provider".to_string(),
+        "proxymateur".to_string(),
+        "--model".to_string(),
+        "gemini-2.5-flash".to_string(),
+    ];
+
+    let parsed = parse_cli_args(&args, PathBuf::from("."));
+
+    assert_eq!(parsed.config.model.format, ModelFormat::OpenAi);
+    assert_eq!(
+        parsed.config.model.base_url.as_deref(),
+        Some("http://127.0.0.1:8045/v1")
+    );
+    assert_eq!(parsed.config.model.model_name, "gemini-2.5-flash");
 }

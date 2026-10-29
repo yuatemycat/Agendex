@@ -6,6 +6,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::telemetry::{format_telemetry, SessionUsage, TokenUsage};
+
 /// Maximum characters allowed in compact trajectory log before truncation triggers.
 pub const DEFAULT_COMPACT_CHAR_LIMIT: usize = 1000;
 
@@ -63,6 +65,8 @@ pub struct TrajectoryLogger {
     step_counter: u64,
     in_memory_steps: Vec<TrajectoryStep>,
     db: Arc<Mutex<Connection>>,
+    session_usage: SessionUsage,
+    last_turn_usage: Option<TokenUsage>,
 }
 
 impl TrajectoryLogger {
@@ -95,6 +99,8 @@ impl TrajectoryLogger {
             step_counter,
             in_memory_steps: Vec::new(),
             db: Arc::new(Mutex::new(conn)),
+            session_usage: SessionUsage::default(),
+            last_turn_usage: None,
         };
 
         logger.reload_steps_from_db()?;
@@ -114,6 +120,8 @@ impl TrajectoryLogger {
             step_counter: 0,
             in_memory_steps: Vec::new(),
             db: Arc::new(Mutex::new(conn)),
+            session_usage: SessionUsage::default(),
+            last_turn_usage: None,
         })
     }
 
@@ -148,8 +156,19 @@ impl TrajectoryLogger {
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS trajectory_token_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                step_index INTEGER,
+                prompt_tokens INTEGER NOT NULL,
+                completion_tokens INTEGER NOT NULL,
+                total_tokens INTEGER NOT NULL,
+                estimated_cost REAL NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_steps_created_at ON trajectory_steps(created_at);
             CREATE INDEX IF NOT EXISTS idx_checkpoints_step ON trajectory_checkpoints(step_index);
+            CREATE INDEX IF NOT EXISTS idx_token_usage_created ON trajectory_token_usage(created_at);
             "#,
         )?;
         Ok(())
@@ -201,7 +220,79 @@ impl TrajectoryLogger {
         for row in rows {
             self.in_memory_steps.push(row?);
         }
+
+        // Reload cumulative token and cost usage
+        if let Ok(mut stmt_usage) = conn.prepare(
+            "SELECT COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(estimated_cost), 0.0), COUNT(*)
+             FROM trajectory_token_usage",
+        ) {
+            if let Ok(usage) = stmt_usage.query_row([], |row| {
+                Ok(SessionUsage {
+                    total_prompt_tokens: row.get::<_, i64>(0)? as usize,
+                    total_completion_tokens: row.get::<_, i64>(1)? as usize,
+                    total_tokens: row.get::<_, i64>(2)? as usize,
+                    total_cost: row.get::<_, f64>(3)?,
+                    turn_count: row.get::<_, i64>(4)? as usize,
+                })
+            }) {
+                self.session_usage = usage;
+            }
+        }
+
         Ok(())
+    }
+
+    /// Records token consumption and cost for a turn to SQLite and in-memory session totals.
+    pub fn record_token_usage(
+        &mut self,
+        step_index: Option<u64>,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        estimated_cost: f64,
+    ) -> anyhow::Result<TokenUsage> {
+        let turn = TokenUsage::new(prompt_tokens, completion_tokens, estimated_cost);
+        let created_at = Utc::now().to_rfc3339();
+
+        {
+            let conn = self
+                .db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("DB lock error: {}", e))?;
+            conn.execute(
+                "INSERT INTO trajectory_token_usage (
+                    step_index, prompt_tokens, completion_tokens, total_tokens, estimated_cost, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    step_index.map(|s| s as i64),
+                    turn.prompt_tokens as i64,
+                    turn.completion_tokens as i64,
+                    turn.total_tokens as i64,
+                    turn.estimated_cost,
+                    created_at,
+                ],
+            )?;
+        }
+
+        self.session_usage.record_turn(&turn);
+        self.last_turn_usage = Some(turn.clone());
+        Ok(turn)
+    }
+
+    /// Returns cumulative session token usage and estimated cost.
+    pub fn session_usage(&self) -> SessionUsage {
+        self.session_usage.clone()
+    }
+
+    /// Returns the token usage breakdown from the most recent turn.
+    pub fn last_turn_usage(&self) -> Option<TokenUsage> {
+        self.last_turn_usage.clone()
+    }
+
+    /// Formats the most recent turn and cumulative session usage into standard telemetry string.
+    pub fn format_last_telemetry(&self) -> Option<String> {
+        self.last_turn_usage
+            .as_ref()
+            .map(|turn| format_telemetry(turn, &self.session_usage))
     }
 
     /// Primary async API compatible with `agendex-core`: logs a step to dual trajectory logs and SQLite.

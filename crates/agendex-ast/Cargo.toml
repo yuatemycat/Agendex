@@ -12,3 +12,6 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 regex = { workspace = true }
 async-trait = { workspace = true }
+walkdir = { workspace = true }
+ignore = { workspace = true }
+uuid = { workspace = true }

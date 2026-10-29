@@ -129,6 +129,12 @@ enum ConsoleRequest {
         reason: String,
         responder: tokio::sync::oneshot::Sender<bool>,
     },
+    DiffApproval {
+        subagent_id: String,
+        path: String,
+        diff: String,
+        responder: tokio::sync::oneshot::Sender<bool>,
+    },
     ReadLine {
         prompt: String,
         responder: tokio::sync::oneshot::Sender<Option<String>>,
@@ -181,6 +187,33 @@ impl SharedApprovalQueue {
                             };
                             let _ = responder.send(approved);
                         }
+                        ConsoleRequest::DiffApproval {
+                            subagent_id,
+                            path,
+                            diff,
+                            responder,
+                        } => {
+                            println!();
+                            if subagent_id.is_empty() || subagent_id == "parent" {
+                                println!("[Diff Review] Proposed changes to '{}':", path);
+                            } else {
+                                println!(
+                                    "[Diff Review: Subagent {}] Proposed changes to '{}':",
+                                    subagent_id, path
+                                );
+                            }
+                            println!("{}", diff);
+                            print!("Apply this change? [y/N]: ");
+                            let _ = std::io::stdout().flush();
+                            let mut input = String::new();
+                            let approved = if std::io::stdin().read_line(&mut input).is_ok() {
+                                let trimmed = input.trim().to_lowercase();
+                                trimmed == "y" || trimmed == "yes"
+                            } else {
+                                false
+                            };
+                            let _ = responder.send(approved);
+                        }
                         ConsoleRequest::ReadLine { prompt, responder } => {
                             if !prompt.is_empty() {
                                 print!("{}", prompt);
@@ -209,6 +242,23 @@ impl SharedApprovalQueue {
             subagent_id: subagent_id.to_string(),
             command: command.to_string(),
             reason: reason.to_string(),
+            responder: tx,
+        };
+
+        if self.sender.send(req).is_err() {
+            return false;
+        }
+
+        rx.await.unwrap_or(false)
+    }
+
+    /// Asynchronously wait for user approval on proposed file diff
+    pub async fn request_diff_approval(&self, subagent_id: &str, path: &str, diff: &str) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let req = ConsoleRequest::DiffApproval {
+            subagent_id: subagent_id.to_string(),
+            path: path.to_string(),
+            diff: diff.to_string(),
             responder: tx,
         };
 

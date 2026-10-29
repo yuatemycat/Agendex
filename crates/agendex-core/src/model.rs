@@ -155,9 +155,12 @@ pub fn resolve_gemini_endpoint(base: &str, model: &str, api_key: &str) -> String
     }
 }
 
+pub type TokenStreamHandler = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 pub struct ModelClient {
     client: reqwest::Client,
     pub config: ModelConfig,
+    pub token_callback: Option<TokenStreamHandler>,
 }
 
 impl ModelClient {
@@ -165,7 +168,13 @@ impl ModelClient {
         Self {
             client: reqwest::Client::new(),
             config,
+            token_callback: None,
         }
+    }
+
+    pub fn with_token_callback(mut self, callback: TokenStreamHandler) -> Self {
+        self.token_callback = Some(callback);
+        self
     }
 
     pub async fn chat(
@@ -173,17 +182,33 @@ impl ModelClient {
         messages: &[ChatMessage],
         tools: &[Value],
     ) -> anyhow::Result<ModelResponse> {
-        match self.config.format {
-            ModelFormat::GoogleGemini => self.chat_gemini(messages, tools).await,
-            ModelFormat::OpenAi => self.chat_openai(messages, tools).await,
-            ModelFormat::Anthropic => self.chat_anthropic(messages, tools).await,
-        }
+        self.chat_with_stream(messages, tools, self.token_callback.clone())
+            .await
     }
 
-    async fn chat_gemini(
+    pub async fn chat_with_stream(
         &self,
         messages: &[ChatMessage],
         tools: &[Value],
+        on_token: Option<TokenStreamHandler>,
+    ) -> anyhow::Result<ModelResponse> {
+        match self.config.format {
+            ModelFormat::GoogleGemini => {
+                self.chat_gemini_streaming(messages, tools, on_token).await
+            }
+            ModelFormat::OpenAi => self.chat_openai_streaming(messages, tools, on_token).await,
+            ModelFormat::Anthropic => {
+                self.chat_anthropic_streaming(messages, tools, on_token)
+                    .await
+            }
+        }
+    }
+
+    async fn chat_gemini_streaming(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        on_token: Option<TokenStreamHandler>,
     ) -> anyhow::Result<ModelResponse> {
         let base = self
             .config
@@ -317,22 +342,29 @@ impl ModelClient {
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize;
 
+        let full_text = if text_parts.is_empty() {
+            None
+        } else {
+            let combined = text_parts.join("\n");
+            if let Some(ref cb) = on_token {
+                cb(&combined);
+            }
+            Some(combined)
+        };
+
         Ok(ModelResponse {
-            text: if text_parts.is_empty() {
-                None
-            } else {
-                Some(text_parts.join("\n"))
-            },
+            text: full_text,
             tool_calls,
             prompt_tokens,
             completion_tokens,
         })
     }
 
-    async fn chat_openai(
+    async fn chat_openai_streaming(
         &self,
         messages: &[ChatMessage],
         tools: &[Value],
+        on_token: Option<TokenStreamHandler>,
     ) -> anyhow::Result<ModelResponse> {
         let base = self
             .config
@@ -371,6 +403,11 @@ impl ModelClient {
             "messages": payload_messages,
         });
 
+        if on_token.is_some() {
+            payload["stream"] = serde_json::json!(true);
+            payload["stream_options"] = serde_json::json!({ "include_usage": true });
+        }
+
         if !tools.is_empty() {
             let openai_tools: Vec<Value> = tools
                 .iter()
@@ -389,10 +426,130 @@ impl ModelClient {
             req = req.bearer_auth(&self.config.api_key);
         }
 
-        let resp = req.send().await?;
+        let mut resp = req.send().await?;
         if !resp.status().is_success() {
             let err_text = resp.text().await?;
             return Err(anyhow::anyhow!("OpenAI API error: {}", err_text));
+        }
+
+        let is_event_stream = resp
+            .headers()
+            .get("content-type")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.contains("text/event-stream"))
+            .unwrap_or(false);
+
+        if is_event_stream {
+            let mut full_text = String::new();
+            let mut tool_calls_map: std::collections::BTreeMap<usize, (String, String, String)> =
+                std::collections::BTreeMap::new();
+            let mut prompt_tokens = 0usize;
+            let mut completion_tokens = 0usize;
+
+            let mut buffer = String::new();
+            while let Some(chunk) = resp.chunk().await? {
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(pos) = buffer.find('\n') {
+                    let line = buffer[..pos].trim().to_string();
+                    buffer = buffer[pos + 1..].to_string();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Some(data) = line.strip_prefix("data:") {
+                        let data = data.trim();
+                        if data == "[DONE]" {
+                            break;
+                        }
+                        if let Ok(val) = serde_json::from_str::<Value>(data) {
+                            if let Some(pt) =
+                                val.pointer("/usage/prompt_tokens").and_then(|v| v.as_u64())
+                            {
+                                prompt_tokens = pt as usize;
+                            }
+                            if let Some(ct) = val
+                                .pointer("/usage/completion_tokens")
+                                .and_then(|v| v.as_u64())
+                            {
+                                completion_tokens = ct as usize;
+                            }
+                            if let Some(choices) = val.get("choices").and_then(|c| c.as_array()) {
+                                if let Some(first) = choices.first() {
+                                    if let Some(delta) = first.get("delta") {
+                                        if let Some(content) =
+                                            delta.get("content").and_then(|c| c.as_str())
+                                        {
+                                            if !content.is_empty() {
+                                                full_text.push_str(content);
+                                                if let Some(ref cb) = on_token {
+                                                    cb(content);
+                                                }
+                                            }
+                                        }
+                                        if let Some(tcs) =
+                                            delta.get("tool_calls").and_then(|t| t.as_array())
+                                        {
+                                            for tc in tcs {
+                                                let idx = tc
+                                                    .get("index")
+                                                    .and_then(|i| i.as_u64())
+                                                    .unwrap_or(0)
+                                                    as usize;
+                                                let entry = tool_calls_map
+                                                    .entry(idx)
+                                                    .or_insert_with(|| {
+                                                        (
+                                                            String::new(),
+                                                            String::new(),
+                                                            String::new(),
+                                                        )
+                                                    });
+                                                if let Some(id) =
+                                                    tc.get("id").and_then(|i| i.as_str())
+                                                {
+                                                    entry.0.push_str(id);
+                                                }
+                                                if let Some(name) = tc
+                                                    .pointer("/function/name")
+                                                    .and_then(|n| n.as_str())
+                                                {
+                                                    entry.1.push_str(name);
+                                                }
+                                                if let Some(args) = tc
+                                                    .pointer("/function/arguments")
+                                                    .and_then(|a| a.as_str())
+                                                {
+                                                    entry.2.push_str(args);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut tool_calls = Vec::new();
+            for (_, (id, name, args_str)) in tool_calls_map {
+                let args: Value = serde_json::from_str(&args_str).unwrap_or(Value::Null);
+                tool_calls.push(ToolCall {
+                    id,
+                    name,
+                    arguments: args,
+                });
+            }
+
+            return Ok(ModelResponse {
+                text: if full_text.is_empty() {
+                    None
+                } else {
+                    Some(full_text)
+                },
+                tool_calls,
+                prompt_tokens,
+                completion_tokens,
+            });
         }
 
         let body: Value = resp.json().await?;
@@ -404,6 +561,13 @@ impl ModelClient {
             .get("content")
             .and_then(|c| c.as_str())
             .map(|s| s.to_string());
+
+        if let Some(ref t) = text {
+            if let Some(ref cb) = on_token {
+                cb(t);
+            }
+        }
+
         let mut tool_calls = Vec::new();
 
         if let Some(tcs) = choice.get("tool_calls").and_then(|t| t.as_array()) {
@@ -448,10 +612,11 @@ impl ModelClient {
         })
     }
 
-    async fn chat_anthropic(
+    async fn chat_anthropic_streaming(
         &self,
         messages: &[ChatMessage],
         tools: &[Value],
+        on_token: Option<TokenStreamHandler>,
     ) -> anyhow::Result<ModelResponse> {
         let base = self
             .config
@@ -522,6 +687,10 @@ impl ModelClient {
             "messages": anthropic_messages,
         });
 
+        if on_token.is_some() {
+            payload["stream"] = serde_json::json!(true);
+        }
+
         if !system_prompt.is_empty() {
             payload["system"] = serde_json::json!(system_prompt.trim());
         }
@@ -540,7 +709,7 @@ impl ModelClient {
             payload["tools"] = serde_json::json!(anthropic_tools);
         }
 
-        let resp = self
+        let mut resp = self
             .client
             .post(&url)
             .header("x-api-key", &self.config.api_key)
@@ -552,6 +721,132 @@ impl ModelClient {
         if !resp.status().is_success() {
             let err_text = resp.text().await?;
             return Err(anyhow::anyhow!("Anthropic API error: {}", err_text));
+        }
+
+        let is_event_stream = resp
+            .headers()
+            .get("content-type")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.contains("text/event-stream"))
+            .unwrap_or(false);
+
+        if is_event_stream {
+            let mut full_text = String::new();
+            let mut tool_calls = Vec::new();
+            let mut current_tool_call: Option<(String, String, String)> = None;
+            let mut prompt_tokens = 0usize;
+            let mut completion_tokens = 0usize;
+
+            let mut buffer = String::new();
+            while let Some(chunk) = resp.chunk().await? {
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(pos) = buffer.find('\n') {
+                    let line = buffer[..pos].trim().to_string();
+                    buffer = buffer[pos + 1..].to_string();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Some(data) = line.strip_prefix("data:") {
+                        let data = data.trim();
+                        if let Ok(val) = serde_json::from_str::<Value>(data) {
+                            let event_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                            match event_type {
+                                "content_block_start" => {
+                                    if let Some(cb) = val.get("content_block") {
+                                        if cb.get("type").and_then(|t| t.as_str())
+                                            == Some("tool_use")
+                                        {
+                                            let id = cb
+                                                .get("id")
+                                                .and_then(|i| i.as_str())
+                                                .unwrap_or("")
+                                                .to_string();
+                                            let name = cb
+                                                .get("name")
+                                                .and_then(|n| n.as_str())
+                                                .unwrap_or("")
+                                                .to_string();
+                                            current_tool_call = Some((id, name, String::new()));
+                                        }
+                                    }
+                                }
+                                "content_block_delta" => {
+                                    if let Some(delta) = val.get("delta") {
+                                        let delta_type = delta
+                                            .get("type")
+                                            .and_then(|t| t.as_str())
+                                            .unwrap_or("");
+                                        if delta_type == "text_delta" {
+                                            if let Some(txt) =
+                                                delta.get("text").and_then(|t| t.as_str())
+                                            {
+                                                full_text.push_str(txt);
+                                                if let Some(ref cb) = on_token {
+                                                    cb(txt);
+                                                }
+                                            }
+                                        } else if delta_type == "input_json_delta" {
+                                            if let Some(partial) =
+                                                delta.get("partial_json").and_then(|p| p.as_str())
+                                            {
+                                                if let Some(ref mut tc) = current_tool_call {
+                                                    tc.2.push_str(partial);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                "content_block_stop" => {
+                                    if let Some((id, name, args_str)) = current_tool_call.take() {
+                                        let arguments: Value =
+                                            serde_json::from_str(&args_str).unwrap_or(Value::Null);
+                                        tool_calls.push(ToolCall {
+                                            id,
+                                            name,
+                                            arguments,
+                                        });
+                                    }
+                                }
+                                "message_start" => {
+                                    if let Some(it) = val
+                                        .pointer("/message/usage/input_tokens")
+                                        .and_then(|v| v.as_u64())
+                                    {
+                                        prompt_tokens = it as usize;
+                                    }
+                                }
+                                "message_delta" => {
+                                    if let Some(ot) =
+                                        val.pointer("/usage/output_tokens").and_then(|v| v.as_u64())
+                                    {
+                                        completion_tokens = ot as usize;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((id, name, args_str)) = current_tool_call.take() {
+                let arguments: Value = serde_json::from_str(&args_str).unwrap_or(Value::Null);
+                tool_calls.push(ToolCall {
+                    id,
+                    name,
+                    arguments,
+                });
+            }
+
+            return Ok(ModelResponse {
+                text: if full_text.is_empty() {
+                    None
+                } else {
+                    Some(full_text)
+                },
+                tool_calls,
+                prompt_tokens,
+                completion_tokens,
+            });
         }
 
         let body: Value = resp.json().await?;
@@ -589,6 +884,16 @@ impl ModelClient {
             }
         }
 
+        let full_text = if text_parts.is_empty() {
+            None
+        } else {
+            let combined = text_parts.join("\n");
+            if let Some(ref cb) = on_token {
+                cb(&combined);
+            }
+            Some(combined)
+        };
+
         let prompt_tokens = body
             .pointer("/usage/input_tokens")
             .and_then(|v| v.as_u64())
@@ -599,11 +904,7 @@ impl ModelClient {
             .unwrap_or(0) as usize;
 
         Ok(ModelResponse {
-            text: if text_parts.is_empty() {
-                None
-            } else {
-                Some(text_parts.join("\n"))
-            },
+            text: full_text,
             tool_calls,
             prompt_tokens,
             completion_tokens,

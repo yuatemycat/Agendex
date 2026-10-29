@@ -44,6 +44,9 @@ impl Default for AgentConfig {
 }
 
 pub type ApprovalHandler = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+pub type DiffApprovalHandler = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+pub type ToolProgressHandler = Arc<dyn Fn(&str) + Send + Sync>;
+pub type TokenStreamHandler = Arc<dyn Fn(&str) + Send + Sync>;
 
 pub struct AgendexAgent {
     pub config: AgentConfig,
@@ -53,7 +56,7 @@ pub struct AgendexAgent {
     pub trajectory: Arc<Mutex<TrajectoryLogger>>,
     pub compactor: Arc<Mutex<CompactorEngine>>,
     pub snapshot_engine: Arc<Mutex<SnapshotEngine>>,
-    pub skill_registry: Arc<SkillRegistry>,
+    pub skill_registry: Arc<std::sync::RwLock<SkillRegistry>>,
     pub rules_engine: Arc<RulesEngine>,
     pub hook_dispatcher: Arc<HookDispatcher>,
     pub ast_patcher: Arc<AstPatcher>,
@@ -64,7 +67,11 @@ pub struct AgendexAgent {
     pub parent_id: Option<String>,
     pub history: Arc<Mutex<Vec<ChatMessage>>>,
     pub approval_handler: Option<ApprovalHandler>,
+    pub diff_approval_handler: Option<DiffApprovalHandler>,
     pub approval_queue: Option<Arc<crate::swarm::SharedApprovalQueue>>,
+    pub event_handler: Option<crate::events::AgentEventHandler>,
+    pub tool_progress_handler: Option<ToolProgressHandler>,
+    pub token_stream_handler: Option<TokenStreamHandler>,
 }
 
 impl AgendexAgent {
@@ -76,10 +83,10 @@ impl AgendexAgent {
         tokio::fs::create_dir_all(&log_dir).await?;
 
         let task_manager = Arc::new(TaskManager::new(state_dir.join("tasks")));
-        let tool_registry = Arc::new(ToolRegistry::new(
-            config.workspace_dir.clone(),
-            Arc::clone(&task_manager),
-        ));
+        let tool_registry = Arc::new(
+            ToolRegistry::new(config.workspace_dir.clone(), Arc::clone(&task_manager))
+                .with_logs_dir(state_dir.join("logs")),
+        );
         let trajectory = Arc::new(Mutex::new(TrajectoryLogger::new(&log_dir)?));
         let compactor = Arc::new(Mutex::new(CompactorEngine::new(config.model_tier)));
         let snapshot_engine = Arc::new(Mutex::new(snapshot_engine_raw));
@@ -185,7 +192,7 @@ impl AgendexAgent {
             trajectory,
             compactor,
             snapshot_engine,
-            skill_registry: Arc::new(skill_registry),
+            skill_registry: Arc::new(std::sync::RwLock::new(skill_registry)),
             rules_engine: Arc::new(rules_engine),
             hook_dispatcher,
             ast_patcher,
@@ -196,8 +203,94 @@ impl AgendexAgent {
             parent_id: None,
             history,
             approval_handler: None,
+            diff_approval_handler: None,
             approval_queue: None,
+            event_handler: None,
+            tool_progress_handler: None,
+            token_stream_handler: None,
         })
+    }
+
+    pub fn with_diff_approval_handler(mut self, handler: DiffApprovalHandler) -> Self {
+        self.diff_approval_handler = Some(handler);
+        self
+    }
+
+    pub fn with_tool_progress_handler(mut self, handler: ToolProgressHandler) -> Self {
+        self.tool_progress_handler = Some(handler);
+        self
+    }
+
+    pub fn with_token_stream_handler(mut self, handler: TokenStreamHandler) -> Self {
+        self.token_stream_handler = Some(handler);
+        self
+    }
+
+    pub fn notify_progress(&self, msg: &str) {
+        if let Some(handler) = &self.tool_progress_handler {
+            handler(msg);
+        }
+    }
+
+    pub async fn request_diff_approval(&self, path: &str, diff: &str) -> bool {
+        if self.config.auto_approve_risky {
+            return true;
+        }
+        if let Some(handler) = &self.diff_approval_handler {
+            return handler(path, diff);
+        }
+        if let Some(queue) = &self.approval_queue {
+            let agent_id = self.agent_id.as_deref().unwrap_or("parent");
+            return queue.request_diff_approval(agent_id, path, diff).await;
+        }
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() {
+            use std::io::Write;
+            println!("\n[Diff Review] Proposed changes to '{}':", path);
+            println!("{}", diff);
+            print!("Apply this change? [y/N]: ");
+            let _ = std::io::stdout().flush();
+            let mut input = String::new();
+            if std::io::stdin().read_line(&mut input).is_ok() {
+                let trimmed = input.trim().to_lowercase();
+                return trimmed == "y" || trimmed == "yes";
+            }
+            return false;
+        }
+        true
+    }
+
+    pub fn with_event_handler(mut self, handler: crate::events::AgentEventHandler) -> Self {
+        self.event_handler = Some(handler);
+        self
+    }
+
+    pub fn emit_event(&self, event: crate::events::AgentEvent) {
+        if let Some(handler) = &self.event_handler {
+            handler(&event);
+        }
+    }
+
+    pub async fn commit_workspace_changes(
+        &self,
+        summary: &str,
+    ) -> anyhow::Result<Option<crate::git::GitCommitResult>> {
+        let res = crate::git::commit_task_changes(&self.config.workspace_dir, summary).await?;
+        if let Some(ref c) = res {
+            self.emit_event(crate::events::AgentEvent::GitCommit {
+                commit_sha: c.commit_sha.clone(),
+                message: c.message.clone(),
+            });
+        }
+        Ok(res)
+    }
+
+    pub async fn switch_or_create_branch(&self, branch: &str) -> anyhow::Result<String> {
+        let res = crate::git::create_or_checkout_branch(&self.config.workspace_dir, branch).await?;
+        self.emit_event(crate::events::AgentEvent::GitBranch {
+            branch: branch.to_string(),
+        });
+        Ok(res)
     }
 
     pub fn with_approval_handler(mut self, handler: ApprovalHandler) -> Self {
@@ -275,12 +368,33 @@ impl AgendexAgent {
     }
 
     pub async fn process_turn(&self, user_input: &str) -> anyhow::Result<String> {
+        match self.process_turn_inner(user_input).await {
+            Ok(res) => Ok(res),
+            Err(e) => {
+                self.emit_event(crate::events::AgentEvent::Error {
+                    message: e.to_string(),
+                });
+                Err(e)
+            }
+        }
+    }
+
+    async fn process_turn_inner(&self, user_input: &str) -> anyhow::Result<String> {
+        self.emit_event(crate::events::AgentEvent::TurnStart {
+            session_id: self.config.session_id.clone(),
+            prompt: user_input.to_string(),
+        });
+
         // 1. Check for slash command resolution
         if user_input.starts_with('/') {
             let cmd = user_input.split_whitespace().next().unwrap_or("");
             match cmd {
                 "/help" => {
-                    return Ok(self.skill_registry.format_slash_commands_prompt());
+                    return Ok(self
+                        .skill_registry
+                        .read()
+                        .map(|r| r.format_slash_commands_prompt())
+                        .unwrap_or_default());
                 }
                 "/compact" => {
                     let mut comp = self.compactor.lock().await;
@@ -290,6 +404,36 @@ impl AgendexAgent {
                         "Context compacted.\n\nContinuation Summary:\n{}",
                         summary
                     ));
+                }
+                "/def" | "/definition" => {
+                    let sym = user_input.split_whitespace().nth(1).unwrap_or("");
+                    if sym.is_empty() {
+                        return Ok("Usage: /def <symbol_name>".to_string());
+                    }
+                    let res = self
+                        .tool_registry
+                        .find_definition(agendex_harness::tools::FindDefinitionArgs {
+                            symbol: sym.to_string(),
+                            path: None,
+                            kind: None,
+                        })
+                        .await?;
+                    if res.definitions.is_empty() {
+                        return Ok(format!("No definitions found for symbol '{}'", sym));
+                    }
+                    let mut out =
+                        format!("Found {} definition(s) for '{}':\n", res.total_found, sym);
+                    for d in &res.definitions {
+                        out.push_str(&format!(
+                            "- [{}] {} ({}:{})\n  Preview: {}\n",
+                            d.kind,
+                            d.symbol,
+                            d.path.display(),
+                            d.line,
+                            d.preview
+                        ));
+                    }
+                    return Ok(out);
                 }
                 "/revert" => {
                     let mut snap = self.snapshot_engine.lock().await;
@@ -319,7 +463,12 @@ impl AgendexAgent {
                     }
                 }
                 _ => {
-                    if let Some(skill) = self.skill_registry.get_skill_by_command(cmd) {
+                    let matched_skill = self
+                        .skill_registry
+                        .read()
+                        .ok()
+                        .and_then(|r| r.get_skill_by_command(cmd).cloned());
+                    if let Some(skill) = matched_skill {
                         tracing::info!("Dispatched dynamic skill command: {}", cmd);
                         return Ok(format!(
                             "Skill [{}]:\n{}\n\nProtocol Instructions:\n{}",
@@ -335,7 +484,7 @@ impl AgendexAgent {
 
         // 3. Workspace Snapshot before turn
         let start_step_count = { self.trajectory.lock().await.step_count() };
-        let turn_step_index = start_step_count + 1;
+        let turn_step_index = (start_step_count + 1) as u64;
         let turn_label = format!("turn_start:{}", turn_step_index);
         {
             let mut snap = self.snapshot_engine.lock().await;
@@ -411,17 +560,27 @@ impl AgendexAgent {
             }));
         }
 
+        // Add save_skill tool if permitted
+        if self.is_tool_allowed("save_skill") {
+            tools.push(agendex_scaffold::save_skill_tool_definition());
+        }
+
         // 6. Access and update conversation history across turns
         let mut history = self.history.lock().await;
 
         if history.is_empty() {
+            let slash_prompt = self
+                .skill_registry
+                .read()
+                .map(|r| r.format_slash_commands_prompt())
+                .unwrap_or_default();
             let system_prompt = format!(
                 "You are Agendex, a powerful local-first autonomous agent.\n\
                 Workspace: {}\n\
                 Available Slash Commands:\n{}\n\
                 Active Rules:\n{}",
                 self.config.workspace_dir.display(),
-                self.skill_registry.format_slash_commands_prompt(),
+                slash_prompt,
                 self.rules_engine.generate_rule_blocks(None)
             );
             history.push(ChatMessage::system(system_prompt));
@@ -431,6 +590,8 @@ impl AgendexAgent {
 
         let mut turn_iteration = 0;
         let mut total_tokens = 0;
+        let mut turn_prompt_tokens = 0;
+        let mut turn_completion_tokens = 0;
 
         // 7. Multi-Turn Model and Tool Execution Loop
         while turn_iteration < self.config.max_tool_iterations {
@@ -472,12 +633,22 @@ impl AgendexAgent {
             }
 
             // Call Model
-            let resp = self.model_client.chat(&history, &tools).await?;
+            self.notify_progress("Generating response...");
+            let resp = self
+                .model_client
+                .chat_with_stream(&history, &tools, self.token_stream_handler.clone())
+                .await?;
 
+            turn_prompt_tokens += resp.prompt_tokens;
+            turn_completion_tokens += resp.completion_tokens;
             total_tokens = resp.prompt_tokens + resp.completion_tokens;
 
             // If the model emitted tool calls, execute them
             if !resp.tool_calls.is_empty() {
+                self.notify_progress(&format!(
+                    "Model requested {} tool call(s)",
+                    resp.tool_calls.len()
+                ));
                 history.push(ChatMessage::assistant(
                     resp.text.clone(),
                     Some(resp.tool_calls.clone()),
@@ -501,8 +672,24 @@ impl AgendexAgent {
                         .await;
                 }
 
+                for tc in &resp.tool_calls {
+                    self.emit_event(crate::events::AgentEvent::ToolCall {
+                        id: tc.id.clone(),
+                        tool: tc.name.clone(),
+                        arguments: tc.arguments.clone(),
+                    });
+                }
+
                 for tc in resp.tool_calls {
                     let tool_result = self.dispatch_tool(&tc).await;
+
+                    let res_val = serde_json::from_str(&tool_result)
+                        .unwrap_or_else(|_| serde_json::Value::String(tool_result.clone()));
+                    self.emit_event(crate::events::AgentEvent::ToolResult {
+                        id: tc.id.clone(),
+                        tool: tc.name.clone(),
+                        result: res_val,
+                    });
 
                     // Log to Trajectory Engine
                     {
@@ -523,6 +710,9 @@ impl AgendexAgent {
             } else {
                 // Final textual response received
                 let final_text = resp.text.unwrap_or_else(|| "Completed turn.".to_string());
+                self.emit_event(crate::events::AgentEvent::FinalOutput {
+                    text: final_text.clone(),
+                });
                 history.push(ChatMessage::assistant(Some(final_text.clone()), None));
                 {
                     let mut traj = self.trajectory.lock().await;
@@ -535,11 +725,44 @@ impl AgendexAgent {
                         )
                         .await;
                 }
+
+                // Record turn token consumption & cost accounting in Trajectory
+                let est_cost = agendex_trajectory::estimate_cost(
+                    &self.config.model.model_name,
+                    turn_prompt_tokens,
+                    turn_completion_tokens,
+                );
+                {
+                    let mut traj = self.trajectory.lock().await;
+                    let _ = traj.record_token_usage(
+                        Some(turn_step_index),
+                        turn_prompt_tokens,
+                        turn_completion_tokens,
+                        est_cost,
+                    );
+                }
+
                 self.hook_dispatcher
                     .trigger_post_tool("turn_complete", "success")
                     .await?;
                 return Ok(final_text);
             }
+        }
+
+        // Record token usage if maximum iterations reached
+        let est_cost = agendex_trajectory::estimate_cost(
+            &self.config.model.model_name,
+            turn_prompt_tokens,
+            turn_completion_tokens,
+        );
+        {
+            let mut traj = self.trajectory.lock().await;
+            let _ = traj.record_token_usage(
+                Some(turn_step_index),
+                turn_prompt_tokens,
+                turn_completion_tokens,
+                est_cost,
+            );
         }
 
         Ok("Reached maximum tool execution iterations.".to_string())
@@ -567,6 +790,46 @@ impl AgendexAgent {
                 tc.name
             );
         }
+
+        // Notify tool progress start
+        let progress_msg = match tc.name.as_str() {
+            "run_command" => {
+                let cmd = tc
+                    .arguments
+                    .get("command")
+                    .or_else(|| tc.arguments.get("CommandLine"))
+                    .or_else(|| tc.arguments.get("cmd"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("");
+                format!("[Tool: run_command] Executing '{}'", cmd)
+            }
+            "edit_file" => {
+                let path = tc
+                    .arguments
+                    .get("path")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("");
+                format!("[Tool: edit_file] Patching '{}'", path)
+            }
+            "write_file" => {
+                let path = tc
+                    .arguments
+                    .get("path")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("");
+                format!("[Tool: write_file] Writing '{}'", path)
+            }
+            "read_file" => {
+                let path = tc
+                    .arguments
+                    .get("path")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("");
+                format!("[Tool: read_file] Reading '{}'", path)
+            }
+            other => format!("[Tool: {}] Executing...", other),
+        };
+        self.notify_progress(&progress_msg);
 
         // Safety gate on external command execution
         if tc.name == "run_command" {
@@ -612,7 +875,7 @@ impl AgendexAgent {
         }
 
         // Capture snapshot before mutating filesystem operations
-        if tc.name == "write_file" || tc.name == "edit_file" {
+        if tc.name == "write_file" || tc.name == "edit_file" || tc.name == "save_skill" {
             let mut snap = self.snapshot_engine.lock().await;
             let _ = snap.capture_snapshot(&format!("pre_{}", tc.name)).await;
         }
@@ -680,7 +943,42 @@ impl AgendexAgent {
                     Ok(p) => p,
                     Err(e) => return format!("Failed to edit {}: {}", path, e),
                 };
-                match self
+
+                if !target_path.exists() {
+                    return format!("Failed to edit {}: File does not exist", path);
+                }
+
+                let old_content = match tokio::fs::read_to_string(&target_path).await {
+                    Ok(c) => c,
+                    Err(e) => return format!("Failed to edit {}: {}", path, e),
+                };
+
+                let patch_res =
+                    match self
+                        .ast_patcher
+                        .patch_string(&old_content, target, replacement)
+                    {
+                        Ok(res) => res,
+                        Err(e) => return format!("Failed to edit {}: {}", path, e),
+                    };
+
+                let diff = agendex_ast::diff::generate_unified_diff(
+                    path,
+                    &old_content,
+                    &patch_res.content,
+                );
+                if !diff.is_empty() {
+                    let approved = self.request_diff_approval(path, &diff).await;
+                    if !approved {
+                        self.notify_progress(&format!(
+                            "[Tool: edit_file] Edit on '{}' rejected by user.",
+                            path
+                        ));
+                        return "Edit rejected by user".to_string();
+                    }
+                }
+
+                let result = match self
                     .ast_patcher
                     .patch_file(&target_path, target, replacement)
                 {
@@ -689,9 +987,151 @@ impl AgendexAgent {
                         res.occurrences, path
                     ),
                     Err(e) => format!("Failed to edit {}: {}", path, e),
+                };
+                self.notify_progress(&format!("[Tool: edit_file] Completed: {}", path));
+                result
+            }
+            "save_skill" => {
+                let name = tc
+                    .arguments
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let description = tc
+                    .arguments
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let content = tc
+                    .arguments
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                if name.trim().is_empty() || content.trim().is_empty() {
+                    return "Failed to save skill: 'name' and 'content' parameters are required."
+                        .to_string();
+                }
+
+                let safe_name = match agendex_scaffold::sanitize_skill_name(name) {
+                    Ok(n) => n,
+                    Err(e) => return format!("Failed to save skill: {}", e),
+                };
+
+                let action = format!("save_skill: {}", safe_name);
+                let reason = format!(
+                    "Writing persistent skill to .agenda/skills/{}/SKILL.md",
+                    safe_name
+                );
+
+                let approved = if let Some(queue) = &self.approval_queue {
+                    let agent_id = self.agent_id.as_deref().unwrap_or("parent");
+                    queue.request_approval(agent_id, &action, &reason).await
+                } else if let Some(handler) = &self.approval_handler {
+                    handler(&action, &reason)
+                } else {
+                    self.config.auto_approve_risky
+                };
+
+                if !approved {
+                    tracing::warn!(
+                        "Safety gate rejected save_skill for '{}': {}",
+                        safe_name,
+                        reason
+                    );
+                    return format!(
+                        "Skill creation for '{}' blocked: requires user approval ({})",
+                        safe_name, reason
+                    );
+                }
+
+                let saver = agendex_scaffold::SkillSaver::new(&self.config.workspace_dir);
+                let args = agendex_scaffold::SaveSkillArgs {
+                    name: safe_name.clone(),
+                    description: description.to_string(),
+                    content: content.to_string(),
+                };
+
+                match saver.save_skill_direct(&args) {
+                    Ok(res) => {
+                        // Immediately register the newly saved skill into the registry
+                        if let Ok(skill) =
+                            agendex_scaffold::SkillRegistry::parse_skill_file(&res.path)
+                        {
+                            if let Ok(mut reg) = self.skill_registry.write() {
+                                reg.register(skill);
+                            }
+                        }
+
+                        format!(
+                            "Successfully saved skill '{}' to {} ({} bytes written).",
+                            res.name,
+                            res.path.display(),
+                            res.bytes_written
+                        )
+                    }
+                    Err(e) => format!("Failed to save skill '{}': {}", safe_name, e),
                 }
             }
             _ => {
+                if tc.name == "write_file" {
+                    let path_str = tc
+                        .arguments
+                        .get("path")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("");
+                    let content = tc
+                        .arguments
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("");
+                    let overwrite = tc
+                        .arguments
+                        .get("overwrite")
+                        .and_then(|o| o.as_bool())
+                        .unwrap_or(false);
+                    let append = tc
+                        .arguments
+                        .get("append")
+                        .and_then(|a| a.as_bool())
+                        .unwrap_or(false);
+
+                    if let Ok(target_path) = self
+                        .tool_registry
+                        .resolve_path(std::path::Path::new(path_str))
+                    {
+                        if target_path.exists() && (overwrite || append) {
+                            let old_content = tokio::fs::read_to_string(&target_path)
+                                .await
+                                .unwrap_or_default();
+                            let new_content = if append {
+                                format!("{}{}", old_content, content)
+                            } else {
+                                content.to_string()
+                            };
+
+                            if old_content != new_content {
+                                let diff = agendex_ast::diff::generate_unified_diff(
+                                    path_str,
+                                    &old_content,
+                                    &new_content,
+                                );
+                                if !diff.is_empty() {
+                                    let approved =
+                                        self.request_diff_approval(path_str, &diff).await;
+                                    if !approved {
+                                        self.notify_progress(&format!(
+                                            "[Tool: write_file] Edit on '{}' rejected by user.",
+                                            path_str
+                                        ));
+                                        return "Edit rejected by user".to_string();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let res_val = self
                     .tool_registry
                     .execute_tool(&tc.name, tc.arguments.clone())
@@ -709,12 +1149,35 @@ impl AgendexAgent {
                                 snap.record_created_file(path_str);
                             }
                         }
+                        self.notify_progress(&format!("[Tool: {}] Completed.", tc.name));
                         serde_json::to_string_pretty(&res).unwrap_or_else(|_| "{}".to_string())
                     }
-                    Err(e) => format!("Tool execution error for '{}': {}", tc.name, e),
+                    Err(e) => {
+                        self.notify_progress(&format!("[Tool: {}] Error: {}", tc.name, e));
+                        format!("Tool execution error for '{}': {}", tc.name, e)
+                    }
                 }
             }
         }
+    }
+
+    /// Returns the token usage breakdown from the most recent turn.
+    pub async fn last_turn_usage(&self) -> Option<agendex_trajectory::TokenUsage> {
+        let traj = self.trajectory.lock().await;
+        traj.last_turn_usage()
+    }
+
+    /// Returns the cumulative session token usage and estimated cost.
+    pub async fn session_usage(&self) -> agendex_trajectory::SessionUsage {
+        let traj = self.trajectory.lock().await;
+        traj.session_usage()
+    }
+
+    /// Formats the most recent turn and cumulative session usage into standard telemetry string:
+    /// e.g. "[Tokens: 412 in, 85 out | Session: 1,230 ($0.0018)]"
+    pub async fn format_telemetry(&self) -> Option<String> {
+        let traj = self.trajectory.lock().await;
+        traj.format_last_telemetry()
     }
 }
 
