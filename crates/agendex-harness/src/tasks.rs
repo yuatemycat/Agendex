@@ -243,6 +243,12 @@ impl TaskManager {
         is_daemon: bool,
         summary: Option<&str>,
     ) -> Result<RunCommandResult> {
+        if is_host_power_invocation(command) {
+            return Err(anyhow!(
+                "refused to spawn host power command: {command}"
+            ));
+        }
+
         let task_id = format!("task-{}", uuid::Uuid::new_v4().simple());
         let log_path = self.log_dir.join(format!("{}.log", task_id));
 
@@ -625,9 +631,107 @@ impl TaskManager {
     }
 }
 
+/// Host power commands are refused before a process is created.
+/// Command position only: `grep shutdown log.txt` is not a power command.
+fn is_host_power_invocation(command: &str) -> bool {
+    fn normalize(token: &str) -> String {
+        let lower = token.trim_matches('"').trim_matches('\'').to_lowercase();
+        let base = lower.rsplit(['/', '\\']).next().unwrap_or(&lower);
+        base.trim_end_matches(".exe").to_string()
+    }
+    fn is_power_bin(name: &str) -> bool {
+        matches!(
+            name,
+            "shutdown"
+                | "reboot"
+                | "halt"
+                | "poweroff"
+                | "logoff"
+                | "stop-computer"
+                | "restart-computer"
+                | "suspend-computer"
+        )
+    }
+    fn split_cmd(command: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut in_quote = false;
+        for c in command.chars() {
+            match c {
+                '"' | '\'' => in_quote = !in_quote,
+                c if c.is_whitespace() && !in_quote => {
+                    if !cur.is_empty() {
+                        out.push(std::mem::take(&mut cur));
+                    }
+                }
+                c => cur.push(c),
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+        out
+    }
+    fn at_command_position(tokens: &[String]) -> bool {
+        let mut i = 0;
+        while i < tokens.len() {
+            let name = normalize(&tokens[i]);
+            if matches!(name.as_str(), "sudo" | "doas" | "env" | "nohup") {
+                i += 1;
+                continue;
+            }
+            if matches!(name.as_str(), "powershell" | "pwsh" | "cmd") {
+                if let Some(pos) = tokens.iter().position(|t| {
+                    matches!(
+                        t.to_lowercase().as_str(),
+                        "-command" | "-c" | "/c" | "/k" | "-encodedcommand"
+                    )
+                }) {
+                    if let Some(inner) = tokens.get(pos + 1) {
+                        return at_command_position(&split_cmd(inner));
+                    }
+                }
+                return false;
+            }
+            return is_power_bin(&name);
+        }
+        false
+    }
+    at_command_position(&split_cmd(command))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_host_power_predicate_does_not_match_mentions() {
+        assert!(is_host_power_invocation("shutdown /s /t 0"));
+        assert!(is_host_power_invocation("shutdown.exe /r /t 0"));
+        assert!(is_host_power_invocation(
+            "powershell -Command \"shutdown /s /t 0\""
+        ));
+        assert!(!is_host_power_invocation("grep shutdown log.txt"));
+        assert!(!is_host_power_invocation("echo shutdown"));
+    }
+
+    #[tokio::test]
+    async fn test_run_command_refuses_host_power_before_spawn() {
+        let tmp = std::env::temp_dir().join(format!(
+            "agenda_tasks_power_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let manager = TaskManager::new(&tmp);
+        let err = manager
+            .run_command("shutdown /s /t 0", 1000, None, false, None)
+            .await
+            .expect_err("host power command must not spawn");
+        assert!(
+            err.to_string().contains("refused to spawn host power command"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[tokio::test]
     async fn test_task_synchronous_success() {

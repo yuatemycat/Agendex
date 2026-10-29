@@ -115,6 +115,77 @@ pub struct SubagentInstance {
     pub error: Option<String>,
 }
 
+/// Shared approval request message sent across threads to the dedicated console worker.
+struct ApprovalTicket {
+    subagent_id: String,
+    command: String,
+    reason: String,
+    responder: std::sync::mpsc::Sender<bool>,
+}
+
+/// Shared approval queue serializing interactive prompts across concurrent subagents
+/// and delegating blocking stdin I/O to a dedicated thread so async runtime workers are never blocked.
+pub struct SharedApprovalQueue {
+    sender: tokio::sync::mpsc::UnboundedSender<ApprovalTicket>,
+}
+
+impl SharedApprovalQueue {
+    pub fn new() -> Arc<Self> {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<ApprovalTicket>();
+
+        std::thread::Builder::new()
+            .name("agendex-swarm-approval".to_string())
+            .spawn(move || {
+                use std::io::Write;
+                while let Some(ticket) = receiver.blocking_recv() {
+                    println!();
+                    if ticket.subagent_id.is_empty() || ticket.subagent_id == "parent" {
+                        println!(
+                            "[Safety Gate] Command is classified as risky ({}):",
+                            ticket.reason
+                        );
+                    } else {
+                        println!(
+                            "[Safety Gate: Subagent {}] Command is classified as risky ({}):",
+                            ticket.subagent_id, ticket.reason
+                        );
+                    }
+                    println!("  {}", ticket.command);
+                    print!("Allow execution? [y/N]: ");
+                    let _ = std::io::stdout().flush();
+                    let mut input = String::new();
+                    let approved = if std::io::stdin().read_line(&mut input).is_ok() {
+                        let trimmed = input.trim().to_lowercase();
+                        trimmed == "y" || trimmed == "yes"
+                    } else {
+                        false
+                    };
+                    let _ = ticket.responder.send(approved);
+                }
+            })
+            .expect("Failed to spawn shared approval worker thread");
+
+        Arc::new(Self { sender })
+    }
+
+    /// Synchronously wait for user approval ticket without blocking the async runtime
+    pub fn request_approval(&self, subagent_id: &str, command: &str, reason: &str) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ticket = ApprovalTicket {
+            subagent_id: subagent_id.to_string(),
+            command: command.to_string(),
+            reason: reason.to_string(),
+            responder: tx,
+        };
+
+        if self.sender.send(ticket).is_err() {
+            return false;
+        }
+
+        rx.recv().unwrap_or(false)
+    }
+}
+
 /// Coordinates dynamic subagent personas, instance lifecycles, and asynchronous execution.
 pub struct SubagentManager {
     parent_id: String,
@@ -125,6 +196,7 @@ pub struct SubagentManager {
     instances: Arc<RwLock<HashMap<String, SubagentInstance>>>,
     join_handles: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     pub approval_handler: Option<ApprovalHandler>,
+    pub approval_queue: Option<Arc<SharedApprovalQueue>>,
 }
 
 impl SubagentManager {
@@ -145,24 +217,8 @@ impl SubagentManager {
         personas.insert(rev.name.clone(), rev);
 
         use std::io::IsTerminal;
-        let approval_handler: Option<ApprovalHandler> = if !base_config.auto_approve_risky
-            && std::io::stdin().is_terminal()
-        {
-            Some(Arc::new(|cmd: &str, reason: &str| -> bool {
-                use std::io::Write;
-                print!(
-                    "\n[Subagent Safety Gate] Command is classified as risky ({}):\n  {}\nAllow execution? [y/N]: ",
-                    reason, cmd
-                );
-                let _ = std::io::stdout().flush();
-                let mut input = String::new();
-                if std::io::stdin().read_line(&mut input).is_ok() {
-                    let trimmed = input.trim().to_lowercase();
-                    trimmed == "y" || trimmed == "yes"
-                } else {
-                    false
-                }
-            }))
+        let approval_queue = if !base_config.auto_approve_risky && std::io::stdin().is_terminal() {
+            Some(SharedApprovalQueue::new())
         } else {
             None
         };
@@ -175,12 +231,18 @@ impl SubagentManager {
             personas: Arc::new(RwLock::new(personas)),
             instances: Arc::new(RwLock::new(HashMap::new())),
             join_handles: Arc::new(Mutex::new(HashMap::new())),
-            approval_handler,
+            approval_handler: None,
+            approval_queue,
         }
     }
 
     pub fn with_approval_handler(mut self, handler: ApprovalHandler) -> Self {
         self.approval_handler = Some(handler);
+        self
+    }
+
+    pub fn with_approval_queue(mut self, queue: Arc<SharedApprovalQueue>) -> Self {
+        self.approval_queue = Some(queue);
         self
     }
 
@@ -261,7 +323,18 @@ impl SubagentManager {
         let id_clone = subagent_id.clone();
         let parent_id_clone = self.parent_id.clone();
         let prompt_owned = prompt.to_string();
-        let approval_handler = self.approval_handler.clone();
+        let approval_handler: Option<ApprovalHandler> =
+            if let Some(handler) = &self.approval_handler {
+                Some(Arc::clone(handler))
+            } else if let Some(queue) = &self.approval_queue {
+                let q = Arc::clone(queue);
+                let id = subagent_id.clone();
+                Some(Arc::new(move |cmd: &str, reason: &str| -> bool {
+                    q.request_approval(&id, cmd, reason)
+                }))
+            } else {
+                None
+            };
 
         // 3. Spawn background execution task
         let handle = tokio::spawn(async move {
@@ -482,12 +555,7 @@ mod tests {
         assert!(manager.get_persona("security_auditor").await.is_some());
 
         // Approval handler wiring check
-        let custom_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag_clone = Arc::clone(&custom_called);
-        let custom_mgr = manager.with_approval_handler(Arc::new(move |_cmd, _reason| {
-            flag_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-            true
-        }));
+        let custom_mgr = manager.with_approval_handler(Arc::new(|_cmd, _reason| true));
         assert!(custom_mgr.approval_handler.is_some());
 
         let _ = std::fs::remove_dir_all(&test_root);
