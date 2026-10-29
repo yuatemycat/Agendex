@@ -1,8 +1,12 @@
 use agendex_core::agent::{AgendexAgent, AgentConfig};
 use agendex_core::model::ModelFormat;
+use std::sync::Mutex;
+
+static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
 #[tokio::test]
 async fn test_provider_slash_command_flow() -> anyhow::Result<()> {
+    let _lock = ENV_MUTEX.lock().unwrap();
     let tmp = std::env::temp_dir().join(format!("agendex_provider_test_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp)?;
     let test_cfg_path = tmp.join("config.toml");
@@ -122,6 +126,58 @@ async fn test_provider_slash_command_flow() -> anyhow::Result<()> {
         assert_eq!(active_model.api_key, "sk-test-key");
     }
 
+    std::env::remove_var("AGENDEX_CONFIG");
+    let _ = std::fs::remove_dir_all(&tmp);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_provider_add_4_part_persists_to_env_and_uses_ref() -> anyhow::Result<()> {
+    let _lock = ENV_MUTEX.lock().unwrap();
+    let tmp = std::env::temp_dir().join(format!("agendex_prov_4part_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp)?;
+    let test_cfg_path = tmp.join(".agendex").join("config.toml");
+    std::env::set_var("AGENDEX_HOME", &tmp);
+    std::env::set_var("AGENDEX_CONFIG", &test_cfg_path);
+
+    let config = AgentConfig {
+        workspace_dir: tmp.clone(),
+        ..Default::default()
+    };
+
+    let agent = AgendexAgent::init(config).await?;
+
+    // 4-part form: /provider add nim nvapi-secret-nim-token-999
+    let add_out = agent
+        .process_turn("/provider add nim nvapi-secret-nim-token-999")
+        .await?;
+    assert!(add_out.contains("Added provider 'nim'"));
+
+    // Check that ~/.agendex/.env was written with the secret key
+    let env_file = tmp.join(".agendex").join(".env");
+    assert!(env_file.exists(), ".env file must exist in AGENDEX_HOME");
+    let env_content = std::fs::read_to_string(&env_file)?;
+    assert!(env_content.contains("NIM_API_KEY=nvapi-secret-nim-token-999"));
+
+    // Check that config.toml does NOT contain the secret key, only the $NIM_API_KEY reference
+    let cfg_content = std::fs::read_to_string(&test_cfg_path)?;
+    assert!(
+        !cfg_content.contains("nvapi-secret-nim-token-999"),
+        "config.toml must never contain literal API key"
+    );
+    assert!(
+        cfg_content.contains("$NIM_API_KEY"),
+        "config.toml must contain $NIM_API_KEY reference"
+    );
+
+    // Switch to nim and verify active model key resolves correctly
+    let _ = agent.process_turn("/provider switch nim").await?;
+    {
+        let active_model = agent.active_model_config.read().await.clone();
+        assert_eq!(active_model.api_key, "nvapi-secret-nim-token-999");
+    }
+
+    std::env::remove_var("AGENDEX_HOME");
     std::env::remove_var("AGENDEX_CONFIG");
     let _ = std::fs::remove_dir_all(&tmp);
     Ok(())

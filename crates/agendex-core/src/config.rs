@@ -349,6 +349,85 @@ pub fn parse_tier_string(val: &str) -> ModelTier {
     }
 }
 
+/// Returns the standard path to `~/.agendex/.env`, honoring `AGENDEX_HOME` or system home.
+pub fn agendex_env_path() -> Option<PathBuf> {
+    if let Ok(home) = std::env::var("AGENDEX_HOME") {
+        if !home.trim().is_empty() {
+            return Some(PathBuf::from(home).join(".agendex").join(".env"));
+        }
+    }
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()?;
+    Some(PathBuf::from(home).join(".agendex").join(".env"))
+}
+
+/// Loads key-value environment variables from `~/.agendex/.env` into the process environment.
+pub fn load_agendex_env() {
+    if let Some(path) = agendex_env_path() {
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        continue;
+                    }
+                    if let Some((k, v)) = trimmed.split_once('=') {
+                        let k = k.trim().trim_start_matches("export").trim();
+                        let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
+                        if !k.is_empty() {
+                            std::env::set_var(k, v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Persists a secret key into `~/.agendex/.env` with private permissions (0600 on Unix).
+pub fn persist_agendex_env_var(key: &str, value: &str) -> anyhow::Result<()> {
+    if let Some(path) = agendex_env_path() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let mut lines = Vec::new();
+        let mut key_updated = false;
+
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with(&format!("{}=", key))
+                        || trimmed.starts_with(&format!("export {}=", key))
+                    {
+                        lines.push(format!("{}={}", key, value));
+                        key_updated = true;
+                    } else {
+                        lines.push(line.to_string());
+                    }
+                }
+            }
+        }
+
+        if !key_updated {
+            lines.push(format!("{}={}", key, value));
+        }
+
+        let payload = lines.join("\n") + "\n";
+        std::fs::write(&path, payload)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            let _ = std::fs::set_permissions(&path, perms);
+        }
+    }
+    Ok(())
+}
+
 /// Returns the standard path to `~/.agendex/config.toml`, honoring `AGENDEX_CONFIG` or `AGENDEX_CONFIG_PATH` overrides.
 pub fn default_config_path() -> Option<PathBuf> {
     if let Ok(override_path) = std::env::var("AGENDEX_CONFIG") {
@@ -498,6 +577,7 @@ pub fn ensure_default_config_exists() -> Option<PathBuf> {
 
 /// Loads the default config from `~/.agendex/config.toml` if it exists, without creating it if missing.
 pub fn load_default_config() -> Option<AgendexConfigFile> {
+    load_agendex_env();
     let path = default_config_path()?;
     if path.exists() {
         match load_config_from_path(&path) {

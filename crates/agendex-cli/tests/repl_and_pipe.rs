@@ -67,12 +67,12 @@ fn test_repl_editor_keybindings_and_creation() {
         .find_binding(KeyModifiers::CONTROL, KeyCode::Char('r'))
         .is_some());
 
-    // Validate '/' and '@' autocomplete triggers
+    // Validate Tab autocomplete and '@' file trigger (typing '/' remains unbound to prevent popup while typing file paths like src/config.rs)
     assert!(
         bindings
             .find_binding(KeyModifiers::NONE, KeyCode::Char('/'))
-            .is_some(),
-        "Typing '/' must activate autocomplete menu"
+            .is_none(),
+        "Typing '/' must not trigger autocomplete menu to allow fluid path typing"
     );
     assert!(
         bindings
@@ -98,6 +98,12 @@ fn test_sanitized_history_prevents_api_key_leakage() {
     let scrubbed5 = sanitize_history_line(input5);
     assert!(!scrubbed5.contains("nvapi-supersecret-99999"));
     assert!(scrubbed5.contains("[REDACTED]"));
+
+    // 4-part syntax (/provider add <name> <key>)
+    let input4 = "/provider add my-nim nvapi-supersecret-77777";
+    let scrubbed4 = sanitize_history_line(input4);
+    assert!(!scrubbed4.contains("nvapi-supersecret-77777"));
+    assert!(scrubbed4.contains("[REDACTED]"));
 
     // .env pasted into prompt
     let env_line = "OPENAI_API_KEY=sk-test-live-key-1234567890123456";

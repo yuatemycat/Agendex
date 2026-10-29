@@ -401,6 +401,55 @@ impl SnapshotEngine {
         let _ = self.save_snapshots_to_disk();
     }
 
+    /// Records completion of a turn, saving the post-turn tree hash and files touched by the agent.
+    pub async fn record_turn_completed(
+        &mut self,
+        turn_label: &str,
+        agent_touched_files: &[String],
+    ) -> anyhow::Result<()> {
+        self.ensure_git_ready().await?;
+
+        let mut add_cmd = Command::new("git");
+        add_cmd.args(["add", "-A"]).current_dir(&self.workspace_dir);
+        if !self.index_file.as_os_str().is_empty() {
+            add_cmd.env("GIT_INDEX_FILE", &self.index_file);
+        }
+        let _ = add_cmd.output().await;
+
+        let mut wt_cmd = Command::new("git");
+        wt_cmd.args(["write-tree"]).current_dir(&self.workspace_dir);
+        if !self.index_file.as_os_str().is_empty() {
+            wt_cmd.env("GIT_INDEX_FILE", &self.index_file);
+        }
+        let end_tree_hash = if let Ok(wt_out) = wt_cmd.output().await {
+            String::from_utf8_lossy(&wt_out.stdout).trim().to_string()
+        } else {
+            String::new()
+        };
+
+        if let Some(snap) = self
+            .snapshots
+            .iter_mut()
+            .rev()
+            .find(|s| s.label == turn_label)
+        {
+            let meta = snap.metadata.get_or_insert_with(|| serde_json::json!({}));
+            if let Some(obj) = meta.as_object_mut() {
+                obj.insert(
+                    "end_tree_hash".to_string(),
+                    serde_json::json!(end_tree_hash),
+                );
+                obj.insert(
+                    "agent_touched_files".to_string(),
+                    serde_json::json!(agent_touched_files),
+                );
+            }
+        }
+
+        self.save_snapshots_to_disk()?;
+        Ok(())
+    }
+
     /// Returns all files created by the agent across recorded snapshots.
     pub fn all_agent_created_files(&self) -> Vec<String> {
         let mut res = Vec::new();
@@ -515,6 +564,82 @@ impl SnapshotEngine {
                     }
                 }
             }
+        }
+
+        // Safety Gate: Ensure no tracked files in the workspace have uncommitted modifications made outside the agent
+        let end_tree = target_record
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("end_tree_hash"))
+            .and_then(|h| h.as_str());
+
+        let agent_touched: Vec<String> = target_record
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("agent_touched_files"))
+            .and_then(|f| serde_json::from_value(f.clone()).ok())
+            .unwrap_or_default();
+
+        let mut external_modified: Vec<String> = Vec::new();
+
+        // 1. If we have end_tree_hash, check if working tree differs from end_tree_hash (i.e. user modified files AFTER the turn completed)
+        if let Some(eth) = end_tree {
+            if !eth.is_empty() && eth != current_tree {
+                let mut diff_cmd = Command::new("git");
+                diff_cmd
+                    .args([
+                        "diff-tree",
+                        "-r",
+                        "--no-commit-id",
+                        "--name-only",
+                        eth,
+                        &current_tree,
+                    ])
+                    .current_dir(&self.workspace_dir);
+                if let Ok(out) = diff_cmd.output().await {
+                    for line in String::from_utf8_lossy(&out.stdout).lines() {
+                        let trimmed = line.trim().replace('\\', "/");
+                        if !trimmed.is_empty() && !external_modified.contains(&trimmed) {
+                            external_modified.push(trimmed);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Also check if working tree differs from target_record.tree_hash in files NEVER touched by the agent
+        if !agent_touched.is_empty() {
+            let mut diff_target = Command::new("git");
+            diff_target
+                .args([
+                    "diff-tree",
+                    "-r",
+                    "--no-commit-id",
+                    "--name-only",
+                    &target_record.tree_hash,
+                    &current_tree,
+                ])
+                .current_dir(&self.workspace_dir);
+            if let Ok(out) = diff_target.output().await {
+                for line in String::from_utf8_lossy(&out.stdout).lines() {
+                    let trimmed = line.trim().replace('\\', "/");
+                    if !trimmed.is_empty()
+                        && !agent_touched.contains(&trimmed)
+                        && !created_by_agent.contains(&trimmed)
+                        && !external_modified.contains(&trimmed)
+                    {
+                        external_modified.push(trimmed);
+                    }
+                }
+            }
+        }
+
+        if !external_modified.is_empty() {
+            anyhow::bail!(
+                "Refusing to revert: {} file(s) modified outside the agent since turn started: [{}]. Stash, commit, or discard manual changes first to prevent data loss.",
+                external_modified.len(),
+                external_modified.join(", ")
+            );
         }
 
         // 1. Unstage any user-created files from isolated index so git read-tree does not delete them
@@ -1142,6 +1267,80 @@ mod tests {
         assert!(
             user_existing.exists(),
             "Pre-existing user file must be preserved"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_revert_refuses_when_user_modifies_tracked_file_after_turn() -> anyhow::Result<()>
+    {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "agendex_test_revert_refusal_{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&temp_dir).await?;
+
+        let mut engine = SnapshotEngine::new(&temp_dir)?;
+
+        // Pre-existing tracked config file
+        let config_file = temp_dir.join("src").join("config.rs");
+        tokio::fs::create_dir_all(config_file.parent().unwrap()).await?;
+        tokio::fs::write(&config_file, "// Original config\npub struct Config;\n").await?;
+
+        // Capture turn 1 snapshot
+        engine
+            .capture_snapshot_with_metadata(
+                "turn_start:1",
+                Some(serde_json::json!({
+                    "kind": "turn_start",
+                    "step_index": 1,
+                    "created_files": []
+                })),
+            )
+            .await?;
+
+        // Agent modifies another file (e.g. main.rs)
+        let main_file = temp_dir.join("src").join("main.rs");
+        tokio::fs::write(&main_file, "fn main() {}\n").await?;
+        engine.record_created_file(&main_file);
+
+        // Turn completes: agent recorded touching main.rs
+        engine
+            .record_turn_completed("turn_start:1", &["src/main.rs".to_string()])
+            .await?;
+
+        // After the agent turn, USER manually edits src/config.rs (a file already in git)
+        tokio::fs::write(
+            &config_file,
+            "// Original config\npub struct Config;\n// User manual addition after agent turn\n",
+        )
+        .await?;
+
+        // User runs /revert -> MUST refuse because config.rs was modified outside the agent!
+        let revert_res = engine.rollback_turn().await;
+        assert!(
+            revert_res.is_err(),
+            "Revert must be refused when tracked files have external modifications"
+        );
+        let err_msg = revert_res.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("Refusing to revert"),
+            "Error message must specify refusal reason: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("config.rs"),
+            "Error message must mention the modified file: {}",
+            err_msg
+        );
+
+        // User edit in config_file MUST STILL BE INTACT!
+        let saved_config = tokio::fs::read_to_string(&config_file).await?;
+        assert!(
+            saved_config.contains("User manual addition after agent turn"),
+            "User addition must never be wiped when revert is refused!"
         );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;

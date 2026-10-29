@@ -74,11 +74,19 @@ pub struct AgendexAgent {
     pub event_handler: Option<crate::events::AgentEventHandler>,
     pub tool_progress_handler: Option<ToolProgressHandler>,
     pub token_stream_handler: Option<TokenStreamHandler>,
+    pub activity_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     pub touched_files: Arc<Mutex<std::collections::HashSet<String>>>,
     pub streamed_tokens_in_turn: Arc<std::sync::atomic::AtomicBool>,
     pub auto_approve_yolo: Arc<std::sync::atomic::AtomicBool>,
     pub current_turn_prompt_tokens: Arc<std::sync::atomic::AtomicUsize>,
     pub current_turn_completion_tokens: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffApprovalResult {
+    Approved,
+    RejectedByUser,
+    RejectedNonTerminal,
 }
 
 impl AgendexAgent {
@@ -227,6 +235,7 @@ impl AgendexAgent {
             event_handler: None,
             tool_progress_handler: None,
             token_stream_handler: None,
+            activity_hook: None,
             touched_files: Arc::new(Mutex::new(std::collections::HashSet::new())),
             streamed_tokens_in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             auto_approve_yolo: Arc::new(std::sync::atomic::AtomicBool::new(
@@ -290,28 +299,49 @@ impl AgendexAgent {
         self
     }
 
+    pub fn with_activity_hook(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.activity_hook = Some(hook);
+        self
+    }
+
+    pub fn notify_activity(&self) {
+        if let Some(hook) = &self.activity_hook {
+            hook();
+        }
+    }
+
     pub fn notify_progress(&self, msg: &str) {
+        self.notify_activity();
         if let Some(handler) = &self.tool_progress_handler {
             let masked = agendex_trajectory::mask_secrets(msg);
             handler(&masked);
         }
     }
 
-    pub async fn request_diff_approval(&self, path: &str, diff: &str) -> bool {
+    pub async fn request_diff_approval(&self, path: &str, diff: &str) -> DiffApprovalResult {
+        self.notify_activity();
         if self.config.auto_approve_risky
             || self
                 .auto_approve_yolo
                 .load(std::sync::atomic::Ordering::SeqCst)
         {
-            return true;
+            return DiffApprovalResult::Approved;
         }
         if let Some(handler) = &self.diff_approval_handler {
             let masked_diff = agendex_trajectory::mask_secrets(diff);
-            return handler(path, &masked_diff);
+            return if handler(path, &masked_diff) {
+                DiffApprovalResult::Approved
+            } else {
+                DiffApprovalResult::RejectedByUser
+            };
         }
         if let Some(queue) = &self.approval_queue {
             let agent_id = self.agent_id.as_deref().unwrap_or("parent");
-            return queue.request_diff_approval(agent_id, path, diff).await;
+            return if queue.request_diff_approval(agent_id, path, diff).await {
+                DiffApprovalResult::Approved
+            } else {
+                DiffApprovalResult::RejectedByUser
+            };
         }
         use std::io::IsTerminal;
         if std::io::stdin().is_terminal() {
@@ -323,12 +353,14 @@ impl AgendexAgent {
             let mut input = String::new();
             if std::io::stdin().read_line(&mut input).is_ok() {
                 let trimmed = input.trim().to_lowercase();
-                return trimmed == "y" || trimmed == "yes";
+                if trimmed == "y" || trimmed == "yes" {
+                    return DiffApprovalResult::Approved;
+                }
             }
-            return false;
+            return DiffApprovalResult::RejectedByUser;
         }
         // Non-terminal execution without -y refuses edits, matching risky command policy
-        false
+        DiffApprovalResult::RejectedNonTerminal
     }
 
     pub fn with_event_handler(mut self, handler: crate::events::AgentEventHandler) -> Self {
@@ -736,8 +768,8 @@ impl AgendexAgent {
                 }
                 "/undo" | "/revert" => {
                     let mut snap = self.snapshot_engine.lock().await;
-                    match snap.rollback_turn().await? {
-                        Some(res) => {
+                    match snap.rollback_turn().await {
+                        Ok(Some(res)) => {
                             if let Some(step_idx) = res.step_index {
                                 let mut traj = self.trajectory.lock().await;
                                 let _ = traj.truncate_after(step_idx.saturating_sub(1));
@@ -756,8 +788,11 @@ impl AgendexAgent {
                             };
                             return Ok(msg);
                         }
-                        None => {
+                        Ok(None) => {
                             return Ok("No previous turn snapshot available to revert.".to_string());
+                        }
+                        Err(err) => {
+                            return Ok(format!("[Refused] {}", err));
                         }
                     }
                 }
@@ -1077,6 +1112,17 @@ impl AgendexAgent {
                 self.hook_dispatcher
                     .trigger_post_tool("turn_complete", "success")
                     .await?;
+
+                // Record turn completion in SnapshotEngine to preserve post-turn tree state
+                {
+                    let mut snap = self.snapshot_engine.lock().await;
+                    let touched = {
+                        let t = self.touched_files.lock().await;
+                        t.iter().cloned().collect::<Vec<_>>()
+                    };
+                    let _ = snap.record_turn_completed(&turn_label, &touched).await;
+                }
+
                 return Ok(final_text);
             }
         }
@@ -1097,6 +1143,15 @@ impl AgendexAgent {
                 est_cost,
                 has_known,
             );
+        }
+
+        {
+            let mut snap = self.snapshot_engine.lock().await;
+            let touched = {
+                let t = self.touched_files.lock().await;
+                t.iter().cloned().collect::<Vec<_>>()
+            };
+            let _ = snap.record_turn_completed(&turn_label, &touched).await;
         }
 
         Ok("Reached maximum tool execution iterations.".to_string())
@@ -1308,13 +1363,22 @@ impl AgendexAgent {
                     &patch_res.content,
                 );
                 if !diff.is_empty() {
-                    let approved = self.request_diff_approval(path, &diff).await;
-                    if !approved {
-                        self.notify_progress(&format!(
-                            "[Tool: edit_file] Edit on '{}' rejected by user.",
-                            path
-                        ));
-                        return "Edit rejected by user".to_string();
+                    match self.request_diff_approval(path, &diff).await {
+                        DiffApprovalResult::Approved => {}
+                        DiffApprovalResult::RejectedByUser => {
+                            self.notify_progress(&format!(
+                                "[Tool: edit_file] Edit on '{}' rejected by user.",
+                                path
+                            ));
+                            return "Edit rejected by user".to_string();
+                        }
+                        DiffApprovalResult::RejectedNonTerminal => {
+                            self.notify_progress(&format!(
+                                "[Tool: edit_file] Edit on '{}' rejected: requires interactive terminal approval or -y/--auto-approve flag.",
+                                path
+                            ));
+                            return "Edit rejected: non-interactive session requires -y/--auto-approve to apply changes without terminal prompt.".to_string();
+                        }
                     }
                 }
 
@@ -1401,6 +1465,9 @@ impl AgendexAgent {
                     queue.request_approval(agent_id, &action, &reason).await
                 } else if let Some(handler) = &self.approval_handler {
                     handler(&action, &reason)
+                } else if already_exists {
+                    // Overwriting existing skill playbook strictly requires explicit user approval
+                    false
                 } else {
                     self.config.auto_approve_risky
                 };
@@ -1411,6 +1478,12 @@ impl AgendexAgent {
                         safe_name,
                         reason
                     );
+                    if already_exists {
+                        return format!(
+                            "Skill creation for '{}' blocked: overwriting an existing skill requires explicit user approval",
+                            safe_name
+                        );
+                    }
                     return format!(
                         "Skill creation for '{}' blocked: requires user approval",
                         safe_name
@@ -1489,14 +1562,22 @@ impl AgendexAgent {
                                     &new_content,
                                 );
                                 if !diff.is_empty() {
-                                    let approved =
-                                        self.request_diff_approval(path_str, &diff).await;
-                                    if !approved {
-                                        self.notify_progress(&format!(
-                                            "[Tool: write_file] Edit on '{}' rejected by user.",
-                                            path_str
-                                        ));
-                                        return "Edit rejected by user".to_string();
+                                    match self.request_diff_approval(path_str, &diff).await {
+                                        DiffApprovalResult::Approved => {}
+                                        DiffApprovalResult::RejectedByUser => {
+                                            self.notify_progress(&format!(
+                                                "[Tool: write_file] Edit on '{}' rejected by user.",
+                                                path_str
+                                            ));
+                                            return "Edit rejected by user".to_string();
+                                        }
+                                        DiffApprovalResult::RejectedNonTerminal => {
+                                            self.notify_progress(&format!(
+                                                "[Tool: write_file] Edit on '{}' rejected: requires interactive terminal approval or -y/--auto-approve flag.",
+                                                path_str
+                                            ));
+                                            return "Edit rejected: non-interactive session requires -y/--auto-approve to apply changes without terminal prompt.".to_string();
+                                        }
                                     }
                                 }
                             }
@@ -1505,13 +1586,22 @@ impl AgendexAgent {
                             let diff =
                                 agendex_ast::diff::generate_unified_diff(path_str, "", content);
                             if !diff.is_empty() {
-                                let approved = self.request_diff_approval(path_str, &diff).await;
-                                if !approved {
-                                    self.notify_progress(&format!(
-                                        "[Tool: write_file] File creation of '{}' rejected by user.",
-                                        path_str
-                                    ));
-                                    return "File creation rejected by user".to_string();
+                                match self.request_diff_approval(path_str, &diff).await {
+                                    DiffApprovalResult::Approved => {}
+                                    DiffApprovalResult::RejectedByUser => {
+                                        self.notify_progress(&format!(
+                                            "[Tool: write_file] File creation of '{}' rejected by user.",
+                                            path_str
+                                        ));
+                                        return "File creation rejected by user".to_string();
+                                    }
+                                    DiffApprovalResult::RejectedNonTerminal => {
+                                        self.notify_progress(&format!(
+                                            "[Tool: write_file] File creation of '{}' rejected: requires interactive terminal approval or -y/--auto-approve flag.",
+                                            path_str
+                                        ));
+                                        return "File creation rejected: non-interactive session requires -y/--auto-approve to apply changes without terminal prompt.".to_string();
+                                    }
                                 }
                             }
                         }
@@ -1674,36 +1764,54 @@ impl AgendexAgent {
                     Ok("Usage: /provider add <name> <base_url> [model] [format] [api_key]\nExample: /provider add vllm http://localhost:8000/v1 meta-llama/Llama-3-8B openai $VLLM_KEY".to_string())
                 } else {
                     let name = parts[2];
-                    let base_url = parts[3];
-                    let (model, format, api_key) = match parts.len() {
-                        4 => (None, None, None),
-                        5 => {
-                            let arg = parts[4];
-                            if arg.starts_with("sk-")
-                                || arg.starts_with("nvapi-")
-                                || arg.starts_with('$')
-                            {
-                                (None, None, Some(arg))
+                    let (base_url, model, format, api_key) = match parts.len() {
+                        4 => {
+                            let arg = parts[3];
+                            if arg.starts_with("http://") || arg.starts_with("https://") {
+                                (arg.to_string(), None, None, None)
                             } else {
-                                (Some(arg), None, None)
+                                // Shorter 4-argument form: `/provider add <name> <api_key>`
+                                let (_, default_base) =
+                                    crate::config::resolve_provider_preset(name);
+                                (
+                                    default_base
+                                        .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+                                    None,
+                                    None,
+                                    Some(arg),
+                                )
+                            }
+                        }
+                        5 => {
+                            let arg3 = parts[3];
+                            let arg4 = parts[4];
+                            if arg4.starts_with("sk-")
+                                || arg4.starts_with("nvapi-")
+                                || arg4.starts_with('$')
+                            {
+                                (arg3.to_string(), None, None, Some(arg4))
+                            } else {
+                                (arg3.to_string(), Some(arg4), None, None)
                             }
                         }
                         6 => {
+                            let arg3 = parts[3];
                             let arg4 = parts[4];
                             let arg5 = parts[5];
                             if arg5 == "openai" || arg5 == "gemini" || arg5 == "anthropic" {
-                                (Some(arg4), Some(arg5), None)
+                                (arg3.to_string(), Some(arg4), Some(arg5), None)
                             } else {
-                                (Some(arg4), None, Some(arg5))
+                                (arg3.to_string(), Some(arg4), None, Some(arg5))
                             }
                         }
                         _ => (
+                            parts[3].to_string(),
                             parts.get(4).copied(),
                             parts.get(5).copied(),
                             parts.get(6).copied(),
                         ),
                     };
-                    self.add_provider(name, base_url, model, format, api_key)
+                    self.add_provider(name, &base_url, model, format, api_key)
                         .await
                 }
             }
@@ -1965,11 +2073,12 @@ impl AgendexAgent {
             )
         } else {
             let env_var = format!("{}_API_KEY", key.to_uppercase().replace('-', "_"));
+            let _ = crate::config::persist_agendex_env_var(&env_var, &resolved_key);
             std::env::set_var(&env_var, &resolved_key);
             let env_ref = format!("${}", env_var);
             (
                 Some(env_ref.clone()),
-                format!(" (key saved as env ref: {})", env_ref),
+                format!(" (key persisted to ~/.agendex/.env as {})", env_ref),
             )
         };
 
@@ -2105,42 +2214,70 @@ impl AgendexAgent {
 
     /// Handles `/context` command.
     pub async fn handle_context_command(&self) -> String {
-        let history = self.history.lock().await;
-        // Count active message text and tool calls JSON
-        let mut total_chars: usize = history
-            .iter()
-            .map(|m| {
-                let tc_len = m
-                    .tool_calls
-                    .as_ref()
-                    .and_then(|tcs| serde_json::to_string(tcs).ok())
-                    .map(|s| s.len())
-                    .unwrap_or(0);
-                m.content.len() + tc_len
-            })
-            .sum();
-        drop(history);
+        let last_known_prompt_tokens = self
+            .current_turn_prompt_tokens
+            .load(std::sync::atomic::Ordering::SeqCst);
 
-        // Include tool schema definitions injected into each LLM turn
-        for t in self.tool_registry.list_tool_definitions() {
-            if let Ok(s) = serde_json::to_string(&t) {
-                total_chars += s.len();
+        let active_tokens = if last_known_prompt_tokens > 0 {
+            last_known_prompt_tokens
+        } else {
+            // Precise pre-turn estimation including full system prompt and wire tool schemas
+            let slash_prompt = self
+                .skill_registry
+                .read()
+                .map(|r| r.format_slash_commands_prompt())
+                .unwrap_or_default();
+            let system_prompt = format!(
+                "You are Agendex, a powerful local-first autonomous agent.\n\
+                Workspace: {}\n\
+                Available Slash Commands:\n{}\n\
+                Active Rules:\n{}",
+                self.config.workspace_dir.display(),
+                slash_prompt,
+                self.rules_engine.generate_rule_blocks(None)
+            );
+
+            let mut prompt_chars = system_prompt.len();
+
+            let history = self.history.lock().await;
+            for m in history.iter() {
+                prompt_chars += m.content.len();
+                if let Some(tcs) = &m.tool_calls {
+                    if let Ok(s) = serde_json::to_string(tcs) {
+                        prompt_chars += s.len();
+                    }
+                }
             }
-        }
+            drop(history);
 
-        // Include MCP tool schemas
-        for t in self.mcp_registry.list_tools().await {
-            if let Ok(s) = serde_json::to_string(&t) {
-                total_chars += s.len();
+            // Tools formatted as wire function definitions in JSON (~2.8 chars per token)
+            let mut tool_chars = 0usize;
+            for t in self.tool_registry.list_tool_definitions() {
+                if let Ok(s) = serde_json::to_string(&serde_json::json!({
+                    "type": "function",
+                    "function": t
+                })) {
+                    tool_chars += s.len();
+                }
             }
-        }
+            for t in self.mcp_registry.list_tools().await {
+                if let Ok(s) = serde_json::to_string(&serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description.unwrap_or_default(),
+                        "parameters": t.input_schema,
+                    }
+                })) {
+                    tool_chars += s.len();
+                }
+            }
 
-        // Include active rule definitions
-        let rule_blocks = self.rules_engine.generate_rule_blocks(None);
-        total_chars += rule_blocks.len();
-
-        // Standard estimation: ~4 characters per token
-        let active_tokens = (total_chars / 4).max(1);
+            // Text tokens (~3.6 chars/token) + JSON schema tokens (~2.8 chars/token)
+            let text_tokens = prompt_chars / 4;
+            let schema_tokens = (tool_chars as f64 / 2.8).round() as usize;
+            (text_tokens + schema_tokens).max(1)
+        };
 
         let tier = self.config.model_tier;
         let limit = tier.ceiling_tokens();

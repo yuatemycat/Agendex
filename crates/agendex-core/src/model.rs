@@ -170,6 +170,77 @@ pub struct ModelClient {
     client: reqwest::Client,
     pub config: ModelConfig,
     pub token_callback: Option<TokenStreamHandler>,
+    pub timeout_secs: u64,
+}
+
+async fn next_chunk_with_timeout(
+    resp: &mut reqwest::Response,
+    gap_timeout: std::time::Duration,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    match tokio::time::timeout(gap_timeout, resp.chunk()).await {
+        Ok(res) => match res? {
+            Some(b) => Ok(Some(b.to_vec())),
+            None => Ok(None),
+        },
+        Err(_) => Err(anyhow::anyhow!(
+            "Stream read timed out: no response chunk received from model provider for {} seconds",
+            gap_timeout.as_secs()
+        )),
+    }
+}
+
+async fn execute_request_with_retry<F>(
+    build_req: F,
+    ttfb_timeout: std::time::Duration,
+) -> anyhow::Result<reqwest::Response>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    let mut attempts = 0;
+    let max_attempts = 3;
+    let mut backoff = std::time::Duration::from_secs(1);
+
+    loop {
+        attempts += 1;
+        let req = build_req();
+        let resp_res = tokio::time::timeout(ttfb_timeout, req.send()).await;
+
+        match resp_res {
+            Ok(Ok(resp)) => {
+                let status = resp.status();
+                if (status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status == reqwest::StatusCode::BAD_GATEWAY
+                    || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    || status == reqwest::StatusCode::GATEWAY_TIMEOUT)
+                    && attempts < max_attempts
+                {
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                    continue;
+                }
+                return Ok(resp);
+            }
+            Ok(Err(e)) => {
+                if attempts < max_attempts {
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                    continue;
+                }
+                return Err(e.into());
+            }
+            Err(_) => {
+                if attempts < max_attempts {
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                    continue;
+                }
+                return Err(anyhow::anyhow!(
+                    "Request timed out waiting for initial response from provider (exceeded {} seconds)",
+                    ttfb_timeout.as_secs()
+                ));
+            }
+        }
+    }
 }
 
 impl ModelClient {
@@ -181,7 +252,6 @@ impl ModelClient {
 
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(30))
-            .timeout(std::time::Duration::from_secs(timeout_secs))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -189,6 +259,7 @@ impl ModelClient {
             client,
             config,
             token_callback: None,
+            timeout_secs,
         }
     }
 
@@ -317,7 +388,14 @@ impl ModelClient {
                 serde_json::json!([{ "functionDeclarations": function_declarations }]);
         }
 
-        let resp = self.client.post(&url).json(&payload).send().await?;
+        let client = self.client.clone();
+        let url_clone = url.clone();
+        let payload_clone = payload.clone();
+        let resp = execute_request_with_retry(
+            move || client.post(&url_clone).json(&payload_clone),
+            std::time::Duration::from_secs(self.timeout_secs),
+        )
+        .await?;
 
         if !resp.status().is_success() {
             let err_text = resp.text().await?;
@@ -441,12 +519,22 @@ impl ModelClient {
             payload["tools"] = serde_json::json!(openai_tools);
         }
 
-        let mut req = self.client.post(&url).json(&payload);
-        if !self.config.api_key.is_empty() {
-            req = req.bearer_auth(&self.config.api_key);
-        }
+        let client = self.client.clone();
+        let url_clone = url.clone();
+        let payload_clone = payload.clone();
+        let api_key = self.config.api_key.clone();
 
-        let mut resp = req.send().await?;
+        let mut resp = execute_request_with_retry(
+            move || {
+                let mut r = client.post(&url_clone).json(&payload_clone);
+                if !api_key.is_empty() {
+                    r = r.bearer_auth(&api_key);
+                }
+                r
+            },
+            std::time::Duration::from_secs(self.timeout_secs),
+        )
+        .await?;
         if !resp.status().is_success() {
             let err_text = resp.text().await?;
             return Err(anyhow::anyhow!("OpenAI API error: {}", err_text));
@@ -467,7 +555,9 @@ impl ModelClient {
             let mut completion_tokens = 0usize;
 
             let mut buffer = String::new();
-            while let Some(chunk) = resp.chunk().await? {
+            while let Some(chunk) =
+                next_chunk_with_timeout(&mut resp, std::time::Duration::from_secs(30)).await?
+            {
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
                 while let Some(pos) = buffer.find('\n') {
                     let line = buffer[..pos].trim().to_string();
@@ -729,14 +819,22 @@ impl ModelClient {
             payload["tools"] = serde_json::json!(anthropic_tools);
         }
 
-        let mut resp = self
-            .client
-            .post(&url)
-            .header("x-api-key", &self.config.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&payload)
-            .send()
-            .await?;
+        let client = self.client.clone();
+        let url_clone = url.clone();
+        let payload_clone = payload.clone();
+        let api_key = self.config.api_key.clone();
+
+        let mut resp = execute_request_with_retry(
+            move || {
+                client
+                    .post(&url_clone)
+                    .header("x-api-key", &api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .json(&payload_clone)
+            },
+            std::time::Duration::from_secs(self.timeout_secs),
+        )
+        .await?;
 
         if !resp.status().is_success() {
             let err_text = resp.text().await?;
@@ -758,7 +856,9 @@ impl ModelClient {
             let mut completion_tokens = 0usize;
 
             let mut buffer = String::new();
-            while let Some(chunk) = resp.chunk().await? {
+            while let Some(chunk) =
+                next_chunk_with_timeout(&mut resp, std::time::Duration::from_secs(30)).await?
+            {
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
                 while let Some(pos) = buffer.find('\n') {
                     let line = buffer[..pos].trim().to_string();

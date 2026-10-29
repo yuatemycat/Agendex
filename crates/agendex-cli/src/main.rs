@@ -6,37 +6,60 @@ use std::sync::Arc;
 
 use agendex_core::agent::AgendexAgent;
 
-fn spawn_spinner(message: &'static str) -> (Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
-    let running = Arc::new(AtomicBool::new(true));
-    let is_term = std::io::stdout().is_terminal() && env::var("NO_COLOR").is_err();
-    let r_clone = running.clone();
+#[derive(Clone)]
+struct SpinnerController {
+    running: Arc<AtomicBool>,
+}
 
-    let handle = tokio::spawn(async move {
-        if !is_term {
-            return;
+impl SpinnerController {
+    fn new() -> Self {
+        Self {
+            running: Arc::new(AtomicBool::new(false)),
         }
-        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let mut idx = 0;
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        while r_clone.load(std::sync::atomic::Ordering::Relaxed) {
-            let frame = frames[idx % frames.len()];
-            eprint!(
-                "\r  \x1b[38;2;129;140;248m{}\x1b[0m \x1b[38;2;148;163;184m{}\x1b[0m",
-                frame, message
-            );
+    }
+
+    fn start(&self, message: &'static str) -> tokio::task::JoinHandle<()> {
+        self.running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let r_clone = self.running.clone();
+        let is_term = std::io::stdout().is_terminal() && env::var("NO_COLOR").is_err();
+
+        tokio::spawn(async move {
+            if !is_term {
+                return;
+            }
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let mut idx = 0;
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            while r_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                let frame = frames[idx % frames.len()];
+                eprint!(
+                    "\r  \x1b[38;2;129;140;248m{}\x1b[0m \x1b[38;2;148;163;184m{}\x1b[0m",
+                    frame, message
+                );
+                let _ = io::stderr().flush();
+                idx += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            }
+            eprint!("\r\x1b[2K");
             let _ = io::stderr().flush();
-            idx += 1;
-            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-        }
-        eprint!("\r\x1b[2K");
-        let _ = io::stderr().flush();
-    });
+        })
+    }
 
-    (running, handle)
+    fn stop(&self) {
+        if self
+            .running
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            eprint!("\r\x1b[2K");
+            let _ = io::stderr().flush();
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    agendex_core::config::load_agendex_env();
     let args: Vec<String> = env::args().collect();
     let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
@@ -87,6 +110,11 @@ async fn main() -> anyhow::Result<()> {
             (agent, None)
         };
 
+    let spinner_ctrl = SpinnerController::new();
+    let stream_filter = Arc::new(std::sync::Mutex::new(
+        agendex_trajectory::StreamingSecretFilter::new(),
+    ));
+
     let agent = if parsed.json_mode {
         agent.with_event_handler(Arc::new(|evt| {
             if let Ok(line) = serde_json::to_string(evt) {
@@ -95,13 +123,25 @@ async fn main() -> anyhow::Result<()> {
             }
         }))
     } else {
+        let sc_token = spinner_ctrl.clone();
+        let sf_token = stream_filter.clone();
+        let sc_tool = spinner_ctrl.clone();
+        let sc_act = spinner_ctrl.clone();
         agent
-            .with_token_stream_handler(Arc::new(|token| {
-                let clean = agendex_trajectory::mask_secrets(token);
-                print!("{}", clean);
-                let _ = io::stdout().flush();
+            .with_activity_hook(Arc::new(move || {
+                sc_act.stop();
             }))
-            .with_tool_progress_handler(Arc::new(|msg| {
+            .with_token_stream_handler(Arc::new(move |token| {
+                sc_token.stop();
+                let mut filter = sf_token.lock().unwrap();
+                let clean = filter.push(token);
+                if !clean.is_empty() {
+                    print!("{}", clean);
+                    let _ = io::stdout().flush();
+                }
+            }))
+            .with_tool_progress_handler(Arc::new(move |msg| {
+                sc_tool.stop();
                 if let Some(clean) = agendex_core::ui::format_tool_notification(msg) {
                     println!("{}", clean);
                 }
@@ -132,7 +172,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if let Some(p) = prompt {
+        let spinner_handle = spinner_ctrl.start("Thinking...");
         let turn_res = agent.process_turn(&p).await;
+        spinner_ctrl.stop();
+        let _ = spinner_handle.await;
+        if !parsed.json_mode {
+            let flushed = stream_filter.lock().unwrap().flush();
+            if !flushed.is_empty() {
+                print!("{}", flushed);
+                let _ = io::stdout().flush();
+            }
+        }
         match turn_res {
             Ok(resp) => {
                 if !parsed.json_mode {
@@ -406,11 +456,16 @@ async fn main() -> anyhow::Result<()> {
                             trimmed,
                         );
 
-                        let (spinner_running, spinner_handle) = spawn_spinner("Thinking...");
+                        let spinner_handle = spinner_ctrl.start("Thinking...");
                         tokio::select! {
                             turn_res = agent.process_turn(&expanded) => {
-                                spinner_running.store(false, std::sync::atomic::Ordering::Relaxed);
+                                spinner_ctrl.stop();
                                 let _ = spinner_handle.await;
+                                let flushed = stream_filter.lock().unwrap().flush();
+                                if !flushed.is_empty() {
+                                    print!("{}", flushed);
+                                    let _ = io::stdout().flush();
+                                }
                                 match turn_res {
                                     Ok(reply) => {
                                         let clean_reply = agendex_trajectory::mask_secrets(&reply);
@@ -422,24 +477,32 @@ async fn main() -> anyhow::Result<()> {
                                         } else {
                                             println!("{}", clean_reply);
                                         }
-                                        if let Some(telemetry) = agent.format_telemetry().await {
-                                            println!(
-                                                "{}",
-                                                agendex_core::ui::format_telemetry_footer(&telemetry)
-                                            );
+                                        if !trimmed.starts_with('/') {
+                                            if let Some(telemetry) = agent.format_telemetry().await {
+                                                println!(
+                                                    "{}",
+                                                    agendex_core::ui::format_telemetry_footer(&telemetry)
+                                                );
+                                            }
                                         }
                                         if parsed.git_commit {
                                             let _ = agent.commit_workspace_changes(trimmed).await;
                                         }
                                     }
                                     Err(err) => {
+                                        spinner_ctrl.stop();
                                         eprintln!("\n[Error]: {}\n", err);
                                     }
                                 }
                             }
                             _ = tokio::signal::ctrl_c() => {
-                                spinner_running.store(false, std::sync::atomic::Ordering::Relaxed);
+                                spinner_ctrl.stop();
                                 let _ = spinner_handle.await;
+                                let flushed = stream_filter.lock().unwrap().flush();
+                                if !flushed.is_empty() {
+                                    print!("{}", flushed);
+                                    let _ = io::stdout().flush();
+                                }
                                 agent.record_interrupted_turn().await;
                                 println!(
                                     "\n  {}⚡ Turn interrupted by user (Ctrl-C). Trajectory and token cost preserved.{}",

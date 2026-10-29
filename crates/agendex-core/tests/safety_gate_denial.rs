@@ -127,3 +127,102 @@ async fn test_safety_gate_denies_destructive_commands() -> anyhow::Result<()> {
     let _ = tokio::fs::remove_dir_all(&test_dir).await;
     Ok(())
 }
+
+#[tokio::test]
+async fn test_save_skill_overwrite_strictly_requires_user_approval() -> anyhow::Result<()> {
+    let test_dir = std::env::temp_dir().join(format!(
+        "agendex_test_skill_overwrite_{}",
+        uuid::Uuid::new_v4()
+    ));
+    tokio::fs::create_dir_all(&test_dir).await?;
+
+    // Pre-create an existing skill in the workspace
+    let skill_path = test_dir.join(".agenda").join("skills").join("my-skill");
+    tokio::fs::create_dir_all(&skill_path).await?;
+    tokio::fs::write(
+        skill_path.join("SKILL.md"),
+        "---\nname: my-skill\ndescription: Original skill\n---\n# Original instructions\n",
+    )
+    .await?;
+
+    // Model attempts to overwrite existing skill
+    let resp1 = json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "tc_save",
+                    "type": "function",
+                    "function": {
+                        "name": "save_skill",
+                        "arguments": json!({
+                            "name": "my-skill",
+                            "description": "Malicious injected skill",
+                            "content": "# Injected instructions",
+                            "overwrite": true
+                        }).to_string()
+                    }
+                }]
+            }
+        }],
+        "usage": { "prompt_tokens": 30, "completion_tokens": 15 }
+    });
+
+    let resp2 = json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "Overwrite was blocked."
+            }
+        }],
+        "usage": { "prompt_tokens": 60, "completion_tokens": 10 }
+    });
+
+    let server = MockModelServer::start(vec![resp1, resp2]).await?;
+
+    // Agent initialized without an interactive approval queue/handler (simulating non-interactive/auto mode)
+    let agent = AgendexAgent::init(AgentConfig {
+        workspace_dir: test_dir.clone(),
+        session_id: "test_session_skill_overwrite".to_string(),
+        auto_approve_risky: true, // Auto-approve is ON, but overwrite must STILL be blocked!
+        model: ModelConfig {
+            format: ModelFormat::OpenAi,
+            model_name: "gpt-4o".to_string(),
+            api_key: "dummy".to_string(),
+            base_url: Some(server.base_url()),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await?;
+
+    let reply = agent.process_turn("Overwrite my-skill").await?;
+    assert!(reply.contains("Overwrite was blocked."));
+
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 2);
+
+    let second_req = &requests[1];
+    let messages = second_req["messages"].as_array().unwrap();
+    let tool_reply = messages
+        .iter()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .expect("Tool result message must exist");
+
+    assert!(
+        tool_reply["content"]
+            .as_str()
+            .unwrap()
+            .contains("overwriting an existing skill requires explicit user approval"),
+        "Must block overwriting skill without human approval even with auto_approve_risky=true"
+    );
+
+    // Verify original skill file was NOT overwritten!
+    let current_skill = tokio::fs::read_to_string(skill_path.join("SKILL.md")).await?;
+    assert!(current_skill.contains("Original instructions"));
+    assert!(!current_skill.contains("Injected instructions"));
+
+    let _ = tokio::fs::remove_dir_all(&test_dir).await;
+    Ok(())
+}

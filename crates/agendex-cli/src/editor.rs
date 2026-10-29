@@ -180,6 +180,8 @@ pub fn sanitize_history_line(line: &str) -> String {
                         || part.starts_with("AIza")
                         || (idx == parts.len() - 1
                             && !part.starts_with('$')
+                            && !part.starts_with("http://")
+                            && !part.starts_with("https://")
                             && *part != "openai"
                             && *part != "gemini"
                             && *part != "anthropic");
@@ -294,16 +296,6 @@ pub fn create_default_keybindings() -> Keybindings {
         KeyModifiers::CONTROL,
         KeyCode::Char('r'),
         ReedlineEvent::SearchHistory,
-    );
-
-    // Typing '/' inserts '/' and immediately activates the command menu
-    keybindings.add_binding(
-        KeyModifiers::NONE,
-        KeyCode::Char('/'),
-        ReedlineEvent::Multiple(vec![
-            ReedlineEvent::Edit(vec![EditCommand::InsertChar('/')]),
-            ReedlineEvent::Menu("ide_menu".into()),
-        ]),
     );
 
     // Typing '@' inserts '@' and immediately activates the @file completion menu
