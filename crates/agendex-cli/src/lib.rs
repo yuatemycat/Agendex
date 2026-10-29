@@ -55,7 +55,7 @@ pub fn try_parse_cli_args(args: &[String], current_dir: PathBuf) -> anyhow::Resu
         load_default_config()
     };
 
-    if let Some(cfg) = loaded_cfg {
+    if let Some(ref cfg) = loaded_cfg {
         let mut temp_agent_config = AgentConfig {
             workspace_dir: current_dir.clone(),
             model_tier: tier,
@@ -96,10 +96,53 @@ pub fn try_parse_cli_args(args: &[String], current_dir: PathBuf) -> anyhow::Resu
             "--format" | "--provider" => {
                 if i + 1 < args.len() {
                     let val = args[i + 1].to_lowercase();
-                    let (fmt, default_base) = resolve_provider_preset(&val);
-                    model_config.format = fmt;
-                    if let Some(base) = default_base {
-                        model_config.base_url = Some(base);
+                    if let Some(ref cfg) = loaded_cfg {
+                        if let Some(entry) = cfg.providers.get(&val) {
+                            if let Some(ref m) = entry.model {
+                                model_config.model_name = m.clone();
+                            }
+                            if let Some(ref fmt_str) = entry.format {
+                                let (fmt, db) = resolve_provider_preset(fmt_str);
+                                model_config.format = fmt;
+                                if let Some(base) = db {
+                                    model_config.base_url = Some(base);
+                                }
+                            }
+                            if let Some(ref b) = entry.base_url {
+                                let expanded = agendex_core::config::expand_env_var_or_literal(b);
+                                if !expanded.is_empty() {
+                                    model_config.base_url = Some(expanded);
+                                }
+                            }
+                            if let Some(ref k) = entry.api_key {
+                                let expanded = agendex_core::config::expand_env_var_or_literal(k);
+                                if !expanded.is_empty() {
+                                    model_config.api_key = expanded;
+                                }
+                            }
+                            if let Some(ref t) = entry.tier {
+                                tier = parse_tier_string(t);
+                            }
+                        } else {
+                            let (fmt, default_base) = resolve_provider_preset(&val);
+                            model_config.format = fmt;
+                            if let Some(base) = default_base {
+                                model_config.base_url = Some(base);
+                            }
+                            model_config.model_name =
+                                agendex_core::config::default_model_for_preset(&val).to_string();
+                            let key = agendex_core::config::default_api_key_for_preset(&val);
+                            if !key.is_empty() {
+                                model_config.api_key =
+                                    agendex_core::config::expand_env_var_or_literal(&key);
+                            }
+                        }
+                    } else {
+                        let (fmt, default_base) = resolve_provider_preset(&val);
+                        model_config.format = fmt;
+                        if let Some(base) = default_base {
+                            model_config.base_url = Some(base);
+                        }
                     }
                     i += 1;
                 }

@@ -39,6 +39,15 @@ impl Default for ModelConfig {
                 temperature: Some(0.2),
                 max_output_tokens: Some(8192),
             }
+        } else if let Ok(key) = std::env::var("NVIDIA_API_KEY") {
+            Self {
+                format: ModelFormat::OpenAi,
+                model_name: "meta/llama-3.1-70b-instruct".to_string(),
+                api_key: key,
+                base_url: Some("https://integrate.api.nvidia.com/v1".to_string()),
+                temperature: Some(0.2),
+                max_output_tokens: Some(4096),
+            }
         } else {
             let key = std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "dummy_key".to_string());
             let base_url = std::env::var("OPENAI_BASE_URL").ok();

@@ -50,7 +50,9 @@ pub type TokenStreamHandler = Arc<dyn Fn(&str) + Send + Sync>;
 
 pub struct AgendexAgent {
     pub config: AgentConfig,
-    pub model_client: Arc<ModelClient>,
+    pub model_client: Arc<tokio::sync::RwLock<ModelClient>>,
+    pub active_model_config: Arc<tokio::sync::RwLock<crate::model::ModelConfig>>,
+    pub active_provider_name: Arc<tokio::sync::RwLock<String>>,
     pub task_manager: Arc<TaskManager>,
     pub tool_registry: Arc<ToolRegistry>,
     pub trajectory: Arc<Mutex<TrajectoryLogger>>,
@@ -102,7 +104,17 @@ impl AgendexAgent {
         let hook_dispatcher = Arc::new(HookDispatcher::new(&config.workspace_dir).await?);
         let ast_patcher = Arc::new(AstPatcher::new());
         let mcp_registry = Arc::new(McpRegistry::new());
-        let model_client = Arc::new(ModelClient::new(config.model.clone()));
+        let active_model_config = Arc::new(tokio::sync::RwLock::new(config.model.clone()));
+        let active_provider_name = Arc::new(tokio::sync::RwLock::new(
+            if let Some(cfg) = crate::config::load_default_config() {
+                cfg.active_provider.unwrap_or_else(|| "nim".to_string())
+            } else {
+                "nim".to_string()
+            },
+        ));
+        let model_client = Arc::new(tokio::sync::RwLock::new(ModelClient::new(
+            config.model.clone(),
+        )));
 
         // Discover and load MCP configuration if specified or present in workspace
         let mcp_path = config.mcp_config.clone().or_else(|| {
@@ -189,6 +201,8 @@ impl AgendexAgent {
         Ok(Self {
             config: config.clone(),
             model_client,
+            active_model_config,
+            active_provider_name,
             task_manager,
             tool_registry,
             trajectory,
@@ -360,7 +374,10 @@ impl AgendexAgent {
         self
     }
 
-    pub fn with_model_client(mut self, model_client: Arc<ModelClient>) -> Self {
+    pub fn with_model_client(
+        mut self,
+        model_client: Arc<tokio::sync::RwLock<ModelClient>>,
+    ) -> Self {
         self.model_client = model_client;
         self
     }
@@ -495,6 +512,9 @@ impl AgendexAgent {
                             return Ok("No previous turn snapshot available to revert.".to_string());
                         }
                     }
+                }
+                "/provider" | "/providers" => {
+                    return self.handle_provider_command(user_input).await;
                 }
                 _ => {
                     let matched_skill = self
@@ -679,10 +699,12 @@ impl AgendexAgent {
                 } else {
                     None
                 };
-            let resp = self
-                .model_client
-                .chat_with_stream(&history, &tools, stream_handler)
-                .await?;
+            let resp = {
+                let client = self.model_client.read().await;
+                client
+                    .chat_with_stream(&history, &tools, stream_handler)
+                    .await?
+            };
 
             turn_prompt_tokens += resp.prompt_tokens;
             turn_completion_tokens += resp.completion_tokens;
@@ -1310,6 +1332,263 @@ impl AgendexAgent {
     pub async fn format_telemetry(&self) -> Option<String> {
         let traj = self.trajectory.lock().await;
         traj.format_last_telemetry()
+    }
+
+    /// Handles `/provider` or `/providers` slash command input.
+    pub async fn handle_provider_command(&self, input: &str) -> anyhow::Result<String> {
+        let parts: Vec<&str> = input.split_whitespace().collect();
+        if parts.len() <= 1 {
+            return Ok(self.list_providers().await);
+        }
+
+        match parts[1].to_lowercase().as_str() {
+            "list" | "ls" => Ok(self.list_providers().await),
+            "switch" | "use" => {
+                if parts.len() < 3 {
+                    Ok("Usage: /provider switch <name> [model]\nExample: /provider switch strata\n         /provider switch nim meta/llama-3.1-70b-instruct".to_string())
+                } else {
+                    let provider = parts[2];
+                    let model = parts.get(3).copied();
+                    self.switch_provider(provider, model).await
+                }
+            }
+            "model" | "set-model" => {
+                if parts.len() < 3 {
+                    Ok("Usage: /provider model <model_name>\nExample: /provider model mistralai/mistral-large-2-instruct".to_string())
+                } else {
+                    self.set_provider_model(parts[2]).await
+                }
+            }
+            "add" => {
+                if parts.len() < 4 {
+                    Ok("Usage: /provider add <name> <base_url> [model] [format] [api_key]\nExample: /provider add vllm http://localhost:8000/v1 meta-llama/Llama-3-8B openai $VLLM_KEY".to_string())
+                } else {
+                    let name = parts[2];
+                    let base_url = parts[3];
+                    let model = parts.get(4).copied();
+                    let format = parts.get(5).copied();
+                    let api_key = parts.get(6).copied();
+                    self.add_provider(name, base_url, model, format, api_key)
+                        .await
+                }
+            }
+            "help" | "-h" | "--help" => Ok(self.provider_help()),
+            other => {
+                // Shortcut: e.g. `/provider strata` or `/provider nim`
+                let model = parts.get(2).copied();
+                self.switch_provider(other, model).await
+            }
+        }
+    }
+
+    fn provider_help(&self) -> String {
+        r#"Provider Management Commands:
+  /provider                        - List all configured providers and status
+  /provider list                   - List providers
+  /provider switch <name> [model]  - Switch active provider (e.g. /provider switch strata)
+  /provider <name> [model]         - Quick-switch provider (e.g. /provider nim)
+  /provider model <model_name>     - Change active model for current provider
+  /provider add <name> <url> [m] [fmt] [key] - Add/update custom provider"#
+            .to_string()
+    }
+
+    /// Returns a formatted list of all configured providers and indicates the active one.
+    pub async fn list_providers(&self) -> String {
+        let cfg = crate::config::load_default_config()
+            .unwrap_or_else(crate::config::create_default_config_with_presets);
+        let active = self.active_provider_name.read().await.clone();
+        let cur_model = self.active_model_config.read().await.clone();
+
+        let mut out = String::new();
+        out.push_str("=======================================================\n");
+        out.push_str(&format!(
+            " Active LLM Provider: [{}] (model: {})\n",
+            active, cur_model.model_name
+        ));
+        out.push_str(&format!(
+            " Format: {:?} | Base URL: {}\n",
+            cur_model.format,
+            cur_model.base_url.as_deref().unwrap_or("<default>")
+        ));
+        out.push_str("=======================================================\n\n");
+        out.push_str("Configured Providers:\n");
+
+        let mut keys: Vec<&String> = cfg.providers.keys().collect();
+        keys.sort();
+
+        for key in keys {
+            let entry = &cfg.providers[key];
+            let is_active = key.eq_ignore_ascii_case(&active);
+            let marker = if is_active { " *" } else { "  " };
+            let model = entry
+                .model
+                .as_deref()
+                .unwrap_or_else(|| crate::config::default_model_for_preset(key));
+            let url = entry.base_url.as_deref().unwrap_or("<upstream default>");
+            out.push_str(&format!(
+                "{} {:<12} - model: {:<30} url: {}\n",
+                marker, key, model, url
+            ));
+        }
+
+        out.push_str(
+            "\nQuick Switch: '/provider <name>' (e.g. '/provider strata' or '/provider nim')\n",
+        );
+        out.push_str("Help:         '/provider help'\n");
+        out
+    }
+
+    /// Switches the active LLM provider and re-initializes the active model client in-flight.
+    pub async fn switch_provider(
+        &self,
+        provider_name: &str,
+        model_override: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let mut cfg = crate::config::load_default_config()
+            .unwrap_or_else(crate::config::create_default_config_with_presets);
+
+        let provider_key = provider_name.to_lowercase();
+        let (format, base_url, model_name, api_key, tier) =
+            if let Some(entry) = cfg.providers.get(&provider_key).cloned() {
+                let fmt = entry
+                    .format
+                    .as_deref()
+                    .map(|f| crate::config::resolve_provider_preset(f).0)
+                    .unwrap_or_else(|| crate::config::resolve_provider_preset(&provider_key).0);
+                let url = entry
+                    .base_url
+                    .clone()
+                    .or_else(|| crate::config::resolve_provider_preset(&provider_key).1);
+                let mdl = model_override
+                    .map(|s| s.to_string())
+                    .or(entry.model.clone())
+                    .unwrap_or_else(|| {
+                        crate::config::default_model_for_preset(&provider_key).to_string()
+                    });
+                let key = entry
+                    .api_key
+                    .as_deref()
+                    .map(crate::config::expand_env_var_or_literal)
+                    .unwrap_or_else(|| crate::config::default_api_key_for_preset(&provider_key));
+                let tier = entry
+                    .tier
+                    .as_deref()
+                    .map(crate::config::parse_tier_string)
+                    .unwrap_or(ModelTier::Standard128k);
+                (fmt, url, mdl, key, tier)
+            } else {
+                let (fmt, default_base) = crate::config::resolve_provider_preset(&provider_key);
+                let mdl = model_override.map(|s| s.to_string()).unwrap_or_else(|| {
+                    crate::config::default_model_for_preset(&provider_key).to_string()
+                });
+                let key = crate::config::default_api_key_for_preset(&provider_key);
+                (fmt, default_base, mdl, key, ModelTier::Standard128k)
+            };
+
+        let new_model_config = ModelConfig {
+            format,
+            base_url: base_url.clone(),
+            api_key: api_key.clone(),
+            model_name: model_name.clone(),
+            temperature: Some(0.2),
+            max_output_tokens: Some(4096),
+        };
+
+        // Update in-memory state
+        *self.active_provider_name.write().await = provider_key.clone();
+        *self.active_model_config.write().await = new_model_config.clone();
+        *self.model_client.write().await = ModelClient::new(new_model_config);
+
+        // Update persistent config on disk
+        cfg.active_provider = Some(provider_key.clone());
+        cfg.model = Some(model_name.clone());
+        cfg.base_url = base_url.clone();
+        cfg.provider = Some(provider_key.clone());
+        if let Some(ref m) = model_override {
+            if let Some(p) = cfg.providers.get_mut(&provider_key) {
+                p.model = Some(m.to_string());
+            }
+        }
+        if let Some(cfg_path) = crate::config::default_config_path() {
+            let _ = cfg.save_to_disk(&cfg_path);
+        }
+
+        let out = format!(
+            "[Agendex] Switched active provider to '{}'.\n  Model:    {}\n  Format:   {:?}\n  Base URL: {}\n  Tier:     {:?}",
+            provider_key,
+            model_name,
+            format,
+            base_url.as_deref().unwrap_or("<upstream default>"),
+            tier
+        );
+        Ok(out)
+    }
+
+    /// Sets the model name for the current active provider.
+    pub async fn set_provider_model(&self, model_name: &str) -> anyhow::Result<String> {
+        let active = self.active_provider_name.read().await.clone();
+        let mut model_cfg = self.active_model_config.read().await.clone();
+        model_cfg.model_name = model_name.to_string();
+
+        *self.active_model_config.write().await = model_cfg.clone();
+        *self.model_client.write().await = ModelClient::new(model_cfg);
+
+        let mut cfg = crate::config::load_default_config()
+            .unwrap_or_else(crate::config::create_default_config_with_presets);
+        if let Some(entry) = cfg.providers.get_mut(&active) {
+            entry.model = Some(model_name.to_string());
+        }
+        cfg.model = Some(model_name.to_string());
+        if let Some(cfg_path) = crate::config::default_config_path() {
+            let _ = cfg.save_to_disk(&cfg_path);
+        }
+
+        Ok(format!(
+            "[Agendex] Updated model for provider '{}' to '{}'.",
+            active, model_name
+        ))
+    }
+
+    /// Adds or updates a provider entry in the persistent configuration.
+    pub async fn add_provider(
+        &self,
+        name: &str,
+        base_url: &str,
+        model: Option<&str>,
+        format: Option<&str>,
+        api_key: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let mut cfg = crate::config::load_default_config()
+            .unwrap_or_else(crate::config::create_default_config_with_presets);
+
+        let key = name.to_lowercase();
+        let resolved_format = format.unwrap_or("openai").to_string();
+        let resolved_model = model.unwrap_or("default-model").to_string();
+        let resolved_key = api_key.unwrap_or("").to_string();
+
+        cfg.providers.insert(
+            key.clone(),
+            crate::config::ProviderConfigEntry {
+                format: Some(resolved_format.clone()),
+                base_url: Some(base_url.to_string()),
+                model: Some(resolved_model.clone()),
+                api_key: if resolved_key.is_empty() {
+                    None
+                } else {
+                    Some(resolved_key)
+                },
+                tier: Some("128k".to_string()),
+            },
+        );
+
+        if let Some(cfg_path) = crate::config::default_config_path() {
+            cfg.save_to_disk(&cfg_path)?;
+        }
+
+        Ok(format!(
+            "[Agendex] Added provider '{}' (url: {}, model: {}, format: {}).\nTo activate: '/provider switch {}'",
+            key, base_url, resolved_model, resolved_format, key
+        ))
     }
 }
 

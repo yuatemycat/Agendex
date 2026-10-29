@@ -142,3 +142,43 @@ fn test_bad_config_file_returns_error() {
         err_str
     );
 }
+
+#[test]
+fn test_cli_provider_nim_flag() {
+    let args = vec![
+        "agendex".to_string(),
+        "--provider".to_string(),
+        "nim".to_string(),
+    ];
+
+    let parsed = parse_cli_args(&args, PathBuf::from("."));
+
+    assert_eq!(parsed.config.model.format, ModelFormat::OpenAi);
+    assert_eq!(
+        parsed.config.model.base_url.as_deref(),
+        Some("https://integrate.api.nvidia.com/v1")
+    );
+    assert_eq!(
+        parsed.config.model.model_name,
+        "meta/llama-3.1-70b-instruct"
+    );
+}
+
+#[test]
+fn test_cli_provider_strata_flag() {
+    let args = vec![
+        "agendex".to_string(),
+        "--provider".to_string(),
+        "strata".to_string(),
+    ];
+
+    let parsed = parse_cli_args(&args, PathBuf::from("."));
+
+    assert_eq!(parsed.config.model.format, ModelFormat::OpenAi);
+    assert_eq!(
+        parsed.config.model.base_url.as_deref(),
+        Some("http://127.0.0.1:8080/v1")
+    );
+    assert_eq!(parsed.config.model.model_name, "huihui-swift-1.5");
+    assert_eq!(parsed.config.model.api_key, "strata");
+}

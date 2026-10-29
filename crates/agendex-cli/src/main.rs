@@ -35,10 +35,17 @@ async fn main() -> anyhow::Result<()> {
     if !parsed.json_mode {
         println!("[Agendex] Workspace: {}", config.workspace_dir.display());
         println!("[Agendex] Session ID: {}", config.session_id);
-        println!(
-            "[Agendex] Model Format: {:?} ({})",
-            config.model.format, config.model.model_name
-        );
+        if let Some(ref base) = config.model.base_url {
+            println!(
+                "[Agendex] Model: {} ({:?}) -> {}",
+                config.model.model_name, config.model.format, base
+            );
+        } else {
+            println!(
+                "[Agendex] Model: {} ({:?})",
+                config.model.model_name, config.model.format
+            );
+        }
         println!("[Agendex] Compaction Ceiling: {:?}", config.model_tier);
     }
 
@@ -148,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         if !parsed.json_mode {
-            println!("Interactive REPL. Type '/help' for skills, '/compact' to compress, or 'exit' to quit.\n");
+            println!("Interactive REPL. Type '/help' for skills, '/provider' to switch models, '/compact' to compress, or 'exit' to quit.\n");
         }
 
         loop {
