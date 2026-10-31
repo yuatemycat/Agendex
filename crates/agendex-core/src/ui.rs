@@ -87,31 +87,36 @@ pub fn print_banner(
         })
         .unwrap_or(false);
 
-    let provider_display = match lower.as_str() {
-        "nim" | "nvidia" => {
-            if is_local_endpoint {
-                "Custom Local Endpoint"
-            } else {
-                "Nvidia NIM"
+    let is_nim_endpoint = base_url
+        .map(|u| {
+            let u_low = u.to_lowercase();
+            u_low.contains("nvidia.com") || u_low.contains("nim")
+        })
+        .unwrap_or(false)
+        || display_model.to_lowercase().contains("nemotron");
+
+    let provider_display = if lower == "nim" || lower == "nvidia" || is_nim_endpoint {
+        "Nvidia NIM"
+    } else {
+        match lower.as_str() {
+            "strata" => "Strata (125B MoE Local)",
+            "proxymateur" => "Proxymateur Gateway",
+            "ollama" => "Ollama Local",
+            "gemini" => "Google Gemini",
+            "claude" => "Anthropic Claude",
+            "openai" => {
+                if is_local_endpoint {
+                    "Custom Local Endpoint"
+                } else {
+                    "OpenAI"
+                }
             }
-        }
-        "strata" => "Strata (125B MoE Local)",
-        "proxymateur" => "Proxymateur Gateway",
-        "ollama" => "Ollama Local",
-        "gemini" => "Google Gemini",
-        "claude" => "Anthropic Claude",
-        "openai" => {
-            if is_local_endpoint {
-                "Custom Local Endpoint"
-            } else {
-                "OpenAI"
-            }
-        }
-        _ => {
-            if is_local_endpoint && (provider_name.is_empty() || lower == "custom") {
-                "Custom Local Endpoint"
-            } else {
-                provider_name
+            _ => {
+                if is_local_endpoint && (provider_name.is_empty() || lower == "custom") {
+                    "Custom Local Endpoint"
+                } else {
+                    provider_name
+                }
             }
         }
     };

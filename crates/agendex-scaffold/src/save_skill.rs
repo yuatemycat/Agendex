@@ -16,6 +16,9 @@ pub struct SaveSkillArgs {
     /// Whether to permit overwriting an existing skill with the same name.
     #[serde(default)]
     pub overwrite: bool,
+    /// Whether to save globally to user directory (~/.agendex/skills) so it is available across all repositories.
+    #[serde(default)]
+    pub global: bool,
 }
 
 /// Output metadata returned after saving a skill.
@@ -77,7 +80,7 @@ pub fn format_skill_document(name: &str, description: &str, content: &str) -> St
 pub fn save_skill_tool_definition() -> serde_json::Value {
     serde_json::json!({
         "name": "save_skill",
-        "description": "Save a reusable skill to .agenda/skills/<name>/SKILL.md with user approval. Use this when a useful workflow or protocol should be persisted for future turns.",
+        "description": "Save a reusable skill to .agenda/skills/<name>/SKILL.md or globally with user approval. Use this when a useful workflow or protocol should be persisted for future turns.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -92,6 +95,10 @@ pub fn save_skill_tool_definition() -> serde_json::Value {
                 "content": {
                     "type": "string",
                     "description": "Complete markdown instructions, protocols, or guidelines"
+                },
+                "global": {
+                    "type": "boolean",
+                    "description": "Save globally to ~/.agendex/skills/ so the skill follows you across all repositories (default: false)"
                 }
             },
             "required": ["name", "description", "content"]
@@ -112,9 +119,32 @@ impl SkillSaver {
         }
     }
 
-    /// Resolve destination path for the skill (`.agenda/skills/<name>/SKILL.md`).
+    /// Resolve destination path for the skill (`.agenda/skills/<name>/SKILL.md` or `~/.agendex/skills/<name>/SKILL.md`).
     pub fn resolve_skill_path(&self, name: &str) -> anyhow::Result<PathBuf> {
+        self.resolve_skill_path_with_scope(name, false)
+    }
+
+    /// Resolve destination path for the skill with explicit global/project scope.
+    pub fn resolve_skill_path_with_scope(
+        &self,
+        name: &str,
+        global: bool,
+    ) -> anyhow::Result<PathBuf> {
         let safe_name = sanitize_skill_name(name)?;
+        if global {
+            let home = std::env::var("AGENDEX_HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .or_else(|_| std::env::var("HOME"))
+                .ok()
+                .map(PathBuf::from);
+            if let Some(h) = home {
+                return Ok(h
+                    .join(".agendex")
+                    .join("skills")
+                    .join(safe_name)
+                    .join("SKILL.md"));
+            }
+        }
         Ok(self
             .workspace_dir
             .join(".agenda")
@@ -126,7 +156,7 @@ impl SkillSaver {
     /// Save the skill directly to disk without checking approval.
     pub fn save_skill_direct(&self, args: &SaveSkillArgs) -> anyhow::Result<SaveSkillResult> {
         let safe_name = sanitize_skill_name(&args.name)?;
-        let target_path = self.resolve_skill_path(&safe_name)?;
+        let target_path = self.resolve_skill_path_with_scope(&safe_name, args.global)?;
 
         if target_path.exists() && !args.overwrite {
             anyhow::bail!(
@@ -219,6 +249,7 @@ mod tests {
             description: "Records diagnostic metrics".to_string(),
             content: "## Instructions\nRun probe and record stats.".to_string(),
             overwrite: false,
+            global: false,
         };
 
         // 1. Rejection case

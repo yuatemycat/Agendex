@@ -500,7 +500,7 @@ impl SnapshotEngine {
             String::new()
         };
 
-        let normalized_touched: Vec<String> = agent_touched_files
+        let mut normalized_touched: Vec<String> = agent_touched_files
             .iter()
             .map(|f| normalize_rel_path(f, &self.workspace_dir))
             .collect();
@@ -511,6 +511,30 @@ impl SnapshotEngine {
             .rev()
             .find(|s| s.label == turn_label)
         {
+            let start_tree = snap.tree_hash.clone();
+            // Automatically capture all files modified during the turn (including shell edits/heredocs)
+            if !start_tree.is_empty() && !end_tree_hash.is_empty() && start_tree != end_tree_hash {
+                let mut diff_cmd = Command::new("git");
+                diff_cmd
+                    .args([
+                        "diff-tree",
+                        "-r",
+                        "--no-commit-id",
+                        "--name-only",
+                        &start_tree,
+                        &end_tree_hash,
+                    ])
+                    .current_dir(&self.workspace_dir);
+                if let Ok(out) = diff_cmd.output().await {
+                    for line in String::from_utf8_lossy(&out.stdout).lines() {
+                        let norm = normalize_rel_path(line.trim(), &self.workspace_dir);
+                        if !norm.is_empty() && !normalized_touched.contains(&norm) {
+                            normalized_touched.push(norm);
+                        }
+                    }
+                }
+            }
+
             let meta = snap.metadata.get_or_insert_with(|| serde_json::json!({}));
             if let Some(obj) = meta.as_object_mut() {
                 obj.insert(
@@ -1485,6 +1509,57 @@ mod tests {
         // Verify lib.rs was restored to original content
         let restored_content = tokio::fs::read_to_string(&lib_file).await?;
         assert_eq!(restored_content, "// Original lib.rs content\n");
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_revert_succeeds_when_agent_modifies_file_via_shell_without_manual_touch_record(
+    ) -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "agendex_test_revert_shell_{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&temp_dir).await?;
+
+        let mut engine = SnapshotEngine::new(&temp_dir)?;
+
+        let target_file = temp_dir.join("src").join("main.rs");
+        tokio::fs::create_dir_all(target_file.parent().unwrap()).await?;
+        tokio::fs::write(&target_file, "// Original code\nfn main() {}\n").await?;
+
+        // Turn start
+        engine
+            .capture_snapshot_with_metadata(
+                "turn_start:1",
+                Some(serde_json::json!({
+                    "kind": "turn_start",
+                    "step_index": 1,
+                    "created_files": []
+                })),
+            )
+            .await?;
+
+        // Model modifies file via shell heredoc or script
+        tokio::fs::write(
+            &target_file,
+            "// Edited via shell heredoc\nfn main() { println!(\"1\"); }\n",
+        )
+        .await?;
+
+        // Turn completed without explicit manual touch list (simulating unindexed shell command execution)
+        engine.record_turn_completed("turn_start:1", &[]).await?;
+
+        // Rollback turn must succeed (counting shell edits as agent's own)
+        let revert_res = engine.rollback_turn().await?;
+        assert!(
+            revert_res.is_some(),
+            "Rollback must succeed for shell-modified files"
+        );
+
+        let restored = tokio::fs::read_to_string(&target_file).await?;
+        assert_eq!(restored, "// Original code\nfn main() {}\n");
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
         Ok(())

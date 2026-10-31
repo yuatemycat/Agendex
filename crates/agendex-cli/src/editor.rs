@@ -466,11 +466,7 @@ pub fn expand_file_mentions(workspace_dir: &Path, input: &str) -> String {
                     } else {
                         content
                     };
-                    let masked_preview = if clean_path.contains(".env") {
-                        agendex_trajectory::mask_secrets(&preview)
-                    } else {
-                        preview
-                    };
+                    let masked_preview = agendex_trajectory::mask_secrets(&preview);
                     attachments.push(format!(
                         "\n--- [Attached File: {}] ---\n{}\n--- [End of {}] ---",
                         clean_path, masked_preview, clean_path

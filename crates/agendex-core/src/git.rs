@@ -137,7 +137,20 @@ pub async fn commit_task_changes(
     let mut add_cmd = Command::new("git");
     add_cmd.current_dir(workspace_dir);
     if let Some(files) = target_files {
-        let valid_files: Vec<&String> = files.iter().filter(|f| !f.trim().is_empty()).collect();
+        let is_build_artifact = |f: &str| {
+            let l = f.to_lowercase();
+            l.ends_with(".pyc")
+                || l.ends_with(".pyo")
+                || l.contains("__pycache__")
+                || l.contains(".pytest_cache")
+                || l.starts_with("target/")
+                || l.contains("/target/")
+                || l.starts_with(".mypy_cache")
+        };
+        let valid_files: Vec<&String> = files
+            .iter()
+            .filter(|f| !f.trim().is_empty() && !is_build_artifact(f))
+            .collect();
         if !valid_files.is_empty() {
             add_cmd.arg("add").arg("--");
             for f in valid_files {

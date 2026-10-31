@@ -97,11 +97,14 @@ async fn test_safety_gate_denies_destructive_commands() -> anyhow::Result<()> {
         "shutdown must be a hard block, not an approvable command: {shutdown_err}"
     );
 
-    // Verify safe-list tuning for package managers and project-local rm/mv
+    // Verify safe-list tuning for package managers and project-local harmless commands
     assert!(AgendexAgent::check_command_safety("npm install express").is_ok());
     assert!(AgendexAgent::check_command_safety("pip install pytest").is_ok());
-    assert!(AgendexAgent::check_command_safety("rm -rf target/debug").is_ok());
+    assert!(AgendexAgent::check_command_safety("seq 1 10").is_ok());
+    assert!(AgendexAgent::check_command_safety("xxd -p file.bin").is_ok());
     assert!(AgendexAgent::check_command_safety("mv src/old.rs src/new.rs").is_ok());
+    // Destructive file deletions strictly require user approval
+    assert!(AgendexAgent::check_command_safety("rm -rf target/debug").is_err());
     assert!(AgendexAgent::check_command_safety("rm /etc/passwd").is_err());
     assert!(AgendexAgent::check_command_safety("mv target /etc/target").is_err());
     assert!(AgendexAgent::check_command_safety("rm -rf .").is_err());

@@ -223,7 +223,7 @@ async fn main() -> anyhow::Result<()> {
                 if !parsed.json_mode {
                     eprintln!("\n[Error]: {}\n", err);
                 }
-                return Err(err);
+                std::process::exit(1);
             }
         }
     } else {
@@ -289,6 +289,14 @@ async fn main() -> anyhow::Result<()> {
                 agendex_cli::editor::SlashCommandInfo {
                     name: "/skills".into(),
                     description: "List all discovered skills and their source paths".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/swarm".into(),
+                    description: "Spawn parallel autonomous subagent fleet".into(),
+                },
+                agendex_cli::editor::SlashCommandInfo {
+                    name: "/battle".into(),
+                    description: "Run adversarial duel between dual personas in worktrees".into(),
                 },
                 agendex_cli::editor::SlashCommandInfo {
                     name: "/mcp".into(),
@@ -521,6 +529,9 @@ async fn main() -> anyhow::Result<()> {
                                     print!("{}", flushed);
                                     let _ = io::stdout().flush();
                                 }
+                                if let Some(ref queue) = approval_queue {
+                                    queue.cancel_pending();
+                                }
                                 agent.record_interrupted_turn().await;
                                 println!(
                                     "\n  {}⚡ Turn interrupted by user (Ctrl-C). Trajectory and token cost preserved.{}",
@@ -531,6 +542,9 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     Ok(reedline::Signal::CtrlC) => {
+                        if let Some(ref queue) = approval_queue {
+                            queue.cancel_pending();
+                        }
                         println!();
                         continue;
                     }

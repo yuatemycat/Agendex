@@ -46,11 +46,15 @@ pub struct ReadFileResult {
     pub truncated: bool,
 }
 
+fn default_overwrite() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriteFileArgs {
     pub path: PathBuf,
     pub content: String,
-    #[serde(default)]
+    #[serde(default = "default_overwrite")]
     pub overwrite: bool,
     #[serde(default)]
     pub append: bool,
@@ -514,19 +518,7 @@ impl ToolRegistry {
         let mut appended = false;
 
         if exists {
-            if !args.overwrite && !args.append {
-                return Err(anyhow!(
-                    "File '{}' already exists. Specify overwrite=true to replace or append=true to append.",
-                    resolved.display()
-                ));
-            }
-
-            if args.overwrite {
-                tokio::fs::write(&resolved, args.content.as_bytes())
-                    .await
-                    .with_context(|| format!("Failed to overwrite file: {}", resolved.display()))?;
-                overwritten = true;
-            } else if args.append {
+            if args.append {
                 use tokio::io::AsyncWriteExt;
                 let mut file = tokio::fs::OpenOptions::new()
                     .append(true)
@@ -537,6 +529,16 @@ impl ToolRegistry {
                     })?;
                 file.write_all(args.content.as_bytes()).await?;
                 appended = true;
+            } else if args.overwrite {
+                tokio::fs::write(&resolved, args.content.as_bytes())
+                    .await
+                    .with_context(|| format!("Failed to overwrite file: {}", resolved.display()))?;
+                overwritten = true;
+            } else {
+                return Err(anyhow!(
+                    "File '{}' already exists and overwrite is set to false.",
+                    resolved.display()
+                ));
             }
         } else {
             tokio::fs::write(&resolved, args.content.as_bytes())
@@ -1050,7 +1052,7 @@ impl ToolRegistry {
                     "properties": {
                         "path": { "type": "string", "description": "Path to file" },
                         "content": { "type": "string", "description": "Content to write" },
-                        "overwrite": { "type": "boolean", "description": "Overwrite existing file" },
+                        "overwrite": { "type": "boolean", "description": "Overwrite existing file (defaults to true)" },
                         "append": { "type": "boolean", "description": "Append to existing file" }
                     },
                     "required": ["path", "content"]

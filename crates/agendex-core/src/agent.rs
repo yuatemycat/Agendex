@@ -256,6 +256,9 @@ impl AgendexAgent {
 
     /// Records token consumption for a user-interrupted turn (Ctrl-C) so session cost accounting remains accurate.
     pub async fn record_interrupted_turn(&self) {
+        if let Some(queue) = &self.approval_queue {
+            queue.cancel_pending();
+        }
         let p_tok = self
             .current_turn_prompt_tokens
             .load(std::sync::atomic::Ordering::SeqCst);
@@ -321,6 +324,17 @@ impl AgendexAgent {
         }
     }
 
+    fn effective_subagent_id(&self) -> &str {
+        if self.parent_id.is_some() {
+            if let Some(ref id) = self.agent_id {
+                if id != &self.config.session_id && id != "parent" {
+                    return id.as_str();
+                }
+            }
+        }
+        "parent"
+    }
+
     pub async fn request_diff_approval(&self, path: &str, diff: &str) -> DiffApprovalResult {
         self.notify_activity();
         if self.config.auto_approve_risky
@@ -339,7 +353,7 @@ impl AgendexAgent {
             };
         }
         if let Some(queue) = &self.approval_queue {
-            let agent_id = self.agent_id.as_deref().unwrap_or("parent");
+            let agent_id = self.effective_subagent_id();
             return if queue.request_diff_approval(agent_id, path, diff).await {
                 DiffApprovalResult::Approved
             } else {
@@ -400,6 +414,17 @@ impl AgendexAgent {
                 }
             }
         }
+        // Exclude ephemeral bytecode and build caches from automated commit
+        touched.retain(|f| {
+            let l = f.to_lowercase();
+            !l.ends_with(".pyc")
+                && !l.ends_with(".pyo")
+                && !l.contains("__pycache__")
+                && !l.contains(".pytest_cache")
+                && !l.starts_with("target/")
+                && !l.contains("/target/")
+                && !l.starts_with(".mypy_cache")
+        });
         let target_files = if !touched.is_empty() {
             Some(touched)
         } else {
@@ -505,16 +530,22 @@ impl AgendexAgent {
         }
     }
 
-    pub async fn process_turn(&self, user_input: &str) -> anyhow::Result<String> {
-        match self.process_turn_inner(user_input).await {
-            Ok(res) => Ok(res),
-            Err(e) => {
-                self.emit_event(crate::events::AgentEvent::Error {
-                    message: e.to_string(),
-                });
-                Err(e)
+    pub fn process_turn<'a>(
+        &'a self,
+        user_input: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            match self.process_turn_inner(user_input).await {
+                Ok(res) => Ok(res),
+                Err(e) => {
+                    self.emit_event(crate::events::AgentEvent::Error {
+                        message: e.to_string(),
+                    });
+                    Err(e)
+                }
             }
-        }
+        })
     }
 
     async fn process_turn_inner(&self, user_input: &str) -> anyhow::Result<String> {
@@ -561,6 +592,12 @@ impl AgendexAgent {
                 }
                 "/config" => {
                     return Ok(self.handle_config_command());
+                }
+                "/swarm" => {
+                    return self.handle_swarm_command(rest_args).await;
+                }
+                "/battle" => {
+                    return self.handle_battle_command(rest_args).await;
                 }
                 "/yolo" => {
                     let cur = self
@@ -1012,6 +1049,47 @@ impl AgendexAgent {
             self.current_turn_completion_tokens
                 .store(turn_completion_tokens, std::sync::atomic::Ordering::SeqCst);
 
+            // Per-turn token ceiling guard to prevent runaway spend or recursive loops
+            let max_turn_tokens: usize = std::env::var("AGENDEX_MAX_TURN_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(500_000);
+
+            if (turn_prompt_tokens + turn_completion_tokens) >= max_turn_tokens {
+                let err_msg = format!(
+                    "Per-turn token ceiling ({} tokens) exceeded to prevent runaway spend. Cumulative turn tokens: {}.",
+                    agendex_trajectory::format_comma(max_turn_tokens),
+                    agendex_trajectory::format_comma(turn_prompt_tokens + turn_completion_tokens)
+                );
+                tracing::warn!("{}", err_msg);
+                let has_known =
+                    agendex_trajectory::is_known_pricing_model(&self.config.model.model_name);
+                let est_cost = agendex_trajectory::estimate_cost(
+                    &self.config.model.model_name,
+                    turn_prompt_tokens,
+                    turn_completion_tokens,
+                );
+                {
+                    let mut traj = self.trajectory.lock().await;
+                    let _ = traj.record_token_usage(
+                        Some(turn_step_index),
+                        turn_prompt_tokens,
+                        turn_completion_tokens,
+                        est_cost,
+                        has_known,
+                    );
+                }
+                {
+                    let mut snap = self.snapshot_engine.lock().await;
+                    let touched = {
+                        let t = self.touched_files.lock().await;
+                        t.iter().cloned().collect::<Vec<_>>()
+                    };
+                    let _ = snap.record_turn_completed(&turn_label, &touched).await;
+                }
+                anyhow::bail!("{}", err_msg);
+            }
+
             // If the model emitted tool calls, execute them
             if !resp.tool_calls.is_empty() {
                 self.notify_progress(&format!(
@@ -1253,7 +1331,7 @@ impl AgendexAgent {
                     {
                         true
                     } else if let Some(queue) = &self.approval_queue {
-                        let agent_id = self.agent_id.as_deref().unwrap_or("parent");
+                        let agent_id = self.effective_subagent_id();
                         queue
                             .request_approval(agent_id, cmd_str, &risk_reason)
                             .await
@@ -1270,7 +1348,7 @@ impl AgendexAgent {
                             risk_reason
                         );
                         return format!(
-                            "Command blocked: requires user approval ({})",
+                            "Command blocked: requires user approval ({}). User explicitly declined execution. Do NOT retry this command.",
                             risk_reason
                         );
                     }
@@ -1380,7 +1458,7 @@ impl AgendexAgent {
                                 "[Tool: edit_file] Edit on '{}' declined by user.",
                                 path
                             ));
-                            return "Edit declined by user".to_string();
+                            return "Edit declined by user. Do NOT retry this edit; choose an alternative approach or ask the user for guidance.".to_string();
                         }
                         DiffApprovalResult::RejectedNonTerminal => {
                             self.notify_progress(&format!(
@@ -1429,6 +1507,12 @@ impl AgendexAgent {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
 
+                let global = tc
+                    .arguments
+                    .get("global")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
                 if name.trim().is_empty() || content.trim().is_empty() {
                     return "Failed to save skill: 'name' and 'content' parameters are required."
                         .to_string();
@@ -1440,7 +1524,7 @@ impl AgendexAgent {
                 };
 
                 let saver = agendex_scaffold::SkillSaver::new(&self.config.workspace_dir);
-                let target_path = match saver.resolve_skill_path(&safe_name) {
+                let target_path = match saver.resolve_skill_path_with_scope(&safe_name, global) {
                     Ok(p) => p,
                     Err(e) => return format!("Failed to save skill: {}", e),
                 };
@@ -1472,7 +1556,7 @@ impl AgendexAgent {
                 );
 
                 let approved = if let Some(queue) = &self.approval_queue {
-                    let agent_id = self.agent_id.as_deref().unwrap_or("parent");
+                    let agent_id = self.effective_subagent_id();
                     queue.request_approval(agent_id, &action, &reason).await
                 } else if let Some(handler) = &self.approval_handler {
                     handler(&action, &reason)
@@ -1506,6 +1590,7 @@ impl AgendexAgent {
                     description: description.to_string(),
                     content: content.to_string(),
                     overwrite: already_exists,
+                    global,
                 };
 
                 match saver.save_skill_direct(&args) {
@@ -1580,7 +1665,7 @@ impl AgendexAgent {
                                                 "[Tool: write_file] Edit on '{}' declined by user.",
                                                 path_str
                                             ));
-                                            return "Edit declined by user".to_string();
+                                            return "Edit declined by user. Do NOT retry this edit; choose an alternative approach or ask the user for guidance.".to_string();
                                         }
                                         DiffApprovalResult::RejectedNonTerminal => {
                                             self.notify_progress(&format!(
@@ -1672,7 +1757,10 @@ impl AgendexAgent {
                         let mut snap = self.snapshot_engine.lock().await;
                         let mut touched = self.touched_files.lock().await;
                         for line in String::from_utf8_lossy(&o.stdout).lines() {
-                            let trimmed = line.trim().replace('\\', "/");
+                            let trimmed = agendex_trajectory::normalize_rel_path(
+                                line.trim(),
+                                &self.config.workspace_dir,
+                            );
                             if !trimmed.is_empty() && !pre_untracked.contains(&trimmed) {
                                 snap.record_created_file(&trimmed);
                                 touched.insert(trimmed);
@@ -1688,7 +1776,10 @@ impl AgendexAgent {
                     if let Ok(o) = post_diff_out {
                         let mut touched = self.touched_files.lock().await;
                         for line in String::from_utf8_lossy(&o.stdout).lines() {
-                            let trimmed = line.trim().replace('\\', "/");
+                            let trimmed = agendex_trajectory::normalize_rel_path(
+                                line.trim(),
+                                &self.config.workspace_dir,
+                            );
                             if !trimmed.is_empty() && !pre_modified.contains(&trimmed) {
                                 touched.insert(trimmed);
                             }
@@ -1718,7 +1809,7 @@ impl AgendexAgent {
                         self.notify_progress(&format!("[Tool: {}] Completed.", tc.name));
                         let out_str =
                             serde_json::to_string_pretty(&res).unwrap_or_else(|_| "{}".to_string());
-                        if tc.name == "read_file" || tc.name == "run_command" {
+                        if tc.name == "read_file" || tc.name == "run_command" || tc.name == "grep" {
                             return agendex_trajectory::mask_secrets(&out_str);
                         }
                         out_str
@@ -2096,6 +2187,10 @@ impl AgendexAgent {
         out.push_str("  /new                 Start a fresh conversation session\n");
         out.push_str("  /resume [id]         List or resume past session trajectories\n");
         out.push_str("  /config              Display current configuration file parameters\n");
+        out.push_str("  /swarm <prompt>      Spawn autonomous specialist subagent fleet\n");
+        out.push_str(
+            "  /battle <prompt>     Run adversarial duel between dual personas in worktrees\n",
+        );
         out.push_str("  /def <symbol>        Jump to AST symbol definition in codebase\n");
         out.push_str("  /exit, /quit         Exit interactive session\n\n");
 
@@ -2127,7 +2222,7 @@ impl AgendexAgent {
             let last_cost_str = if l.has_known_cost {
                 format!("${:.4}", l.estimated_cost)
             } else {
-                "n/a".to_string()
+                "n/a (unlisted model pricing schedule)".to_string()
             };
             out.push_str(&format!(
                 "  • Last Turn Cost:    {} ({} in, {} out)\n",
@@ -2137,7 +2232,7 @@ impl AgendexAgent {
         let total_cost_str = if usage.has_known_cost {
             format!("${:.4}", usage.total_cost)
         } else {
-            "n/a".to_string()
+            "n/a (unlisted model pricing schedule)".to_string()
         };
         out.push_str(&format!(
             "  • Cumulative Cost:   {} across {} turn(s)\n",
@@ -2440,6 +2535,99 @@ impl AgendexAgent {
         Ok(format!(
             "Successfully initialized AGENTS.md and .agents/ scaffolding at {}.",
             self.config.workspace_dir.display()
+        ))
+    }
+
+    /// Handles `/swarm` command: spawns an autonomous specialist subagent in an isolated workspace.
+    pub async fn handle_swarm_command(&self, prompt: &str) -> anyhow::Result<String> {
+        let trimmed = prompt.trim();
+        if trimmed.is_empty() {
+            return Ok("Usage: /swarm <task_prompt>\nSpawns an autonomous specialist subagent to execute complex tasks in isolation.\nExample: /swarm Build a comprehensive benchmark script in tests/bench.py".to_string());
+        }
+
+        let worktree_mgr = Arc::new(crate::worktree::WorktreeManager::new(
+            self.config.workspace_dir.clone(),
+            None,
+        )?);
+        let subagent_mgr = self.create_subagent_manager(Arc::clone(&worktree_mgr));
+        let persona = crate::swarm::SubagentPersona::coder();
+
+        println!(
+            "  {}⚡ Spawning autonomous subagent '{}' for task:{} {}",
+            crate::ui::ACCENT_CYAN,
+            persona.name,
+            crate::ui::RESET,
+            trimmed
+        );
+
+        let id = subagent_mgr
+            .spawn_custom_subagent(persona, trimmed, crate::worktree::WorkspaceMode::Inherit)
+            .await?;
+
+        match subagent_mgr
+            .wait_for_subagent(&id, Some(std::time::Duration::from_secs(300)))
+            .await
+        {
+            Ok(inst) => {
+                let status_str = match inst.status {
+                    crate::swarm::SubagentStatus::Completed => "Completed",
+                    crate::swarm::SubagentStatus::Failed => "Failed",
+                    _ => "Other",
+                };
+                let res_text = inst
+                    .result
+                    .unwrap_or_else(|| inst.error.unwrap_or_default());
+                Ok(format!(
+                    "Subagent [{}] finished ({}):\n{}",
+                    inst.id, status_str, res_text
+                ))
+            }
+            Err(e) => Ok(format!("Subagent [{}] error: {}", id, e)),
+        }
+    }
+
+    /// Handles `/battle` command: pits dual subagents in adversarial duel in isolated worktrees.
+    pub async fn handle_battle_command(&self, prompt: &str) -> anyhow::Result<String> {
+        let trimmed = prompt.trim();
+        if trimmed.is_empty() {
+            return Ok("Usage: /battle <task_prompt>\nPits two rival agent implementations against each other in isolated git worktrees, runs automated verification, and applies the winner's diff.\nExample: /battle Optimize the slugify regex with benchmark assertion".to_string());
+        }
+
+        let worktree_mgr = Arc::new(crate::worktree::WorktreeManager::new(
+            self.config.workspace_dir.clone(),
+            None,
+        )?);
+        let subagent_mgr = Arc::new(self.create_subagent_manager(Arc::clone(&worktree_mgr)));
+        let arena = crate::battle::BattleArena::new(subagent_mgr, worktree_mgr);
+
+        let config = crate::battle::BattleDuelConfig {
+            task_prompt: trimmed.to_string(),
+            combatant_a: crate::swarm::SubagentPersona::coder(),
+            combatant_b: crate::swarm::SubagentPersona::coder(),
+            verification_cmd: None,
+            workspace_mode: crate::worktree::WorkspaceMode::Share,
+            timeout: Some(std::time::Duration::from_secs(300)),
+            apply_winner: true,
+            cleanup_worktrees: true,
+        };
+
+        println!(
+            "  {}⚔️ Entering Colosseum Battle Arena: Dual combatants competing on:{} {}",
+            crate::ui::ACCENT_AMBER,
+            crate::ui::RESET,
+            trimmed
+        );
+
+        let report = arena.duel(config).await?;
+        Ok(format!(
+            "✦ Battle Duel Complete ✦\nVerdict: {:?}\nRationale: {}\nA: {} ({:?})\nB: {} ({:?})\nApplied To Parent: {}",
+            report.verdict,
+            report.rationale,
+            report.combatant_a.persona_name,
+            report.combatant_a.execution_duration,
+            report.combatant_b.persona_name,
+            report.combatant_b.execution_duration,
+            report.applied_to_parent
         ))
     }
 

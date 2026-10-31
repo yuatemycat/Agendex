@@ -144,6 +144,7 @@ enum ConsoleRequest {
 enum ConsoleEvent {
     Request(ConsoleRequest),
     Line(String),
+    CancelPending,
     Eof,
 }
 
@@ -433,6 +434,31 @@ impl SharedApprovalQueue {
                                 let _ = responder.send(Some(input));
                             }
                         }
+                        ConsoleEvent::CancelPending => {
+                            if let Some(ticket) = active_approval.take() {
+                                match ticket {
+                                    ActiveApproval::Command { tx, .. } => {
+                                        let _ = tx.send(false);
+                                    }
+                                    ActiveApproval::Diff { tx, .. } => {
+                                        let _ = tx.send(false);
+                                    }
+                                }
+                            }
+                            while let Some(req) = pending_approvals.pop_front() {
+                                match req {
+                                    ConsoleRequest::Approval { responder, .. } => {
+                                        let _ = responder.send(false);
+                                    }
+                                    ConsoleRequest::DiffApproval { responder, .. } => {
+                                        let _ = responder.send(false);
+                                    }
+                                    ConsoleRequest::ReadLine { responder, .. } => {
+                                        let _ = responder.send(None);
+                                    }
+                                }
+                            }
+                        }
                         ConsoleEvent::Eof => {
                             if let Some(ticket) = active_approval.take() {
                                 match ticket {
@@ -488,11 +514,13 @@ impl SharedApprovalQueue {
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Cancels and clears all active and pending approvals (e.g. on Ctrl-C interruption).
+    pub fn cancel_pending(&self) {
+        let _ = self.sender.send(ConsoleEvent::CancelPending);
+    }
+
     /// Asynchronously wait for user approval ticket without blocking the async runtime
     pub async fn request_approval(&self, subagent_id: &str, command: &str, reason: &str) -> bool {
-        if self.is_paused.load(std::sync::atomic::Ordering::SeqCst) {
-            return true;
-        }
         if self.allowed_commands.lock().unwrap().contains(command) {
             return true;
         }
@@ -514,9 +542,6 @@ impl SharedApprovalQueue {
 
     /// Asynchronously wait for user approval on proposed file diff
     pub async fn request_diff_approval(&self, subagent_id: &str, path: &str, diff: &str) -> bool {
-        if self.is_paused.load(std::sync::atomic::Ordering::SeqCst) {
-            return true;
-        }
         if self.allowed_diffs.lock().unwrap().contains(path) {
             return true;
         }

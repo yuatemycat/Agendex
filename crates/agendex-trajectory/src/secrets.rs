@@ -76,6 +76,15 @@ fn is_safe_assignment(key: &str, val: &str) -> bool {
     false
 }
 
+fn is_sensitive_value(val: &str) -> bool {
+    let v_lower = val.to_lowercase();
+    let trimmed = v_lower.trim_matches(|c| c == '"' || c == '\'');
+    if trimmed.len() < 6 {
+        return false;
+    }
+    trimmed.contains("secret") || trimmed.contains("password") || trimmed.contains("passwd")
+}
+
 fn is_sensitive_key_name(k: &str) -> bool {
     let k_lower = k.to_lowercase();
     // Exclusions
@@ -181,23 +190,41 @@ pub fn mask_secrets(input: &str) -> String {
     let mut result = input.to_string();
 
     // 1. Specific API key patterns (OpenAI, Anthropic, Nvidia NIM, Google, GitHub, AWS, Slack, Bearer, JWT, PEM)
-    // sk- keys (OpenAI & Anthropic & general, excluding package/tool names like sk-learn or sk-docs-generator-tool)
+    // sk- keys (OpenAI & Anthropic & general, excluding package names like sk-learn or multi-hyphen tool names like sk-docs-generator-tool)
     static SK_REGEX: OnceLock<Regex> = OnceLock::new();
     let sk_re =
         SK_REGEX.get_or_init(|| Regex::new(r"(?i)\b(sk-(?:ant-)?[a-zA-Z0-9_\-]{8,})\b").unwrap());
     result = sk_re
         .replace_all(&result, |caps: &regex::Captures| {
             let tok = &caps[1];
-            // If the token consists solely of lowercase letters, hyphens, and underscores,
-            // with NO digits and NO uppercase letters, it is a kebab-case tool/package identifier
-            // (e.g. sk-learn, sk-docs-generator-tool, sk-image, sk-build, etc.)
+            let lower = tok.to_lowercase();
+            let after = if let Some(stripped) = lower.strip_prefix("sk-ant-") {
+                stripped
+            } else if let Some(stripped) = lower.strip_prefix("sk-") {
+                stripped
+            } else {
+                &lower
+            };
+
+            // 1. Spared: well-known Python machine learning package prefixes
+            if after.starts_with("learn")
+                || after.starts_with("image")
+                || after.starts_with("opt")
+                || after.starts_with("spatial")
+                || after.starts_with("build")
+            {
+                return tok.to_string();
+            }
+
+            // 2. Spared: multi-hyphen kebab-case tool/module identifiers with no digits and no uppercase (e.g. sk-docs-generator-tool)
             let has_digit = tok.chars().any(|c| c.is_ascii_digit());
             let has_uppercase = tok.chars().any(|c| c.is_ascii_uppercase());
-            if !has_digit && !has_uppercase {
-                tok.to_string()
-            } else {
-                "[REDACTED]".to_string()
+            if !has_digit && !has_uppercase && after.contains('-') {
+                return tok.to_string();
             }
+
+            // Otherwise, bare random letters (e.g. sk-abcdefghij) or tokens with digits/mixed case are masked
+            "[REDACTED]".to_string()
         })
         .to_string();
 
@@ -250,26 +277,35 @@ pub fn mask_secrets(input: &str) -> String {
         .to_string();
 
     // 2. Unanchored inline secret key-value assignments (e.g. DB_PASSWORD=xxx, API_KEY=xxx)
+    // Preserves whitespace and surrounding quotes verbatim to avoid reformatting display/logs
     static INLINE_ASSIGN_REGEX: OnceLock<Regex> = OnceLock::new();
-    let inline_re = INLINE_ASSIGN_REGEX
-        .get_or_init(|| Regex::new(r#"([A-Za-z0-9_]+)\s*=\s*["']?([^"'\s;&|]{3,})["']?"#).unwrap());
+    let inline_re = INLINE_ASSIGN_REGEX.get_or_init(|| {
+        Regex::new(r#"(\b[A-Za-z0-9_]+\s*=\s*["']?)([^"'\s;&|\r\n]+)(["']?)"#).unwrap()
+    });
     result = inline_re
         .replace_all(&result, |caps: &regex::Captures| {
-            let key = &caps[1];
+            let prefix = &caps[1];
             let val = &caps[2];
-            if is_sensitive_key_name(key) && !is_safe_assignment(key, val) {
-                format!("{}=[REDACTED]", key)
+            let suffix = &caps[3];
+            let key = prefix
+                .trim_start()
+                .trim_end_matches(|c| c == '=' || c == ' ' || c == '\t' || c == '"' || c == '\'')
+                .trim();
+            if (is_sensitive_key_name(key) || is_sensitive_value(val))
+                && !is_safe_assignment(key, val)
+            {
+                format!("{}[REDACTED]{}", prefix, suffix)
             } else {
                 caps[0].to_string()
             }
         })
         .to_string();
 
-    // 3. .env file line assignments (e.g. MY_CUSTOM=..., DB_PASSWORD=...)
+    // 3. .env file line assignments (e.g. MY_CUSTOM=abc123secretvalue, DB_PASSWORD=...)
     static ENV_REGEX: OnceLock<Regex> = OnceLock::new();
     let env_re = ENV_REGEX.get_or_init(|| {
         Regex::new(
-            r#"(?m)^(\s*(?:export\s+)?([A-Za-z0-9_]{2,})\s*=\s*["']?)([^"'\r\n\s#]{3,})(["']?.*)$"#,
+            r#"(?m)^(\s*(?:export\s+)?([A-Za-z0-9_]{2,})\s*=\s*["']?)([^"'\r\n\s#]+)(["']?.*)$"#,
         )
         .unwrap()
     });
@@ -280,7 +316,9 @@ pub fn mask_secrets(input: &str) -> String {
             let key = &caps[2];
             let val = &caps[3];
             let suffix = &caps[4];
-            if is_sensitive_key_name(key) && !is_safe_assignment(key, val) {
+            if (is_sensitive_key_name(key) || is_sensitive_value(val))
+                && !is_safe_assignment(key, val)
+            {
                 format!("{}[REDACTED]{}", prefix, suffix)
             } else {
                 caps[0].to_string()
@@ -288,17 +326,44 @@ pub fn mask_secrets(input: &str) -> String {
         })
         .to_string();
 
-    // 4. JSON secret fields (e.g., "api_key": "...")
+    // 4. YAML colon assignments (e.g. password: hunter2pass, api_key: "xxx")
+    static YAML_FIELD_REGEX: OnceLock<Regex> = OnceLock::new();
+    let yaml_re = YAML_FIELD_REGEX.get_or_init(|| {
+        Regex::new(r#"(?m)^(\s*["']?([A-Za-z0-9_\-]+)["']?\s*:\s*["']?)([^"'\r\n\s#]+)(["']?\s*)$"#)
+            .unwrap()
+    });
+
+    result = yaml_re
+        .replace_all(&result, |caps: &regex::Captures| {
+            let prefix = &caps[1];
+            let key = &caps[2];
+            let val = &caps[3];
+            let suffix = &caps[4];
+            if (is_sensitive_key_name(key) || is_sensitive_value(val))
+                && !is_safe_assignment(key, val)
+            {
+                format!("{}[REDACTED]{}", prefix, suffix)
+            } else {
+                caps[0].to_string()
+            }
+        })
+        .to_string();
+
+    // 5. JSON secret fields (e.g., "api_key": "...")
     static JSON_FIELD_REGEX: OnceLock<Regex> = OnceLock::new();
     let json_re = JSON_FIELD_REGEX
-        .get_or_init(|| Regex::new(r#"(?i)"([A-Za-z0-9_\-]+)"\s*:\s*"([^"]{4,})""#).unwrap());
+        .get_or_init(|| Regex::new(r#"(?i)("([A-Za-z0-9_\-]+)"\s*:\s*")([^"]+)(")"#).unwrap());
 
     result = json_re
         .replace_all(&result, |caps: &regex::Captures| {
-            let field = &caps[1];
-            let val = &caps[2];
-            if is_sensitive_key_name(field) && !is_safe_assignment(field, val) {
-                format!(r#""{}": "[REDACTED]""#, field)
+            let prefix = &caps[1];
+            let field = &caps[2];
+            let val = &caps[3];
+            let suffix = &caps[4];
+            if (is_sensitive_key_name(field) || is_sensitive_value(val))
+                && !is_safe_assignment(field, val)
+            {
+                format!("{}[REDACTED]{}", prefix, suffix)
             } else {
                 caps[0].to_string()
             }
@@ -560,5 +625,33 @@ edition = "2021"
         assert!(key_masked.contains("[REDACTED]"));
         assert!(!key_masked.contains("sk-FAKEsevenTestKey"));
         assert!(!key_masked.contains("nvapi-FAKEfiveTestKey"));
+    }
+
+    #[test]
+    fn test_specific_secret_patterns_and_format_preservation() {
+        // 1. MY_CUSTOM=abc123secretvalue must be masked
+        let custom_env = "MY_CUSTOM=abc123secretvalue\nPORT=8080\n";
+        let masked_custom = mask_secrets(custom_env);
+        assert!(masked_custom.contains("MY_CUSTOM=[REDACTED]"));
+        assert!(masked_custom.contains("PORT=8080"));
+
+        // 2. Bare sk-abcdefghij must be masked
+        let bare_sk = "OpenAI key: sk-abcdefghij in config";
+        let masked_bare = mask_secrets(bare_sk);
+        assert_eq!(masked_bare, "OpenAI key: [REDACTED] in config");
+
+        // 3. YAML password: hunter2pass must be masked
+        let yaml_content = "username: admin\npassword: hunter2pass\n";
+        let masked_yaml = mask_secrets(yaml_content);
+        assert_eq!(masked_yaml, "username: admin\npassword: [REDACTED]\n");
+
+        // 4. Whitespace and quotes preservation (no stripping)
+        let quoted_line = "api_key = \"x\"";
+        let masked_quoted = mask_secrets(quoted_line);
+        assert_eq!(masked_quoted, "api_key = \"[REDACTED]\"");
+
+        let single_quoted = "secret_key = 'super_secret'";
+        let masked_single = mask_secrets(single_quoted);
+        assert_eq!(masked_single, "secret_key = '[REDACTED]'");
     }
 }

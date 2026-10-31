@@ -197,7 +197,7 @@ where
     F: Fn() -> reqwest::RequestBuilder,
 {
     let mut attempts = 0;
-    let max_attempts = 3;
+    let max_attempts = 5;
     let mut backoff = std::time::Duration::from_secs(1);
 
     loop {
@@ -214,8 +214,34 @@ where
                     || status == reqwest::StatusCode::GATEWAY_TIMEOUT)
                     && attempts < max_attempts
                 {
-                    tokio::time::sleep(backoff).await;
-                    backoff *= 2;
+                    let sleep_duration = resp
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|h| h.to_str().ok())
+                        .and_then(|s| {
+                            if let Ok(secs) = s.trim().parse::<u64>() {
+                                Some(std::time::Duration::from_secs(secs))
+                            } else if let Ok(secs_f) = s.trim().parse::<f64>() {
+                                Some(std::time::Duration::from_millis((secs_f * 1000.0) as u64))
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(backoff)
+                        .clamp(
+                            std::time::Duration::from_millis(500),
+                            std::time::Duration::from_secs(60),
+                        );
+
+                    tracing::warn!(
+                        "Provider returned HTTP {} (attempt {}/{}). Retrying after {:?}...",
+                        status,
+                        attempts,
+                        max_attempts,
+                        sleep_duration
+                    );
+                    tokio::time::sleep(sleep_duration).await;
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
                     continue;
                 }
                 return Ok(resp);
@@ -228,8 +254,15 @@ where
                     ));
                 }
                 if attempts < max_attempts {
+                    tracing::warn!(
+                        "Provider request transport error (attempt {}/{}): {}. Retrying in {:?}...",
+                        attempts,
+                        max_attempts,
+                        e,
+                        backoff
+                    );
                     tokio::time::sleep(backoff).await;
-                    backoff *= 2;
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
                     continue;
                 }
                 return Err(e.into());
@@ -284,14 +317,55 @@ impl ModelClient {
         tools: &[Value],
         on_token: Option<TokenStreamHandler>,
     ) -> anyhow::Result<ModelResponse> {
-        match self.config.format {
-            ModelFormat::GoogleGemini => {
-                self.chat_gemini_streaming(messages, tools, on_token).await
-            }
-            ModelFormat::OpenAi => self.chat_openai_streaming(messages, tools, on_token).await,
-            ModelFormat::Anthropic => {
-                self.chat_anthropic_streaming(messages, tools, on_token)
-                    .await
+        let mut stream_attempts = 0;
+        let max_stream_attempts = 3;
+        let mut stream_backoff = std::time::Duration::from_millis(1500);
+
+        loop {
+            stream_attempts += 1;
+            let res = match self.config.format {
+                ModelFormat::GoogleGemini => {
+                    self.chat_gemini_streaming(messages, tools, on_token.clone())
+                        .await
+                }
+                ModelFormat::OpenAi => {
+                    self.chat_openai_streaming(messages, tools, on_token.clone())
+                        .await
+                }
+                ModelFormat::Anthropic => {
+                    self.chat_anthropic_streaming(messages, tools, on_token.clone())
+                        .await
+                }
+            };
+
+            match res {
+                Ok(resp) => return Ok(resp),
+                Err(err) => {
+                    let err_msg = err.to_string();
+                    let is_broken_stream = (err_msg.contains("connection closed")
+                        || err_msg.contains("channel closed")
+                        || err_msg.contains("broken pipe")
+                        || err_msg.contains("stream ended prematurely")
+                        || err_msg.contains("Connection reset by peer")
+                        || err_msg.contains("error reading a body from connection")
+                        || err_msg.contains("unexpected end of file")
+                        || err_msg.contains("incomplete message")
+                        || err_msg.contains("stream error"))
+                        && !err_msg.contains("Stream read timed out");
+
+                    if is_broken_stream && stream_attempts < max_stream_attempts {
+                        tracing::warn!(
+                            "Streaming connection interrupted halfway (attempt {}/{}): {}. Retrying request...",
+                            stream_attempts,
+                            max_stream_attempts,
+                            err_msg
+                        );
+                        tokio::time::sleep(stream_backoff).await;
+                        stream_backoff *= 2;
+                        continue;
+                    }
+                    return Err(err);
+                }
             }
         }
     }

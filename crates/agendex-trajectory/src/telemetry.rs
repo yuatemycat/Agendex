@@ -56,7 +56,14 @@ impl SessionUsage {
 /// Returns true if the model has a known pricing schedule.
 pub fn is_known_pricing_model(model_name: &str) -> bool {
     let lower = model_name.to_lowercase();
-    lower.contains("gemini-") || lower.contains("gpt-") || lower.contains("claude-")
+    lower.contains("gemini-")
+        || lower.contains("gpt-")
+        || lower.contains("claude-")
+        || lower.contains("nemotron")
+        || lower.contains("llama-3")
+        || lower.contains("mistral")
+        || lower.contains("deepseek")
+        || lower.contains("qwen")
 }
 
 /// Estimates dollar cost based on model name and token volume.
@@ -107,6 +114,33 @@ pub fn estimate_cost_optional(
         m if m.contains("claude-3-opus") => {
             // $15.00 / 1M prompt, $75.00 / 1M completion
             (0.00001500, 0.00007500)
+        }
+        m if m.contains("nemotron") => {
+            // Nvidia NIM Nemotron ($0.70 / 1M prompt, $2.80 / 1M completion)
+            (0.00000070, 0.00000280)
+        }
+        m if m.contains("llama-3.1-70b")
+            || m.contains("llama-3.3-70b")
+            || m.contains("llama-3-70b") =>
+        {
+            // Cloud / NIM 70B ($0.70 / 1M prompt, $2.80 / 1M completion)
+            (0.00000070, 0.00000280)
+        }
+        m if m.contains("llama-3.1-8b") || m.contains("llama-3-8b") => {
+            // Cloud / NIM 8B ($0.15 / 1M prompt, $0.60 / 1M completion)
+            (0.00000015, 0.00000060)
+        }
+        m if m.contains("deepseek") => {
+            // DeepSeek V3 / R1 ($0.27 / 1M prompt, $1.10 / 1M completion)
+            (0.00000027, 0.00000110)
+        }
+        m if m.contains("qwen") => {
+            // Qwen 2.5 72B ($0.35 / 1M prompt, $1.40 / 1M completion)
+            (0.00000035, 0.00000140)
+        }
+        m if m.contains("mistral") => {
+            // Mistral Large ($2.00 / 1M prompt, $6.00 / 1M completion)
+            (0.00000200, 0.00000600)
         }
         _ => return None,
     };
@@ -165,10 +199,10 @@ mod tests {
 
     #[test]
     fn test_unknown_models_default_to_zero_cost() {
-        assert!(!is_known_pricing_model("meta/llama-3.1-70b-instruct"));
-        assert!(!is_known_pricing_model("ollama/mistral"));
-        assert!(estimate_cost_optional("meta/llama-3.1-70b-instruct", 1000, 500).is_none());
-        assert_eq!(estimate_cost("meta/llama-3.1-70b-instruct", 1000, 500), 0.0);
+        assert!(is_known_pricing_model("nvidia/nemotron-4-340b-instruct"));
+        assert!(!is_known_pricing_model("my-private-model-v1"));
+        assert!(estimate_cost_optional("my-private-model-v1", 1000, 500).is_none());
+        assert_eq!(estimate_cost("my-private-model-v1", 1000, 500), 0.0);
 
         let turn = TokenUsage::new(1000, 500, 0.0, false);
         let mut session = SessionUsage::default();
