@@ -246,13 +246,25 @@ impl AgendexConfigFile {
 /// falling back to the literal string if not referencing an environment variable.
 pub fn expand_env_var_or_literal(val: &str) -> String {
     let trimmed = val.trim();
-    if trimmed.starts_with("${") && trimmed.ends_with('}') && trimmed.len() > 3 {
-        let var_name = &trimmed[2..trimmed.len() - 1];
-        std::env::var(var_name).unwrap_or_default()
-    } else if let Some(var_name) = trimmed.strip_prefix('$') {
-        std::env::var(var_name).unwrap_or_default()
-    } else if let Some(var_name) = trimmed.strip_prefix("env:") {
-        std::env::var(var_name).unwrap_or_default()
+    let var_name = if trimmed.starts_with("${") && trimmed.ends_with('}') && trimmed.len() > 3 {
+        Some(&trimmed[2..trimmed.len() - 1])
+    } else if let Some(stripped) = trimmed.strip_prefix('$') {
+        Some(stripped)
+    } else if let Some(stripped) = trimmed.strip_prefix("env:") {
+        Some(stripped)
+    } else {
+        None
+    };
+
+    if let Some(name) = var_name {
+        if let Ok(v) = std::env::var(name) {
+            if !v.is_empty() {
+                return v;
+            }
+        }
+        // Try reloading .env in case it was written or loaded under a new config path
+        load_agendex_env();
+        std::env::var(name).unwrap_or_default()
     } else {
         trimmed.to_string()
     }
@@ -339,6 +351,7 @@ pub struct ParsedProviderAddArgs {
 
 /// Returns true if a command-line token represents an API key or credential reference.
 pub fn is_likely_key_token(token: &str) -> bool {
+    let t_lower = token.to_lowercase();
     token.starts_with("sk-")
         || token.starts_with("nvapi-")
         || token.starts_with("AIza")
@@ -347,6 +360,12 @@ pub fn is_likely_key_token(token: &str) -> bool {
         || token.starts_with("github_pat_")
         || token.starts_with("AKIA")
         || token.starts_with("xox")
+        || token.starts_with("hf_")
+        || token.starts_with("gsk_")
+        || t_lower.contains("key")
+        || t_lower.contains("secret")
+        || t_lower.contains("token")
+        || t_lower.contains("fake")
         || agendex_trajectory::mask_secrets(token).contains("[REDACTED]")
 }
 
@@ -381,9 +400,12 @@ pub fn parse_provider_add_tokens(parts: &[&str]) -> Option<ParsedProviderAddArgs
             } else if explicit_url.is_none() {
                 // E.g. `/provider add nim my-secret-token`
                 (None, Some(tok.to_string()))
-            } else {
-                // E.g. `/provider add custom-vllm http://127.0.0.1:8000/v1 custom-model`
+            } else if tok.contains('/') || tok.contains(':') {
+                // E.g. `/provider add custom-vllm http://127.0.0.1:8000/v1 meta-llama/Llama-3-8B`
                 (Some(tok.to_string()), None)
+            } else {
+                // 5-part syntax `/provider add <name> <url> <key>` (e.g. plainFAKEkey5arg)
+                (None, Some(tok.to_string()))
             }
         }
         2 => {
@@ -457,8 +479,26 @@ pub fn parse_tier_string(val: &str) -> ModelTier {
     }
 }
 
-/// Returns the standard path to `~/.agendex/.env`, honoring `AGENDEX_HOME` or system home.
+/// Returns the standard path to `~/.agendex/.env`, honoring AGENDEX_ENV, AGENDEX_CONFIG, `AGENDEX_HOME` or system home.
 pub fn agendex_env_path() -> Option<PathBuf> {
+    if let Ok(env_override) = std::env::var("AGENDEX_ENV") {
+        if !env_override.trim().is_empty() {
+            return Some(PathBuf::from(env_override.trim()));
+        }
+    }
+    if let Ok(env_override) = std::env::var("AGENDEX_ENV_PATH") {
+        if !env_override.trim().is_empty() {
+            return Some(PathBuf::from(env_override.trim()));
+        }
+    }
+    if let Some(cfg_path) = default_config_path() {
+        if let Some(parent) = cfg_path.parent() {
+            let env_candidate = parent.join(".env");
+            if env_candidate.exists() || !parent.as_os_str().is_empty() {
+                return Some(env_candidate);
+            }
+        }
+    }
     if let Ok(home) = std::env::var("AGENDEX_HOME") {
         if !home.trim().is_empty() {
             return Some(PathBuf::from(home).join(".agendex").join(".env"));
@@ -470,22 +510,38 @@ pub fn agendex_env_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".agendex").join(".env"))
 }
 
-/// Loads key-value environment variables from `~/.agendex/.env` into the process environment.
+/// Loads key-value environment variables from `.env` files into the process environment.
 pub fn load_agendex_env() {
+    let mut paths_to_load = Vec::new();
+    // 1. Base home .env if available
+    if let Ok(home) = std::env::var("AGENDEX_HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .or_else(|_| std::env::var("HOME"))
+    {
+        let home_env = PathBuf::from(home).join(".agendex").join(".env");
+        if home_env.exists() {
+            paths_to_load.push(home_env);
+        }
+    }
+    // 2. Active agendex_env_path() (e.g. adjacent to active config)
     if let Some(path) = agendex_env_path() {
-        if path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                for line in content.lines() {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() || trimmed.starts_with('#') {
-                        continue;
-                    }
-                    if let Some((k, v)) = trimmed.split_once('=') {
-                        let k = k.trim().trim_start_matches("export").trim();
-                        let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
-                        if !k.is_empty() {
-                            std::env::set_var(k, v);
-                        }
+        if !paths_to_load.contains(&path) && path.exists() {
+            paths_to_load.push(path);
+        }
+    }
+
+    for path in paths_to_load {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                if let Some((k, v)) = trimmed.split_once('=') {
+                    let k = k.trim().trim_start_matches("export").trim();
+                    let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
+                    if !k.is_empty() {
+                        std::env::set_var(k, v);
                     }
                 }
             }

@@ -18,6 +18,7 @@ pub struct CliParsedArgs {
     pub json_mode: bool,
     pub git_commit: bool,
     pub git_branch: Option<String>,
+    pub provider: Option<String>,
 }
 
 pub fn parse_cli_args(args: &[String], current_dir: PathBuf) -> CliParsedArgs {
@@ -39,12 +40,16 @@ pub fn try_parse_cli_args(args: &[String], current_dir: PathBuf) -> anyhow::Resu
     let mut json_mode = false;
     let mut git_commit = false;
     let mut git_branch: Option<String> = None;
+    let mut provider: Option<String> = None;
 
     // First scan for an explicit --config flag
     let mut explicit_config_path: Option<PathBuf> = None;
     for (i, arg) in args.iter().enumerate() {
         if arg == "--config" && i + 1 < args.len() {
-            explicit_config_path = Some(PathBuf::from(&args[i + 1]));
+            let p = PathBuf::from(&args[i + 1]);
+            std::env::set_var("AGENDEX_CONFIG", &p);
+            explicit_config_path = Some(p);
+            agendex_core::config::load_agendex_env();
             break;
         }
     }
@@ -99,6 +104,7 @@ pub fn try_parse_cli_args(args: &[String], current_dir: PathBuf) -> anyhow::Resu
             "--format" | "--provider" => {
                 if i + 1 < args.len() {
                     let val = args[i + 1].to_lowercase();
+                    provider = Some(val.clone());
                     if let Some(ref cfg) = loaded_cfg {
                         if let Some(entry) = cfg.providers.get(&val) {
                             if let Some(ref m) = entry.model {
@@ -225,5 +231,6 @@ pub fn try_parse_cli_args(args: &[String], current_dir: PathBuf) -> anyhow::Resu
         json_mode,
         git_commit,
         git_branch,
+        provider,
     })
 }

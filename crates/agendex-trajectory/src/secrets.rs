@@ -103,12 +103,14 @@ fn is_secret_json_key(k: &str) -> bool {
     let exact = [
         "api_key",
         "apikey",
+        "key",
         "secret",
         "secret_key",
         "client_secret",
         "access_token",
         "refresh_token",
         "auth_token",
+        "token",
         "private_key",
         "password",
         "passwd",
@@ -142,15 +144,32 @@ pub fn mask_secrets(input: &str) -> String {
     let mut result = input.to_string();
 
     // 1. Specific API key patterns (OpenAI, Anthropic, Nvidia NIM, Google, GitHub, AWS, Slack, Bearer, JWT, PEM)
+    // sk- keys (OpenAI & Anthropic & general, excluding common Python packages like sk-learn)
+    static SK_REGEX: OnceLock<Regex> = OnceLock::new();
+    let sk_re =
+        SK_REGEX.get_or_init(|| Regex::new(r"(?i)\b(sk-(?:ant-)?[a-zA-Z0-9_\-]{8,})\b").unwrap());
+    result = sk_re
+        .replace_all(&result, |caps: &regex::Captures| {
+            let tok = &caps[1];
+            let lower = tok.to_lowercase();
+            if lower.starts_with("sk-learn")
+                || lower.starts_with("sk-image")
+                || lower.starts_with("sk-opt")
+                || lower.starts_with("sk-spatial")
+                || lower.starts_with("sk-build")
+            {
+                tok.to_string()
+            } else {
+                "[REDACTED]".to_string()
+            }
+        })
+        .to_string();
+
     static KEY_REGEXES: OnceLock<Vec<Regex>> = OnceLock::new();
     let key_regexes = KEY_REGEXES.get_or_init(|| {
         vec![
-            // Anthropic keys
-            Regex::new(r"(?i)\b(sk-ant-[a-zA-Z0-9_\-]{3,})\b").unwrap(),
-            // OpenAI & general sk- keys
-            Regex::new(r"(?i)\b(sk-[a-zA-Z0-9_\-]{3,})\b").unwrap(),
             // Nvidia NIM keys
-            Regex::new(r"(?i)\b(nvapi-[a-zA-Z0-9_\-]{3,})\b").unwrap(),
+            Regex::new(r"(?i)\b(nvapi-[a-zA-Z0-9_\-]{8,})\b").unwrap(),
             // Google AIza keys
             Regex::new(r"\b(AIza[0-9A-Za-z\-_]{35})\b").unwrap(),
             // GitHub tokens
@@ -469,5 +488,20 @@ EMPTY_VAL=
         assert_eq!(out4, "");
         let out5 = filter.flush();
         assert_eq!(out5, "Normal text without newline");
+    }
+
+    #[test]
+    fn test_sk_learn_not_masked_while_keys_are_masked() {
+        // Python libraries and package identifiers must NOT be redacted
+        let pkg_text = "Install sk-learn and sk-image or scikit-learn for machine learning.";
+        let pkg_masked = mask_secrets(pkg_text);
+        assert_eq!(pkg_masked, pkg_text);
+
+        // Real and mock API keys must still be properly redacted
+        let key_text = "API keys: sk-FAKEsevenTestKey and nvapi-FAKEfiveTestKey";
+        let key_masked = mask_secrets(key_text);
+        assert!(key_masked.contains("[REDACTED]"));
+        assert!(!key_masked.contains("sk-FAKEsevenTestKey"));
+        assert!(!key_masked.contains("nvapi-FAKEfiveTestKey"));
     }
 }

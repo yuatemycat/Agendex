@@ -76,15 +76,44 @@ pub fn print_banner(
         model_name
     };
     let lower = provider_name.to_lowercase();
+    let is_local_endpoint = base_url
+        .map(|u| {
+            let u_low = u.to_lowercase();
+            u_low.contains("127.0.0.1")
+                || u_low.contains("localhost")
+                || u_low.contains("0.0.0.0")
+                || u_low.starts_with("http://192.168.")
+                || u_low.starts_with("http://10.")
+        })
+        .unwrap_or(false);
+
     let provider_display = match lower.as_str() {
-        "nim" | "nvidia" => "Nvidia NIM",
+        "nim" | "nvidia" => {
+            if is_local_endpoint {
+                "Custom Local Endpoint"
+            } else {
+                "Nvidia NIM"
+            }
+        }
         "strata" => "Strata (125B MoE Local)",
         "proxymateur" => "Proxymateur Gateway",
         "ollama" => "Ollama Local",
         "gemini" => "Google Gemini",
         "claude" => "Anthropic Claude",
-        "openai" => "OpenAI",
-        _ => provider_name,
+        "openai" => {
+            if is_local_endpoint {
+                "Custom Local Endpoint"
+            } else {
+                "OpenAI"
+            }
+        }
+        _ => {
+            if is_local_endpoint && (provider_name.is_empty() || lower == "custom") {
+                "Custom Local Endpoint"
+            } else {
+                provider_name
+            }
+        }
     };
 
     println!();

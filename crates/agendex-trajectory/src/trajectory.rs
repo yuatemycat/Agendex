@@ -457,12 +457,14 @@ impl TrajectoryLogger {
             let mut file = OpenOptions::new().create(true).append(true).open(c_path)?;
             let compact_json = serde_json::to_string(&compact_step)?;
             writeln!(file, "{}", compact_json)?;
+            file.flush()?;
         }
 
         if let Some(ref f_path) = self.full_path {
             let mut file = OpenOptions::new().create(true).append(true).open(f_path)?;
             let full_json = serde_json::to_string(&full_step)?;
             writeln!(file, "{}", full_json)?;
+            file.flush()?;
         }
 
         // 5. Update in-memory cache

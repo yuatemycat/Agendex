@@ -63,6 +63,83 @@ pub fn state_dir_for_workspace(workspace_dir: &Path) -> PathBuf {
         .join(format!("{folder_name}-{hash_val}"))
 }
 
+/// Normalizes a path to a workspace-relative path string with forward slashes.
+/// Handles absolute paths, verbatim prefixes (\\?\ or //?/), and already-relative paths.
+pub fn normalize_rel_path(path: &str, workspace_dir: &Path) -> String {
+    let raw = path.trim().replace('\\', "/");
+    let unescaped = raw
+        .strip_prefix("//?/")
+        .or_else(|| raw.strip_prefix("/?//"))
+        .unwrap_or(&raw);
+
+    // Normalize workspace directory path
+    let ws_str = workspace_dir.to_string_lossy().replace('\\', "/");
+    let ws_clean = ws_str
+        .strip_prefix("//?/")
+        .unwrap_or(&ws_str)
+        .trim_end_matches('/');
+
+    // 1. Direct string prefix strip (case-insensitive for Windows drive letters)
+    if let Some(suffix) = unescaped.strip_prefix(ws_clean) {
+        return suffix.trim_start_matches('/').to_string();
+    }
+    if unescaped
+        .to_lowercase()
+        .starts_with(&ws_clean.to_lowercase())
+    {
+        let suffix = &unescaped[ws_clean.len()..];
+        return suffix.trim_start_matches('/').to_string();
+    }
+
+    // 2. Canonicalized prefix strip
+    if let Ok(canon_ws) = workspace_dir.canonicalize() {
+        let canon_ws_str = canon_ws.to_string_lossy().replace('\\', "/");
+        let canon_ws_clean = canon_ws_str
+            .strip_prefix("//?/")
+            .unwrap_or(&canon_ws_str)
+            .trim_end_matches('/');
+        if let Some(suffix) = unescaped.strip_prefix(canon_ws_clean) {
+            return suffix.trim_start_matches('/').to_string();
+        }
+        if unescaped
+            .to_lowercase()
+            .starts_with(&canon_ws_clean.to_lowercase())
+        {
+            let suffix = &unescaped[canon_ws_clean.len()..];
+            return suffix.trim_start_matches('/').to_string();
+        }
+        if let Ok(canon_p) = Path::new(unescaped).canonicalize() {
+            let canon_p_str = canon_p.to_string_lossy().replace('\\', "/");
+            let canon_p_clean = canon_p_str.strip_prefix("//?/").unwrap_or(&canon_p_str);
+            if let Some(suffix) = canon_p_clean.strip_prefix(canon_ws_clean) {
+                return suffix.trim_start_matches('/').to_string();
+            }
+            if canon_p_clean
+                .to_lowercase()
+                .starts_with(&canon_ws_clean.to_lowercase())
+            {
+                let suffix = &canon_p_clean[canon_ws_clean.len()..];
+                return suffix.trim_start_matches('/').to_string();
+            }
+        }
+    }
+
+    // 3. Fall back to std::path::Path::strip_prefix
+    if let Ok(rel) = Path::new(unescaped).strip_prefix(workspace_dir) {
+        return rel
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .trim_start_matches('/')
+            .to_string();
+    }
+
+    unescaped
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string()
+}
+
 /// Result of a multi-turn rollback operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnRollbackResult {
@@ -377,12 +454,8 @@ impl SnapshotEngine {
 
     /// Record a file created by the agent during the current turn.
     pub fn record_created_file(&mut self, path: impl AsRef<Path>) {
-        let rel_path = path
-            .as_ref()
-            .strip_prefix(&self.workspace_dir)
-            .unwrap_or_else(|_| path.as_ref())
-            .to_string_lossy()
-            .replace('\\', "/");
+        let p_str = path.as_ref().to_string_lossy();
+        let rel_path = normalize_rel_path(&p_str, &self.workspace_dir);
 
         if let Some(last) = self.snapshots.last_mut() {
             let meta = last.metadata.get_or_insert_with(|| serde_json::json!({}));
@@ -427,6 +500,11 @@ impl SnapshotEngine {
             String::new()
         };
 
+        let normalized_touched: Vec<String> = agent_touched_files
+            .iter()
+            .map(|f| normalize_rel_path(f, &self.workspace_dir))
+            .collect();
+
         if let Some(snap) = self
             .snapshots
             .iter_mut()
@@ -441,7 +519,7 @@ impl SnapshotEngine {
                 );
                 obj.insert(
                     "agent_touched_files".to_string(),
-                    serde_json::json!(agent_touched_files),
+                    serde_json::json!(normalized_touched),
                 );
             }
         }
@@ -458,7 +536,7 @@ impl SnapshotEngine {
                 if let Some(arr) = meta.get("created_files").and_then(|f| f.as_array()) {
                     for v in arr {
                         if let Some(str_val) = v.as_str() {
-                            let norm = str_val.replace('\\', "/");
+                            let norm = normalize_rel_path(str_val, &self.workspace_dir);
                             if !res.contains(&norm) {
                                 res.push(norm);
                             }
@@ -556,7 +634,7 @@ impl SnapshotEngine {
                 if let Some(arr) = meta.get("created_files").and_then(|f| f.as_array()) {
                     for v in arr {
                         if let Some(str_val) = v.as_str() {
-                            let norm = str_val.replace('\\', "/");
+                            let norm = normalize_rel_path(str_val, &self.workspace_dir);
                             if !created_by_agent.contains(&norm) {
                                 created_by_agent.push(norm);
                             }
@@ -573,12 +651,17 @@ impl SnapshotEngine {
             .and_then(|m| m.get("end_tree_hash"))
             .and_then(|h| h.as_str());
 
-        let agent_touched: Vec<String> = target_record
+        let raw_agent_touched: Vec<String> = target_record
             .metadata
             .as_ref()
             .and_then(|m| m.get("agent_touched_files"))
             .and_then(|f| serde_json::from_value(f.clone()).ok())
             .unwrap_or_default();
+
+        let agent_touched: Vec<String> = raw_agent_touched
+            .iter()
+            .map(|f| normalize_rel_path(f, &self.workspace_dir))
+            .collect();
 
         let mut external_modified: Vec<String> = Vec::new();
 
@@ -598,7 +681,7 @@ impl SnapshotEngine {
                     .current_dir(&self.workspace_dir);
                 if let Ok(out) = diff_cmd.output().await {
                     for line in String::from_utf8_lossy(&out.stdout).lines() {
-                        let trimmed = line.trim().replace('\\', "/");
+                        let trimmed = normalize_rel_path(line.trim(), &self.workspace_dir);
                         if !trimmed.is_empty() && !external_modified.contains(&trimmed) {
                             external_modified.push(trimmed);
                         }
@@ -622,7 +705,7 @@ impl SnapshotEngine {
                 .current_dir(&self.workspace_dir);
             if let Ok(out) = diff_target.output().await {
                 for line in String::from_utf8_lossy(&out.stdout).lines() {
-                    let trimmed = line.trim().replace('\\', "/");
+                    let trimmed = normalize_rel_path(line.trim(), &self.workspace_dir);
                     if !trimmed.is_empty()
                         && !agent_touched.contains(&trimmed)
                         && !created_by_agent.contains(&trimmed)
@@ -1342,6 +1425,58 @@ mod tests {
             saved_config.contains("User manual addition after agent turn"),
             "User addition must never be wiped when revert is refused!"
         );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_revert_succeeds_when_agent_touched_files_are_absolute_paths() -> anyhow::Result<()>
+    {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "agendex_test_revert_abs_paths_{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&temp_dir).await?;
+
+        let mut engine = SnapshotEngine::new(&temp_dir)?;
+
+        // Pre-existing tracked file
+        let lib_file = temp_dir.join("src").join("lib.rs");
+        tokio::fs::create_dir_all(lib_file.parent().unwrap()).await?;
+        tokio::fs::write(&lib_file, "// Original lib.rs content\n").await?;
+
+        // Capture turn 1 snapshot
+        engine
+            .capture_snapshot_with_metadata(
+                "turn_start:1",
+                Some(serde_json::json!({
+                    "kind": "turn_start",
+                    "step_index": 1,
+                    "created_files": []
+                })),
+            )
+            .await?;
+
+        // Agent modifies src/lib.rs
+        tokio::fs::write(&lib_file, "// Modified lib.rs by agent\n").await?;
+
+        // Agent records touched file as an ABSOLUTE path
+        let abs_lib_path = lib_file.to_string_lossy().to_string();
+        engine
+            .record_turn_completed("turn_start:1", &[abs_lib_path])
+            .await?;
+
+        // Roll back turn: must succeed and NOT be falsely refused as an external modification!
+        let revert_res = engine.rollback_turn().await?;
+        assert!(
+            revert_res.is_some(),
+            "Rollback must succeed when agent touched files are absolute paths"
+        );
+
+        // Verify lib.rs was restored to original content
+        let restored_content = tokio::fs::read_to_string(&lib_file).await?;
+        assert_eq!(restored_content, "// Original lib.rs content\n");
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
         Ok(())

@@ -13,7 +13,9 @@ pub use compactor::{
     DEFAULT_TAIL_TURNS, STRATEGY_ANCHORED_HEAD_TAIL,
 };
 pub use search::{HistorySearchQuery, HistorySearchResult, TrajectorySearcher};
-pub use snapshots::{state_dir_for_workspace, SnapshotEngine, SnapshotRecord, TurnRollbackResult};
+pub use snapshots::{
+    normalize_rel_path, state_dir_for_workspace, SnapshotEngine, SnapshotRecord, TurnRollbackResult,
+};
 pub use telemetry::{
     estimate_cost, estimate_cost_optional, format_comma, format_telemetry, is_known_pricing_model,
     SessionUsage, TokenUsage,

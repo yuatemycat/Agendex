@@ -462,7 +462,20 @@ impl ToolRegistry {
             truncated = true;
         }
 
-        let content = selected_lines.join("\n");
+        let raw_content = selected_lines.join("\n");
+        let is_env_file = resolved
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n == ".env" || n.starts_with(".env.") || n.ends_with(".env"))
+            .unwrap_or(false)
+            || resolved.to_string_lossy().contains("/.env")
+            || resolved.to_string_lossy().contains("\\.env");
+
+        let content = if is_env_file {
+            agendex_trajectory::mask_secrets(&raw_content)
+        } else {
+            raw_content
+        };
         let bytes_read = content.len();
 
         Ok(ReadFileResult {
@@ -719,12 +732,18 @@ impl ToolRegistry {
         let mut matches = Vec::new();
         let mut truncated = false;
 
+        let pattern_wants_hidden = args.show_hidden
+            || args.pattern.starts_with('.')
+            || args.pattern.contains("/.")
+            || args.pattern.contains(".env");
+        let pattern_targets_env = args.pattern.contains(".env") || args.pattern.contains("env");
+
         let mut builder = ignore::WalkBuilder::new(&base_dir);
         builder
-            .hidden(!args.show_hidden)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
+            .hidden(!pattern_wants_hidden)
+            .git_ignore(!pattern_targets_env)
+            .git_global(!pattern_targets_env)
+            .git_exclude(!pattern_targets_env)
             .require_git(false)
             .follow_links(false);
 
@@ -752,6 +771,19 @@ impl ToolRegistry {
                     break;
                 }
                 matches.push(ws_rel_path.to_path_buf());
+            }
+        }
+
+        if pattern_targets_env {
+            let env_candidate = base_dir.join(".env");
+            if env_candidate.is_file() {
+                let ws_rel = env_candidate
+                    .strip_prefix(&self.workspace_dir)
+                    .unwrap_or(&env_candidate)
+                    .to_path_buf();
+                if !matches.contains(&ws_rel) {
+                    matches.push(ws_rel);
+                }
             }
         }
 
@@ -797,11 +829,23 @@ impl ToolRegistry {
         let mut matches = Vec::new();
         let mut truncated = false;
 
+        let glob_wants_hidden = args
+            .glob
+            .as_deref()
+            .map(|g| g.starts_with('.') || g.contains("/.") || g.contains(".env"))
+            .unwrap_or(false);
+        let glob_targets_env = args
+            .glob
+            .as_deref()
+            .map(|g| g.contains(".env") || g.contains("env"))
+            .unwrap_or(false);
+
         let mut walker_builder = ignore::WalkBuilder::new(&target_dir);
         walker_builder
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
+            .hidden(!glob_wants_hidden)
+            .git_ignore(!glob_targets_env)
+            .git_global(!glob_targets_env)
+            .git_exclude(!glob_targets_env)
             .require_git(false)
             .follow_links(false);
 
@@ -1804,6 +1848,104 @@ mod tests {
         let json_res: FindDefinitionResult = serde_json::from_value(json_val).unwrap();
         assert_eq!(json_res.total_found, 1);
         assert_eq!(json_res.definitions[0].symbol, "WorkerPool");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_read_file_masks_env_secrets_and_glob_discovers_hidden_gitignored_env() {
+        let tmp = std::env::temp_dir().join(format!(
+            "agendex_env_safety_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // 1. Create .gitignore with .env ignored
+        std::fs::write(tmp.join(".gitignore"), ".env\n*.secret\ntarget/\n").unwrap();
+
+        // 2. Create .env with sensitive credentials
+        let env_body = "OPENAI_API_KEY=sk-live-secret-openai-key-999\nNVIDIA_API_KEY=nvapi-supersecret-99999\nCUSTOM_SECRET=plainFAKEkey5arg\nPORT=8080\n";
+        std::fs::write(tmp.join(".env"), env_body).unwrap();
+
+        let task_manager = Arc::new(TaskManager::new(tmp.join("tasks")));
+        let registry = ToolRegistry::new(tmp.clone(), task_manager);
+
+        // 3. Test read_file: .env secrets MUST be masked
+        let read_res = registry
+            .read_file(ReadFileArgs {
+                path: PathBuf::from(".env"),
+                start_line: None,
+                end_line: None,
+                max_bytes: None,
+                byte_offset: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            read_res.content.contains("OPENAI_API_KEY=[REDACTED]"),
+            "OPENAI_API_KEY must be masked: {}",
+            read_res.content
+        );
+        assert!(
+            read_res.content.contains("NVIDIA_API_KEY=[REDACTED]"),
+            "NVIDIA_API_KEY must be masked: {}",
+            read_res.content
+        );
+        assert!(
+            read_res.content.contains("CUSTOM_SECRET=[REDACTED]"),
+            "CUSTOM_SECRET must be masked: {}",
+            read_res.content
+        );
+        assert!(
+            read_res.content.contains("PORT=8080"),
+            "Non-secret variables must remain visible: {}",
+            read_res.content
+        );
+        assert!(
+            !read_res.content.contains("sk-live-secret-openai-key-999"),
+            "Raw OpenAI key must not be sent: {}",
+            read_res.content
+        );
+        assert!(
+            !read_res.content.contains("plainFAKEkey5arg"),
+            "Raw secret value must not be sent: {}",
+            read_res.content
+        );
+
+        // 4. Test glob search: pattern '.env' MUST find the hidden & gitignored .env file
+        let glob_res1 = registry
+            .glob(GlobArgs {
+                pattern: ".env".to_string(),
+                path: None,
+                max_results: None,
+                show_hidden: false,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            glob_res1.matches.iter().any(|p| p.ends_with(".env")),
+            "Glob for '.env' must find hidden & gitignored .env file! Found: {:?}",
+            glob_res1.matches
+        );
+
+        // 5. Test glob search: pattern '**/.env*'
+        let glob_res2 = registry
+            .glob(GlobArgs {
+                pattern: "**/.env*".to_string(),
+                path: None,
+                max_results: None,
+                show_hidden: false,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            glob_res2.matches.iter().any(|p| p.ends_with(".env")),
+            "Glob for '**/.env*' must find hidden & gitignored .env file! Found: {:?}",
+            glob_res2.matches
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

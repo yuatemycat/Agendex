@@ -81,11 +81,13 @@ async fn main() -> anyhow::Result<()> {
     let config = parsed.config;
     let prompt = parsed.prompt;
 
-    let active_provider = if let Some(cfg) = agendex_core::config::load_default_config() {
-        cfg.active_provider.unwrap_or_else(|| "nim".to_string())
-    } else {
-        "nim".to_string()
-    };
+    let active_provider = parsed.provider.unwrap_or_else(|| {
+        if let Some(cfg) = agendex_core::config::load_default_config() {
+            cfg.active_provider.unwrap_or_else(|| "nim".to_string())
+        } else {
+            "nim".to_string()
+        }
+    });
 
     if !parsed.json_mode && prompt.is_none() {
         agendex_core::ui::print_banner(

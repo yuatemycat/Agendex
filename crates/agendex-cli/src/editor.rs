@@ -689,6 +689,14 @@ mod tests {
             "/provider add custom-vllm http://127.0.0.1:8000/v1 custom-llm openai [REDACTED]"
         );
 
+        // 5-arg form with unprefixed key (e.g. plainFAKEkey5arg) is also scrubbed
+        let raw_5arg = "/provider add custom-vllm http://127.0.0.1:8000/v1 plainFAKEkey5arg";
+        let sanitized_5arg = sanitize_history_line(raw_5arg);
+        assert_eq!(
+            sanitized_5arg,
+            "/provider add custom-vllm http://127.0.0.1:8000/v1 [REDACTED]"
+        );
+
         // Environment variable references are kept intact
         let env_raw =
             "/provider add custom-vllm http://127.0.0.1:8000/v1 custom-llm openai $VLLM_KEY";

@@ -91,6 +91,9 @@ pub enum DiffApprovalResult {
 
 impl AgendexAgent {
     pub async fn init(config: AgentConfig) -> anyhow::Result<Self> {
+        // Ensure environment variables from .env are loaded into the process
+        crate::config::load_agendex_env();
+
         // Initialize SnapshotEngine first (ensures git and state_dir are initialized consistently)
         let snapshot_engine_raw = SnapshotEngine::new(&config.workspace_dir)?;
         let state_dir = snapshot_engine_raw.state_dir().to_path_buf();
@@ -376,8 +379,9 @@ impl AgendexAgent {
 
     /// Explicitly records a file path as touched by the agent during this session.
     pub async fn record_touched_file(&self, path: impl AsRef<std::path::Path>) {
-        let p_str = path.as_ref().to_string_lossy().replace('\\', "/");
-        self.touched_files.lock().await.insert(p_str);
+        let p_str = path.as_ref().to_string_lossy();
+        let norm = agendex_trajectory::normalize_rel_path(&p_str, &self.config.workspace_dir);
+        self.touched_files.lock().await.insert(norm);
     }
 
     pub async fn commit_workspace_changes(
@@ -1387,10 +1391,11 @@ impl AgendexAgent {
                     .patch_file(&target_path, target, replacement)
                 {
                     Ok(res) => {
-                        self.touched_files
-                            .lock()
-                            .await
-                            .insert(path.replace('\\', "/"));
+                        let norm = agendex_trajectory::normalize_rel_path(
+                            path,
+                            &self.config.workspace_dir,
+                        );
+                        self.touched_files.lock().await.insert(norm);
                         format!(
                             "Successfully replaced {} occurrences in {}",
                             res.occurrences, path
@@ -1689,22 +1694,35 @@ impl AgendexAgent {
                     Ok(res) => {
                         if tc.name == "write_file" {
                             if let Some(path_str) = res.get("path").and_then(|p| p.as_str()) {
-                                self.touched_files
-                                    .lock()
-                                    .await
-                                    .insert(path_str.replace('\\', "/"));
+                                let norm = agendex_trajectory::normalize_rel_path(
+                                    path_str,
+                                    &self.config.workspace_dir,
+                                );
+                                self.touched_files.lock().await.insert(norm.clone());
                                 if res
                                     .get("created")
                                     .and_then(|c| c.as_bool())
                                     .unwrap_or(false)
                                 {
                                     let mut snap = self.snapshot_engine.lock().await;
-                                    snap.record_created_file(path_str);
+                                    snap.record_created_file(&norm);
                                 }
                             }
                         }
                         self.notify_progress(&format!("[Tool: {}] Completed.", tc.name));
-                        serde_json::to_string_pretty(&res).unwrap_or_else(|_| "{}".to_string())
+                        let out_str =
+                            serde_json::to_string_pretty(&res).unwrap_or_else(|_| "{}".to_string());
+                        if tc.name == "read_file" {
+                            let p = tc
+                                .arguments
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if p.contains(".env") {
+                                return agendex_trajectory::mask_secrets(&out_str);
+                            }
+                        }
+                        out_str
                     }
                     Err(e) => {
                         self.notify_progress(&format!("[Tool: {}] Error: {}", tc.name, e));
@@ -2018,8 +2036,9 @@ impl AgendexAgent {
             .unwrap_or_else(crate::config::create_default_config_with_presets);
 
         let key = name.to_lowercase();
+        let default_m = crate::config::default_model_for_preset(&key);
         let resolved_format = format.unwrap_or("openai").to_string();
-        let resolved_model = model.unwrap_or("default-model").to_string();
+        let resolved_model = model.unwrap_or(default_m).to_string();
         let resolved_key = api_key.unwrap_or("").to_string();
 
         let (stored_key_ref, key_display_note) = if resolved_key.is_empty() {
@@ -2036,7 +2055,7 @@ impl AgendexAgent {
             let env_ref = format!("${}", env_var);
             (
                 Some(env_ref.clone()),
-                format!(" (key persisted to ~/.agendex/.env as {})", env_ref),
+                format!(" (key persisted to .env as {})", env_ref),
             )
         };
 

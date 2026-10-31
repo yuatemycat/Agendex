@@ -252,6 +252,63 @@ async fn test_provider_add_key_before_model() -> anyhow::Result<()> {
         add_out2
     );
 
+    // 3. 5-argument syntax with unprefixed key (e.g. plainFAKEkey5arg):
+    // /provider add custom-unprefixed http://127.0.0.1:8000/v1 plainFAKEkey5arg
+    let add_out3 = agent
+        .process_turn("/provider add custom-unprefixed http://127.0.0.1:8000/v1 plainFAKEkey5arg")
+        .await?;
+
+    assert!(
+        !add_out3.contains("model: plainFAKEkey5arg"),
+        "Must NOT treat unprefixed key as model name: {}",
+        add_out3
+    );
+    assert!(
+        !add_out3.contains("plainFAKEkey5arg"),
+        "Must not echo plain text key in output: {}",
+        add_out3
+    );
+    assert!(
+        add_out3.contains("$CUSTOM_UNPREFIXED_API_KEY"),
+        "Must reference environment variable for key: {}",
+        add_out3
+    );
+
+    // Verify .env has the unprefixed key persisted
+    let env_content3 = std::fs::read_to_string(&env_file)?;
+    assert!(
+        env_content3.contains("CUSTOM_UNPREFIXED_API_KEY=plainFAKEkey5arg"),
+        "Expected plainFAKEkey5arg in .env: {}",
+        env_content3
+    );
+
+    // Verify config.toml does NOT have plain text key under model or api_key
+    let cfg_content = std::fs::read_to_string(&test_cfg_path)?;
+    assert!(
+        !cfg_content.contains("model = \"plainFAKEkey5arg\""),
+        "config.toml must not store key as model: {}",
+        cfg_content
+    );
+    assert!(
+        !cfg_content.contains("api_key = \"plainFAKEkey5arg\""),
+        "config.toml must not store plain text key: {}",
+        cfg_content
+    );
+    assert!(
+        cfg_content.contains("api_key = \"$CUSTOM_UNPREFIXED_API_KEY\""),
+        "config.toml must store $CUSTOM_UNPREFIXED_API_KEY reference: {}",
+        cfg_content
+    );
+
+    // 4. Persistence across process restart: remove env var from memory, load env, expand
+    std::env::remove_var("CUSTOM_UNPREFIXED_API_KEY");
+    agendex_core::config::load_agendex_env();
+    let expanded = agendex_core::config::expand_env_var_or_literal("$CUSTOM_UNPREFIXED_API_KEY");
+    assert_eq!(
+        expanded, "plainFAKEkey5arg",
+        "Key must persist and reload across restarts from .env"
+    );
+
     std::env::remove_var("AGENDEX_HOME");
     std::env::remove_var("AGENDEX_CONFIG");
     let _ = std::fs::remove_dir_all(&tmp);
