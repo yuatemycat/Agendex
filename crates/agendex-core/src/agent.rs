@@ -518,6 +518,7 @@ impl AgendexAgent {
     }
 
     async fn process_turn_inner(&self, user_input: &str) -> anyhow::Result<String> {
+        self.touched_files.lock().await.clear();
         self.streamed_tokens_in_turn
             .store(false, std::sync::atomic::Ordering::SeqCst);
         self.emit_event(crate::events::AgentEvent::TurnStart {
@@ -1067,7 +1068,12 @@ impl AgendexAgent {
                                 "TOOL_RESULT",
                                 "SYSTEM",
                                 &tool_result,
-                                serde_json::json!({ "tool": tc.name, "id": tc.id }),
+                                serde_json::json!({
+                                    "tool": tc.name,
+                                    "id": tc.id,
+                                    "tool_name": tc.name,
+                                    "call_id": tc.id
+                                }),
                             )
                             .await;
                     }
@@ -1371,10 +1377,10 @@ impl AgendexAgent {
                         DiffApprovalResult::Approved => {}
                         DiffApprovalResult::RejectedByUser => {
                             self.notify_progress(&format!(
-                                "[Tool: edit_file] Edit on '{}' rejected by user.",
+                                "[Tool: edit_file] Edit on '{}' declined by user.",
                                 path
                             ));
-                            return "Edit rejected by user".to_string();
+                            return "Edit declined by user".to_string();
                         }
                         DiffApprovalResult::RejectedNonTerminal => {
                             self.notify_progress(&format!(
@@ -1571,10 +1577,10 @@ impl AgendexAgent {
                                         DiffApprovalResult::Approved => {}
                                         DiffApprovalResult::RejectedByUser => {
                                             self.notify_progress(&format!(
-                                                "[Tool: write_file] Edit on '{}' rejected by user.",
+                                                "[Tool: write_file] Edit on '{}' declined by user.",
                                                 path_str
                                             ));
-                                            return "Edit rejected by user".to_string();
+                                            return "Edit declined by user".to_string();
                                         }
                                         DiffApprovalResult::RejectedNonTerminal => {
                                             self.notify_progress(&format!(
@@ -1595,10 +1601,10 @@ impl AgendexAgent {
                                     DiffApprovalResult::Approved => {}
                                     DiffApprovalResult::RejectedByUser => {
                                         self.notify_progress(&format!(
-                                            "[Tool: write_file] File creation of '{}' rejected by user.",
+                                            "[Tool: write_file] File creation of '{}' declined by user.",
                                             path_str
                                         ));
-                                        return "File creation rejected by user".to_string();
+                                        return "File creation declined by user".to_string();
                                     }
                                     DiffApprovalResult::RejectedNonTerminal => {
                                         self.notify_progress(&format!(
@@ -1712,15 +1718,8 @@ impl AgendexAgent {
                         self.notify_progress(&format!("[Tool: {}] Completed.", tc.name));
                         let out_str =
                             serde_json::to_string_pretty(&res).unwrap_or_else(|_| "{}".to_string());
-                        if tc.name == "read_file" {
-                            let p = tc
-                                .arguments
-                                .get("path")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            if p.contains(".env") {
-                                return agendex_trajectory::mask_secrets(&out_str);
-                            }
+                        if tc.name == "read_file" || tc.name == "run_command" {
+                            return agendex_trajectory::mask_secrets(&out_str);
                         }
                         out_str
                     }
@@ -2572,15 +2571,19 @@ impl AgendexAgent {
                         let name = step
                             .metadata
                             .as_ref()
-                            .and_then(|m| m.get("tool_name"))
+                            .and_then(|m| m.get("tool_name").or_else(|| m.get("tool")))
                             .and_then(|n| n.as_str())
                             .unwrap_or("tool");
                         let call_id = step
                             .metadata
                             .as_ref()
-                            .and_then(|m| m.get("call_id"))
+                            .and_then(|m| {
+                                m.get("call_id")
+                                    .or_else(|| m.get("id"))
+                                    .or_else(|| m.get("tool_call_id"))
+                            })
                             .and_then(|c| c.as_str())
-                            .unwrap_or("call_1");
+                            .unwrap_or("");
                         reloaded.push(ChatMessage::tool_result(call_id, name, &step.content));
                     }
                     _ => {}

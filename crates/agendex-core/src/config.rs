@@ -314,7 +314,8 @@ pub fn default_model_for_preset(provider_str: &str) -> &'static str {
         "ollama" => "qwen2.5-coder:7b",
         "gemini" | "google" => "gemini-2.5-flash",
         "anthropic" | "claude" => "claude-3-7-sonnet-20250219",
-        _ => "gpt-4o",
+        "openai" => "gpt-4o",
+        _ => "default",
     }
 }
 
@@ -351,7 +352,6 @@ pub struct ParsedProviderAddArgs {
 
 /// Returns true if a command-line token represents an API key or credential reference.
 pub fn is_likely_key_token(token: &str) -> bool {
-    let t_lower = token.to_lowercase();
     token.starts_with("sk-")
         || token.starts_with("nvapi-")
         || token.starts_with("AIza")
@@ -362,10 +362,6 @@ pub fn is_likely_key_token(token: &str) -> bool {
         || token.starts_with("xox")
         || token.starts_with("hf_")
         || token.starts_with("gsk_")
-        || t_lower.contains("key")
-        || t_lower.contains("secret")
-        || t_lower.contains("token")
-        || t_lower.contains("fake")
         || agendex_trajectory::mask_secrets(token).contains("[REDACTED]")
 }
 
@@ -410,15 +406,22 @@ pub fn parse_provider_add_tokens(parts: &[&str]) -> Option<ParsedProviderAddArgs
         }
         2 => {
             let (tok0, tok1) = (rest[0], rest[1]);
-            if is_likely_key_token(tok0) {
+            if is_likely_key_token(tok0) && !is_likely_key_token(tok1) {
                 // Key came before model! e.g. `/provider add custom http://... sk-FAKEseven custom-model`
                 (Some(tok1.to_string()), Some(tok0.to_string()))
-            } else if is_likely_key_token(tok1) {
+            } else if is_likely_key_token(tok1) && !is_likely_key_token(tok0) {
                 // Model came before key! e.g. `/provider add custom http://... custom-model sk-FAKEseven`
                 (Some(tok0.to_string()), Some(tok1.to_string()))
-            } else {
-                // Neither token has a recognizable key prefix: default order is [model] [api_key]
+            } else if tok0.contains('/') || tok0.contains(':') {
+                // tok0 has a model path/tag slash or colon (e.g. meta-llama/Llama-3-8B plainFAKEkey5arg)
                 (Some(tok0.to_string()), Some(tok1.to_string()))
+            } else if tok1.contains('/') || tok1.contains(':') {
+                // tok1 has a model path/tag slash or colon (e.g. plainFAKEkey5arg meta-llama/Llama-3-8B)
+                (Some(tok1.to_string()), Some(tok0.to_string()))
+            } else {
+                // Neither token has a recognizable key prefix or path slash:
+                // User passed `[api_key] [model]` (e.g. `plainFAKEkey5arg llama3` or `plainFAKEkey5arg keyword-extractor-v2`)
+                (Some(tok1.to_string()), Some(tok0.to_string()))
             }
         }
         _ => {
@@ -840,5 +843,41 @@ mod tests {
 
         assert_eq!(agent_cfg.model.api_key, "nvapi-secret-12345");
         std::env::remove_var("TEST_AGENDEX_SECRET_KEY");
+    }
+
+    #[test]
+    fn test_parse_provider_add_tokens_unprefixed_key_and_model_names() {
+        // Model name containing "key" like "keyword-extractor-v2" must NOT be treated as a key
+        assert!(!is_likely_key_token("keyword-extractor-v2"));
+
+        // Unprefixed key followed by model: /provider add custom http://localhost:8000/v1 plainFAKEkey5arg llama3
+        let parts = [
+            "/provider",
+            "add",
+            "custom",
+            "http://localhost:8000/v1",
+            "plainFAKEkey5arg",
+            "llama3",
+        ];
+        let parsed = parse_provider_add_tokens(&parts).unwrap();
+        assert_eq!(parsed.model.as_deref(), Some("llama3"));
+        assert_eq!(parsed.api_key.as_deref(), Some("plainFAKEkey5arg"));
+
+        // Unprefixed key followed by keyword-extractor-v2 model
+        let parts2 = [
+            "/provider",
+            "add",
+            "custom",
+            "http://localhost:8000/v1",
+            "plainFAKEkey5arg",
+            "keyword-extractor-v2",
+        ];
+        let parsed2 = parse_provider_add_tokens(&parts2).unwrap();
+        assert_eq!(parsed2.model.as_deref(), Some("keyword-extractor-v2"));
+        assert_eq!(parsed2.api_key.as_deref(), Some("plainFAKEkey5arg"));
+
+        // Custom provider default model must be "default", not "gpt-4o"
+        assert_eq!(default_model_for_preset("custom"), "default");
+        assert_eq!(default_model_for_preset("openai"), "gpt-4o");
     }
 }

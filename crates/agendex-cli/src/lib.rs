@@ -152,6 +152,13 @@ pub fn try_parse_cli_args(args: &[String], current_dir: PathBuf) -> anyhow::Resu
                         if let Some(base) = default_base {
                             model_config.base_url = Some(base);
                         }
+                        model_config.model_name =
+                            agendex_core::config::default_model_for_preset(&val).to_string();
+                        let key = agendex_core::config::default_api_key_for_preset(&val);
+                        if !key.is_empty() {
+                            model_config.api_key =
+                                agendex_core::config::expand_env_var_or_literal(&key);
+                        }
                     }
                     i += 1;
                 }

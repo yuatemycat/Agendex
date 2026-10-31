@@ -741,9 +741,9 @@ impl ToolRegistry {
         let mut builder = ignore::WalkBuilder::new(&base_dir);
         builder
             .hidden(!pattern_wants_hidden)
-            .git_ignore(!pattern_targets_env)
-            .git_global(!pattern_targets_env)
-            .git_exclude(!pattern_targets_env)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
             .require_git(false)
             .follow_links(false);
 
@@ -834,18 +834,13 @@ impl ToolRegistry {
             .as_deref()
             .map(|g| g.starts_with('.') || g.contains("/.") || g.contains(".env"))
             .unwrap_or(false);
-        let glob_targets_env = args
-            .glob
-            .as_deref()
-            .map(|g| g.contains(".env") || g.contains("env"))
-            .unwrap_or(false);
 
         let mut walker_builder = ignore::WalkBuilder::new(&target_dir);
         walker_builder
             .hidden(!glob_wants_hidden)
-            .git_ignore(!glob_targets_env)
-            .git_global(!glob_targets_env)
-            .git_exclude(!glob_targets_env)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
             .require_git(false)
             .follow_links(false);
 
@@ -1863,9 +1858,15 @@ mod tests {
         // 1. Create .gitignore with .env ignored
         std::fs::write(tmp.join(".gitignore"), ".env\n*.secret\ntarget/\n").unwrap();
 
-        // 2. Create .env with sensitive credentials
+        // 2. Create .env with sensitive credentials and a gitignored target/ folder
         let env_body = "OPENAI_API_KEY=sk-live-secret-openai-key-999\nNVIDIA_API_KEY=nvapi-supersecret-99999\nCUSTOM_SECRET=plainFAKEkey5arg\nPORT=8080\n";
         std::fs::write(tmp.join(".env"), env_body).unwrap();
+        std::fs::create_dir_all(tmp.join("target")).unwrap();
+        std::fs::write(
+            tmp.join("target").join("ignored_env_output.txt"),
+            "build cache",
+        )
+        .unwrap();
 
         let task_manager = Arc::new(TaskManager::new(tmp.join("tasks")));
         let registry = ToolRegistry::new(tmp.clone(), task_manager);
@@ -1945,6 +1946,26 @@ mod tests {
             glob_res2.matches.iter().any(|p| p.ends_with(".env")),
             "Glob for '**/.env*' must find hidden & gitignored .env file! Found: {:?}",
             glob_res2.matches
+        );
+
+        // 6. Test glob search: pattern '*env*' must NOT search gitignored folders like target/
+        let glob_res3 = registry
+            .glob(GlobArgs {
+                pattern: "*env*".to_string(),
+                path: None,
+                max_results: None,
+                show_hidden: true,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            !glob_res3
+                .matches
+                .iter()
+                .any(|p| p.to_string_lossy().contains("target")),
+            "Glob for '*env*' must NEVER traverse gitignored target/ folder! Found: {:?}",
+            glob_res3.matches
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

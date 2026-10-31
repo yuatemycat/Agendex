@@ -594,7 +594,7 @@ impl SnapshotEngine {
         }
 
         // Find the most recent turn that actually changed files or created files
-        let mut target_idx = *turn_start_indices.last().unwrap_or(&0);
+        let mut target_idx = None;
         for &idx in turn_start_indices.iter().rev() {
             let snap = &self.snapshots[idx];
             let has_created = snap
@@ -604,11 +604,19 @@ impl SnapshotEngine {
                 .and_then(|f| f.as_array())
                 .map(|a| !a.is_empty())
                 .unwrap_or(false);
-            if snap.tree_hash != current_tree || has_created {
-                target_idx = idx;
+            let has_touched = snap
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("agent_touched_files"))
+                .and_then(|f| f.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            if (has_touched || has_created) && (snap.tree_hash != current_tree || has_created) {
+                target_idx = Some(idx);
                 break;
             }
         }
+        let target_idx = target_idx.unwrap_or_else(|| *turn_start_indices.last().unwrap_or(&0));
 
         let target_record = self.snapshots[target_idx].clone();
 

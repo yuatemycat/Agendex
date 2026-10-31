@@ -76,7 +76,7 @@ fn is_safe_assignment(key: &str, val: &str) -> bool {
     false
 }
 
-fn is_secret_json_key(k: &str) -> bool {
+fn is_sensitive_key_name(k: &str) -> bool {
     let k_lower = k.to_lowercase();
     // Exclusions
     if k_lower == "author"
@@ -89,28 +89,40 @@ fn is_secret_json_key(k: &str) -> bool {
         || k_lower == "key_bindings"
         || k_lower == "keybindings"
         || k_lower == "keycode"
+        || k_lower == "tokens"
+        || k_lower == "name"
+        || k_lower == "version"
+        || k_lower == "edition"
+        || k_lower == "description"
+        || k_lower == "title"
+        || k_lower == "path"
+        || k_lower == "file"
+        || k_lower == "model"
+        || k_lower == "url"
+        || k_lower == "type"
+        || k_lower == "layout"
+        || k_lower.starts_with("keyboard")
+        || k_lower.starts_with("keyword")
         || k_lower.contains("max_token")
         || k_lower.contains("prompt_token")
         || k_lower.contains("completion_token")
         || k_lower.contains("total_token")
         || k_lower.contains("num_token")
-        || k_lower == "tokens"
     {
         return false;
     }
 
-    // Exact matches
+    // Exact matches (note: generic "key" and "token" are intentionally excluded to avoid over-masking)
     let exact = [
         "api_key",
         "apikey",
-        "key",
         "secret",
         "secret_key",
         "client_secret",
         "access_token",
         "refresh_token",
         "auth_token",
-        "token",
+        "session_token",
         "private_key",
         "password",
         "passwd",
@@ -128,11 +140,36 @@ fn is_secret_json_key(k: &str) -> bool {
         || k_lower.ends_with("_token")
         || k_lower.ends_with("_password")
         || k_lower.ends_with("_passwd")
+        || k_lower.ends_with("_credential")
+        || k_lower.ends_with("_credentials")
+    {
+        return true;
+    }
+
+    // Prefix matches
+    if k_lower.starts_with("api_key")
+        || k_lower.starts_with("secret_")
+        || k_lower.starts_with("token_")
+        || k_lower.starts_with("password_")
+        || k_lower.starts_with("private_key")
+    {
+        return true;
+    }
+
+    // Delimited matches
+    if k_lower.contains("_key_")
+        || k_lower.contains("_secret_")
+        || k_lower.contains("_password_")
+        || k_lower.contains("_token_")
     {
         return true;
     }
 
     false
+}
+
+fn is_secret_json_key(k: &str) -> bool {
+    is_sensitive_key_name(k)
 }
 
 /// Masks known API keys, tokens, credentials, and .env secrets from string content.
@@ -144,20 +181,19 @@ pub fn mask_secrets(input: &str) -> String {
     let mut result = input.to_string();
 
     // 1. Specific API key patterns (OpenAI, Anthropic, Nvidia NIM, Google, GitHub, AWS, Slack, Bearer, JWT, PEM)
-    // sk- keys (OpenAI & Anthropic & general, excluding common Python packages like sk-learn)
+    // sk- keys (OpenAI & Anthropic & general, excluding package/tool names like sk-learn or sk-docs-generator-tool)
     static SK_REGEX: OnceLock<Regex> = OnceLock::new();
     let sk_re =
         SK_REGEX.get_or_init(|| Regex::new(r"(?i)\b(sk-(?:ant-)?[a-zA-Z0-9_\-]{8,})\b").unwrap());
     result = sk_re
         .replace_all(&result, |caps: &regex::Captures| {
             let tok = &caps[1];
-            let lower = tok.to_lowercase();
-            if lower.starts_with("sk-learn")
-                || lower.starts_with("sk-image")
-                || lower.starts_with("sk-opt")
-                || lower.starts_with("sk-spatial")
-                || lower.starts_with("sk-build")
-            {
+            // If the token consists solely of lowercase letters, hyphens, and underscores,
+            // with NO digits and NO uppercase letters, it is a kebab-case tool/package identifier
+            // (e.g. sk-learn, sk-docs-generator-tool, sk-image, sk-build, etc.)
+            let has_digit = tok.chars().any(|c| c.is_ascii_digit());
+            let has_uppercase = tok.chars().any(|c| c.is_ascii_uppercase());
+            if !has_digit && !has_uppercase {
                 tok.to_string()
             } else {
                 "[REDACTED]".to_string()
@@ -215,20 +251,16 @@ pub fn mask_secrets(input: &str) -> String {
 
     // 2. Unanchored inline secret key-value assignments (e.g. DB_PASSWORD=xxx, API_KEY=xxx)
     static INLINE_ASSIGN_REGEX: OnceLock<Regex> = OnceLock::new();
-    let inline_re = INLINE_ASSIGN_REGEX.get_or_init(|| {
-        Regex::new(
-            r#"(?i)\b([A-Za-z0-9_]*(?:KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE)[A-Za-z0-9_]*)\s*=\s*["']?([^"'\s;&|]{3,})["']?"#,
-        )
-        .unwrap()
-    });
+    let inline_re = INLINE_ASSIGN_REGEX
+        .get_or_init(|| Regex::new(r#"([A-Za-z0-9_]+)\s*=\s*["']?([^"'\s;&|]{3,})["']?"#).unwrap());
     result = inline_re
         .replace_all(&result, |caps: &regex::Captures| {
             let key = &caps[1];
             let val = &caps[2];
-            if is_safe_assignment(key, val) {
-                format!("{}={}", key, val)
-            } else {
+            if is_sensitive_key_name(key) && !is_safe_assignment(key, val) {
                 format!("{}=[REDACTED]", key)
+            } else {
+                caps[0].to_string()
             }
         })
         .to_string();
@@ -248,31 +280,27 @@ pub fn mask_secrets(input: &str) -> String {
             let key = &caps[2];
             let val = &caps[3];
             let suffix = &caps[4];
-            if is_safe_assignment(key, val) {
-                format!("{}{}{}", prefix, val, suffix)
-            } else {
+            if is_sensitive_key_name(key) && !is_safe_assignment(key, val) {
                 format!("{}[REDACTED]{}", prefix, suffix)
+            } else {
+                caps[0].to_string()
             }
         })
         .to_string();
 
     // 4. JSON secret fields (e.g., "api_key": "...")
     static JSON_FIELD_REGEX: OnceLock<Regex> = OnceLock::new();
-    let json_re = JSON_FIELD_REGEX.get_or_init(|| {
-        Regex::new(
-            r#"(?i)"((?:api_?)?key|secret|token|password|passwd|auth|credential)"\s*:\s*"([^"]{4,})""#,
-        )
-        .unwrap()
-    });
+    let json_re = JSON_FIELD_REGEX
+        .get_or_init(|| Regex::new(r#"(?i)"([A-Za-z0-9_\-]+)"\s*:\s*"([^"]{4,})""#).unwrap());
 
     result = json_re
         .replace_all(&result, |caps: &regex::Captures| {
             let field = &caps[1];
             let val = &caps[2];
-            if is_safe_assignment(field, val) {
-                format!(r#""{}": "{}""#, field, val)
-            } else {
+            if is_sensitive_key_name(field) && !is_safe_assignment(field, val) {
                 format!(r#""{}": "[REDACTED]""#, field)
+            } else {
+                caps[0].to_string()
             }
         })
         .to_string();
@@ -464,11 +492,40 @@ EMPTY_VAL=
         );
 
         // Generic custom env variable in .env
-        let env_file = "MY_CUSTOM=super_secret_val_123\nDB_PASSWORD=my_db_pass\nPORT=8080\n";
+        let env_file = "CUSTOM_SECRET=super_secret_val_123\nDB_PASSWORD=my_db_pass\nPORT=8080\n";
         let masked_env = mask_secrets(env_file);
-        assert!(masked_env.contains("MY_CUSTOM=[REDACTED]"));
+        assert!(masked_env.contains("CUSTOM_SECRET=[REDACTED]"));
         assert!(masked_env.contains("DB_PASSWORD=[REDACTED]"));
         assert!(masked_env.contains("PORT=8080"));
+    }
+
+    #[test]
+    fn test_normal_values_not_masked() {
+        // Cargo.toml name and keyboard_layout must remain completely untouched
+        let cargo_toml = r#"[package]
+name = "mathy"
+version = "0.1.0"
+edition = "2021"
+"#;
+        assert_eq!(mask_secrets(cargo_toml), cargo_toml);
+
+        let config_line = "keyboard_layout = \"qwerty\"";
+        assert_eq!(mask_secrets(config_line), config_line);
+
+        // Kebab-case tool name starting with sk-
+        let tool_name = "Running sk-docs-generator-tool for documentation generation.";
+        assert_eq!(mask_secrets(tool_name), tool_name);
+
+        // JSON fields named "key" and "token"
+        let json_data = serde_json::json!({
+            "key": "user_id_column",
+            "token": "identifier_token",
+            "api_key": "sk-realFake1234567890",
+        });
+        let redacted = redact_json_value(&json_data);
+        assert_eq!(redacted["key"], "user_id_column");
+        assert_eq!(redacted["token"], "identifier_token");
+        assert_eq!(redacted["api_key"], "[REDACTED]");
     }
 
     #[test]

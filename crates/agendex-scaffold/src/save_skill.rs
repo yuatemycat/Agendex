@@ -92,10 +92,6 @@ pub fn save_skill_tool_definition() -> serde_json::Value {
                 "content": {
                     "type": "string",
                     "description": "Complete markdown instructions, protocols, or guidelines"
-                },
-                "overwrite": {
-                    "type": "boolean",
-                    "description": "Whether to permit overwriting an existing skill with the same name (default: false)"
                 }
             },
             "required": ["name", "description", "content"]
@@ -179,7 +175,7 @@ impl SkillSaver {
         let approved = approval_gate(&action, &reason).await;
         if !approved {
             anyhow::bail!(
-                "Skill creation for '{}' was rejected by user approval gate",
+                "Skill creation for '{}' was declined by user approval gate",
                 safe_name
             );
         }
