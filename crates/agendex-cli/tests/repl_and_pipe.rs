@@ -115,6 +115,27 @@ fn test_sanitized_history_prevents_api_key_leakage() {
     let env_input = "/provider add my-vllm http://127.0.0.1:8000/v1 custom-model openai $VLLM_KEY";
     let env_scrubbed = sanitize_history_line(env_input);
     assert_eq!(env_scrubbed, env_input);
+
+    // Key before model: masks key, does NOT mask model
+    let key_before_model =
+        "/provider add custom-vllm http://127.0.0.1:8000/v1 sk-FAKEseven custom-model";
+    let scrubbed_kbm = sanitize_history_line(key_before_model);
+    assert!(!scrubbed_kbm.contains("sk-FAKEseven"));
+    assert!(scrubbed_kbm.contains("custom-model"));
+    assert_eq!(
+        scrubbed_kbm,
+        "/provider add custom-vllm http://127.0.0.1:8000/v1 [REDACTED] custom-model"
+    );
+
+    // Preset with key before model: masks nvapi key, preserves model
+    let preset_kbm = "/provider add nim nvapi-FAKEfive meta/llama-3.1-70b-instruct";
+    let scrubbed_pkbm = sanitize_history_line(preset_kbm);
+    assert!(!scrubbed_pkbm.contains("nvapi-FAKEfive"));
+    assert!(scrubbed_pkbm.contains("meta/llama-3.1-70b-instruct"));
+    assert_eq!(
+        scrubbed_pkbm,
+        "/provider add nim [REDACTED] meta/llama-3.1-70b-instruct"
+    );
 }
 
 #[tokio::test]

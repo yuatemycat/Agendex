@@ -355,6 +355,22 @@ async fn main() -> anyhow::Result<()> {
                         if trimmed.is_empty() {
                             continue;
                         }
+
+                        let sanitized = agendex_cli::editor::sanitize_history_line(trimmed);
+                        if sanitized != trimmed && std::io::stdout().is_terminal() {
+                            use crossterm::{cursor, terminal, ExecutableCommand};
+                            use reedline::Prompt;
+                            let _ =
+                                std::io::stdout()
+                                    .execute(cursor::MoveUp(1))
+                                    .and_then(|stdout| {
+                                        stdout.execute(terminal::Clear(
+                                            terminal::ClearType::CurrentLine,
+                                        ))
+                                    });
+                            let p_str = prompt.render_prompt_left();
+                            println!("{}{}", p_str, sanitized);
+                        }
                         if trimmed == "exit"
                             || trimmed == "quit"
                             || trimmed == "/exit"

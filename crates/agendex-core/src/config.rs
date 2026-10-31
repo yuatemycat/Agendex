@@ -327,6 +327,114 @@ pub fn default_api_key_for_preset(provider_str: &str) -> String {
     }
 }
 
+/// Parsed arguments for `/provider add <name> ...`
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedProviderAddArgs {
+    pub name: String,
+    pub base_url: String,
+    pub model: Option<String>,
+    pub format: Option<String>,
+    pub api_key: Option<String>,
+}
+
+/// Returns true if a command-line token represents an API key or credential reference.
+pub fn is_likely_key_token(token: &str) -> bool {
+    token.starts_with("sk-")
+        || token.starts_with("nvapi-")
+        || token.starts_with("AIza")
+        || token.starts_with('$')
+        || token.starts_with("ghp_")
+        || token.starts_with("github_pat_")
+        || token.starts_with("AKIA")
+        || token.starts_with("xox")
+        || agendex_trajectory::mask_secrets(token).contains("[REDACTED]")
+}
+
+/// Parses the tokens of `/provider add <name> [args...]` regardless of argument order
+/// (e.g. key before model, url omitted for presets, etc.).
+pub fn parse_provider_add_tokens(parts: &[&str]) -> Option<ParsedProviderAddArgs> {
+    if parts.len() < 4 {
+        return None;
+    }
+    let name = parts[2].to_lowercase();
+    let mut rest: Vec<&str> = parts[3..].to_vec();
+
+    // 1. Extract base_url if present (starts with http:// or https://)
+    let url_idx = rest
+        .iter()
+        .position(|t| t.starts_with("http://") || t.starts_with("https://"));
+    let explicit_url = url_idx.map(|idx| rest.remove(idx).to_string());
+
+    // 2. Extract format if present (exact match "openai", "gemini", "anthropic")
+    let fmt_idx = rest
+        .iter()
+        .position(|&t| t == "openai" || t == "gemini" || t == "anthropic");
+    let explicit_fmt = fmt_idx.map(|idx| rest.remove(idx).to_string());
+
+    // 3. Classify remaining tokens between api_key and model
+    let (model, api_key) = match rest.len() {
+        0 => (None, None),
+        1 => {
+            let tok = rest[0];
+            if is_likely_key_token(tok) {
+                (None, Some(tok.to_string()))
+            } else if explicit_url.is_none() {
+                // E.g. `/provider add nim my-secret-token`
+                (None, Some(tok.to_string()))
+            } else {
+                // E.g. `/provider add custom-vllm http://127.0.0.1:8000/v1 custom-model`
+                (Some(tok.to_string()), None)
+            }
+        }
+        2 => {
+            let (tok0, tok1) = (rest[0], rest[1]);
+            if is_likely_key_token(tok0) {
+                // Key came before model! e.g. `/provider add custom http://... sk-FAKEseven custom-model`
+                (Some(tok1.to_string()), Some(tok0.to_string()))
+            } else if is_likely_key_token(tok1) {
+                // Model came before key! e.g. `/provider add custom http://... custom-model sk-FAKEseven`
+                (Some(tok0.to_string()), Some(tok1.to_string()))
+            } else {
+                // Neither token has a recognizable key prefix: default order is [model] [api_key]
+                (Some(tok0.to_string()), Some(tok1.to_string()))
+            }
+        }
+        _ => {
+            let key_idx = rest.iter().position(|&t| is_likely_key_token(t));
+            if let Some(k_idx) = key_idx {
+                let key_str = rest.remove(k_idx).to_string();
+                let model_str = rest.join(" ");
+                (Some(model_str), Some(key_str))
+            } else {
+                (Some(rest[0].to_string()), Some(rest[1..].join(" ")))
+            }
+        }
+    };
+
+    // 4. Resolve default base_url and format if not explicitly provided
+    let (_, default_base) = resolve_provider_preset(&name);
+    let resolved_base_url = explicit_url
+        .or(default_base)
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+
+    let resolved_format = explicit_fmt.unwrap_or_else(|| {
+        let (fmt, _) = resolve_provider_preset(&name);
+        match fmt {
+            ModelFormat::GoogleGemini => "gemini".to_string(),
+            ModelFormat::Anthropic => "anthropic".to_string(),
+            ModelFormat::OpenAi => "openai".to_string(),
+        }
+    });
+
+    Some(ParsedProviderAddArgs {
+        name,
+        base_url: resolved_base_url,
+        model,
+        format: Some(resolved_format),
+        api_key,
+    })
+}
+
 /// Parses a string representation into a `ModelTier`.
 pub fn parse_tier_string(val: &str) -> ModelTier {
     match val.to_lowercase().trim() {

@@ -146,11 +146,11 @@ pub fn mask_secrets(input: &str) -> String {
     let key_regexes = KEY_REGEXES.get_or_init(|| {
         vec![
             // Anthropic keys
-            Regex::new(r"(?i)\b(sk-ant-[a-zA-Z0-9_\-]{8,})\b").unwrap(),
+            Regex::new(r"(?i)\b(sk-ant-[a-zA-Z0-9_\-]{3,})\b").unwrap(),
             // OpenAI & general sk- keys
-            Regex::new(r"(?i)\b(sk-[a-zA-Z0-9_\-]{12,})\b").unwrap(),
+            Regex::new(r"(?i)\b(sk-[a-zA-Z0-9_\-]{3,})\b").unwrap(),
             // Nvidia NIM keys
-            Regex::new(r"(?i)\b(nvapi-[a-zA-Z0-9_\-]{8,})\b").unwrap(),
+            Regex::new(r"(?i)\b(nvapi-[a-zA-Z0-9_\-]{3,})\b").unwrap(),
             // Google AIza keys
             Regex::new(r"\b(AIza[0-9A-Za-z\-_]{35})\b").unwrap(),
             // GitHub tokens

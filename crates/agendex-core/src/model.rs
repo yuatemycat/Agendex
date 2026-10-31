@@ -221,6 +221,12 @@ where
                 return Ok(resp);
             }
             Ok(Err(e)) => {
+                if e.is_timeout() {
+                    return Err(anyhow::anyhow!(
+                        "Request timed out waiting for initial response from provider (exceeded {} seconds)",
+                        ttfb_timeout.as_secs()
+                    ));
+                }
                 if attempts < max_attempts {
                     tokio::time::sleep(backoff).await;
                     backoff *= 2;
@@ -229,11 +235,6 @@ where
                 return Err(e.into());
             }
             Err(_) => {
-                if attempts < max_attempts {
-                    tokio::time::sleep(backoff).await;
-                    backoff *= 2;
-                    continue;
-                }
                 return Err(anyhow::anyhow!(
                     "Request timed out waiting for initial response from provider (exceeded {} seconds)",
                     ttfb_timeout.as_secs()
@@ -555,8 +556,11 @@ impl ModelClient {
             let mut completion_tokens = 0usize;
 
             let mut buffer = String::new();
-            while let Some(chunk) =
-                next_chunk_with_timeout(&mut resp, std::time::Duration::from_secs(30)).await?
+            while let Some(chunk) = next_chunk_with_timeout(
+                &mut resp,
+                std::time::Duration::from_secs(self.timeout_secs),
+            )
+            .await?
             {
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
                 while let Some(pos) = buffer.find('\n') {
@@ -856,8 +860,11 @@ impl ModelClient {
             let mut completion_tokens = 0usize;
 
             let mut buffer = String::new();
-            while let Some(chunk) =
-                next_chunk_with_timeout(&mut resp, std::time::Duration::from_secs(30)).await?
+            while let Some(chunk) = next_chunk_with_timeout(
+                &mut resp,
+                std::time::Duration::from_secs(self.timeout_secs),
+            )
+            .await?
             {
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
                 while let Some(pos) = buffer.find('\n') {

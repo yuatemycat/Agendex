@@ -518,7 +518,7 @@ impl AgendexAgent {
             .store(false, std::sync::atomic::Ordering::SeqCst);
         self.emit_event(crate::events::AgentEvent::TurnStart {
             session_id: self.config.session_id.clone(),
-            prompt: user_input.to_string(),
+            prompt: agendex_trajectory::mask_secrets(user_input),
         });
 
         // 1. Check for slash command resolution
@@ -1760,59 +1760,17 @@ impl AgendexAgent {
                 }
             }
             "add" => {
-                if parts.len() < 4 {
-                    Ok("Usage: /provider add <name> <base_url> [model] [format] [api_key]\nExample: /provider add vllm http://localhost:8000/v1 meta-llama/Llama-3-8B openai $VLLM_KEY".to_string())
+                if let Some(parsed) = crate::config::parse_provider_add_tokens(&parts) {
+                    self.add_provider(
+                        &parsed.name,
+                        &parsed.base_url,
+                        parsed.model.as_deref(),
+                        parsed.format.as_deref(),
+                        parsed.api_key.as_deref(),
+                    )
+                    .await
                 } else {
-                    let name = parts[2];
-                    let (base_url, model, format, api_key) = match parts.len() {
-                        4 => {
-                            let arg = parts[3];
-                            if arg.starts_with("http://") || arg.starts_with("https://") {
-                                (arg.to_string(), None, None, None)
-                            } else {
-                                // Shorter 4-argument form: `/provider add <name> <api_key>`
-                                let (_, default_base) =
-                                    crate::config::resolve_provider_preset(name);
-                                (
-                                    default_base
-                                        .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
-                                    None,
-                                    None,
-                                    Some(arg),
-                                )
-                            }
-                        }
-                        5 => {
-                            let arg3 = parts[3];
-                            let arg4 = parts[4];
-                            if arg4.starts_with("sk-")
-                                || arg4.starts_with("nvapi-")
-                                || arg4.starts_with('$')
-                            {
-                                (arg3.to_string(), None, None, Some(arg4))
-                            } else {
-                                (arg3.to_string(), Some(arg4), None, None)
-                            }
-                        }
-                        6 => {
-                            let arg3 = parts[3];
-                            let arg4 = parts[4];
-                            let arg5 = parts[5];
-                            if arg5 == "openai" || arg5 == "gemini" || arg5 == "anthropic" {
-                                (arg3.to_string(), Some(arg4), Some(arg5), None)
-                            } else {
-                                (arg3.to_string(), Some(arg4), None, Some(arg5))
-                            }
-                        }
-                        _ => (
-                            parts[3].to_string(),
-                            parts.get(4).copied(),
-                            parts.get(5).copied(),
-                            parts.get(6).copied(),
-                        ),
-                    };
-                    self.add_provider(name, &base_url, model, format, api_key)
-                        .await
+                    Ok("Usage: /provider add <name> [base_url] [model] [format] [api_key]\nExample: /provider add vllm http://localhost:8000/v1 meta-llama/Llama-3-8B openai $VLLM_KEY\n         /provider add nim nvapi-secret meta/llama-3.1-70b-instruct".to_string())
                 }
             }
             "help" | "-h" | "--help" => Ok(self.provider_help()),

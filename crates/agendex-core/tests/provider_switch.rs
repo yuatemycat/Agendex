@@ -182,3 +182,78 @@ async fn test_provider_add_4_part_persists_to_env_and_uses_ref() -> anyhow::Resu
     let _ = std::fs::remove_dir_all(&tmp);
     Ok(())
 }
+
+#[tokio::test]
+async fn test_provider_add_key_before_model() -> anyhow::Result<()> {
+    let _lock = ENV_MUTEX.lock().unwrap();
+    let tmp = std::env::temp_dir().join(format!("agendex_prov_kbm_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp)?;
+    let test_cfg_path = tmp.join(".agendex").join("config.toml");
+    std::env::set_var("AGENDEX_HOME", &tmp);
+    std::env::set_var("AGENDEX_CONFIG", &test_cfg_path);
+
+    let config = AgentConfig {
+        workspace_dir: tmp.clone(),
+        ..Default::default()
+    };
+
+    let agent = AgendexAgent::init(config).await?;
+
+    // 1. Key before model with explicit base URL
+    // /provider add custom-kbm http://127.0.0.1:8000/v1 sk-FAKEseven custom-model
+    let add_out1 = agent
+        .process_turn("/provider add custom-kbm http://127.0.0.1:8000/v1 sk-FAKEseven custom-model")
+        .await?;
+
+    // Model must be custom-model, NOT [REDACTED]
+    assert!(
+        add_out1.contains("model: custom-model"),
+        "Expected 'model: custom-model' in reply, got: {}",
+        add_out1
+    );
+    assert!(
+        !add_out1.contains("model: [REDACTED]"),
+        "Must not mask the model field: {}",
+        add_out1
+    );
+    assert!(
+        !add_out1.contains("sk-FAKEseven"),
+        "Must not leak raw key in reply: {}",
+        add_out1
+    );
+
+    // Verify .env persisted the actual key
+    let env_file = tmp.join(".agendex").join(".env");
+    let env_content = std::fs::read_to_string(&env_file)?;
+    assert!(
+        env_content.contains("CUSTOM_KBM_API_KEY=sk-FAKEseven"),
+        "Expected actual key in .env, got: {}",
+        env_content
+    );
+
+    // 2. Preset with key before model: /provider add nim nvapi-FAKEfive meta/llama-3.1-70b-instruct
+    let add_out2 = agent
+        .process_turn("/provider add nim nvapi-FAKEfive meta/llama-3.1-70b-instruct")
+        .await?;
+
+    assert!(
+        add_out2.contains("model: meta/llama-3.1-70b-instruct"),
+        "Expected 'model: meta/llama-3.1-70b-instruct' in reply, got: {}",
+        add_out2
+    );
+    assert!(
+        !add_out2.contains("model: [REDACTED]"),
+        "Must not mask the model field: {}",
+        add_out2
+    );
+    assert!(
+        !add_out2.contains("nvapi-FAKEfive"),
+        "Must not leak raw key in reply: {}",
+        add_out2
+    );
+
+    std::env::remove_var("AGENDEX_HOME");
+    std::env::remove_var("AGENDEX_CONFIG");
+    let _ = std::fs::remove_dir_all(&tmp);
+    Ok(())
+}

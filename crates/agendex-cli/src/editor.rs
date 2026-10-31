@@ -167,32 +167,29 @@ pub fn sanitize_history_line(line: &str) -> String {
     let mut scrubbed =
         if trimmed.starts_with("/provider add") || trimmed.starts_with("/providers add") {
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            // Syntax variations:
-            // 1. /provider add <name> <base_url> [model] [format] [api_key] (7 parts)
-            // 2. /provider add <name> <base_url> [model] [api_key] (6 parts)
-            // 3. /provider add <name> <base_url> [api_key] (5 parts)
-            // 4. /provider add <name> <api_key> (4 parts)
-            let mut new_parts = Vec::new();
-            for (idx, part) in parts.iter().enumerate() {
-                if idx >= 3 {
-                    let is_key_token = part.starts_with("sk-")
-                        || part.starts_with("nvapi-")
-                        || part.starts_with("AIza")
-                        || (idx == parts.len() - 1
-                            && !part.starts_with('$')
-                            && !part.starts_with("http://")
-                            && !part.starts_with("https://")
-                            && *part != "openai"
-                            && *part != "gemini"
-                            && *part != "anthropic");
-                    if is_key_token && !part.starts_with('$') {
-                        new_parts.push("[REDACTED]");
-                        continue;
+            if let Some(parsed) = agendex_core::config::parse_provider_add_tokens(&parts) {
+                if let Some(ref key) = parsed.api_key {
+                    if !key.starts_with('$') {
+                        let mut new_parts = Vec::new();
+                        let mut replaced = false;
+                        for part in &parts {
+                            if !replaced && *part == key.as_str() {
+                                new_parts.push("[REDACTED]");
+                                replaced = true;
+                            } else {
+                                new_parts.push(*part);
+                            }
+                        }
+                        new_parts.join(" ")
+                    } else {
+                        trimmed.to_string()
                     }
+                } else {
+                    trimmed.to_string()
                 }
-                new_parts.push(*part);
+            } else {
+                trimmed.to_string()
             }
-            new_parts.join(" ")
         } else {
             line.to_string()
         };
