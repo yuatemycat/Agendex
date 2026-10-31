@@ -9,23 +9,29 @@ use agendex_core::agent::AgendexAgent;
 #[derive(Clone)]
 struct SpinnerController {
     running: Arc<AtomicBool>,
+    stopped: Arc<AtomicBool>,
 }
 
 impl SpinnerController {
     fn new() -> Self {
         Self {
             running: Arc::new(AtomicBool::new(false)),
+            stopped: Arc::new(AtomicBool::new(true)),
         }
     }
 
     fn start(&self, message: &'static str) -> tokio::task::JoinHandle<()> {
         self.running
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.stopped
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let r_clone = self.running.clone();
+        let s_clone = self.stopped.clone();
         let is_term = std::io::stdout().is_terminal() && env::var("NO_COLOR").is_err();
 
         tokio::spawn(async move {
             if !is_term {
+                s_clone.store(true, std::sync::atomic::Ordering::SeqCst);
                 return;
             }
             let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -43,6 +49,7 @@ impl SpinnerController {
             }
             eprint!("\r\x1b[2K");
             let _ = io::stderr().flush();
+            s_clone.store(true, std::sync::atomic::Ordering::SeqCst);
         })
     }
 
@@ -51,6 +58,12 @@ impl SpinnerController {
             .running
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
+            let start = std::time::Instant::now();
+            while !self.stopped.load(std::sync::atomic::Ordering::SeqCst)
+                && start.elapsed().as_millis() < 200
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             eprint!("\r\x1b[2K");
             let _ = io::stderr().flush();
         }

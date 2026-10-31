@@ -59,7 +59,6 @@ pub fn is_known_pricing_model(model_name: &str) -> bool {
     lower.contains("gemini-")
         || lower.contains("gpt-")
         || lower.contains("claude-")
-        || lower.contains("nemotron")
         || lower.contains("llama-3")
         || lower.contains("mistral")
         || lower.contains("deepseek")
@@ -114,11 +113,6 @@ pub fn estimate_cost_optional(
         m if m.contains("claude-3-opus") => {
             // $15.00 / 1M prompt, $75.00 / 1M completion
             (0.00001500, 0.00007500)
-        }
-        m if m.contains("nemotron") => {
-            // Nvidia NIM / OpenRouter Llama-3.1-Nemotron-70B hosted rate ($0.70 / 1M prompt, $0.70 / 1M completion)
-            // Reference: https://build.nvidia.com/nvidia/llama-3_1-nemotron-70b-instruct and OpenRouter catalog
-            (0.00000070, 0.00000070)
         }
         m if m.contains("llama-3.1-70b")
             || m.contains("llama-3.3-70b")
@@ -200,7 +194,8 @@ mod tests {
 
     #[test]
     fn test_unknown_models_default_to_zero_cost() {
-        assert!(is_known_pricing_model("nvidia/nemotron-4-340b-instruct"));
+        assert!(is_known_pricing_model("gpt-4o"));
+        assert!(!is_known_pricing_model("nvidia/nemotron-4-340b-instruct"));
         assert!(!is_known_pricing_model("my-private-model-v1"));
         assert!(estimate_cost_optional("my-private-model-v1", 1000, 500).is_none());
         assert_eq!(estimate_cost("my-private-model-v1", 1000, 500), 0.0);

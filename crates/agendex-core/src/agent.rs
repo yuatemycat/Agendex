@@ -367,12 +367,26 @@ impl AgendexAgent {
             use std::io::Write;
             println!("\n[Diff Review] Proposed changes to '{}':", path);
             println!("{}", diff);
-            print!("Apply this change? [y/N]: ");
+            print!("Apply this change? [y]es / [n]o / [e]dit / [a]lways allow: ");
             let _ = std::io::stdout().flush();
             let mut input = String::new();
             if std::io::stdin().read_line(&mut input).is_ok() {
                 let trimmed = input.trim().to_lowercase();
-                if trimmed == "y" || trimmed == "yes" {
+                if trimmed == "e" || trimmed == "edit" {
+                    let editor = std::env::var("EDITOR")
+                        .or_else(|_| std::env::var("VISUAL"))
+                        .unwrap_or_else(|_| {
+                            if cfg!(windows) {
+                                "notepad".to_string()
+                            } else {
+                                "nano".to_string()
+                            }
+                        });
+                    println!("Opening '{}' in {}...", path, editor);
+                    let _ = std::process::Command::new(editor).arg(path).status();
+                    return DiffApprovalResult::Approved;
+                }
+                if trimmed == "y" || trimmed == "yes" || trimmed == "a" || trimmed == "always" {
                     return DiffApprovalResult::Approved;
                 }
             }
@@ -2919,84 +2933,134 @@ fn format_num(n: usize) -> String {
     out
 }
 
-/// Determines if a shell command explicitly wrote, modified, or targeted a given relative file path,
-/// preventing unrelated external or user edits made during the command's execution from being attributed to the agent.
+/// Determines if a shell command could have written, modified, or targeted a given relative file path,
+/// preventing unrelated external or user edits made during the command's execution from being falsely attributed to the agent.
 fn command_wrote_or_targeted_path(cmd: &str, rel_path: &str) -> bool {
     let cmd_clean = cmd.replace('\\', "/");
     let cmd_lower = cmd_clean.to_lowercase();
     let norm_path = rel_path.replace('\\', "/");
     let norm_lower = norm_path.to_lowercase();
 
-    // 1. Pure read-only inspection or delay commands without redirection never create or edit workspace files
-    let is_pure_read_or_delay = {
-        let first_word = cmd_lower
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_start_matches("./");
-        matches!(
-            first_word,
-            "sleep"
-                | "timeout"
-                | "wait"
-                | "cat"
-                | "head"
-                | "tail"
-                | "ls"
-                | "dir"
-                | "grep"
-                | "find"
-                | "pwd"
-                | "whoami"
-                | "ps"
-                | "top"
-        ) && !cmd_lower.contains('>')
-            && !cmd_lower.contains(">>")
-            && !cmd_lower.contains('|')
-            && !cmd_lower.contains("out-file")
-            && !cmd_lower.contains("set-content")
+    // Check if the command contains any redirection or file-writing operators
+    let has_redirection = cmd_lower.contains('>')
+        || cmd_lower.contains(">>")
+        || cmd_lower.contains("tee ")
+        || cmd_lower.contains("out-file")
+        || cmd_lower.contains("set-content");
+
+    // 1. If every command segment in the pipeline/chain is a known pure read-only/inspection command without redirection,
+    // it is physically impossible for the command to write ANY file on disk.
+    let is_entirely_read_only = {
+        let segments: Vec<&str> = cmd_lower
+            .split(&['&', ';', '|'][..])
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        !has_redirection
+            && !segments.is_empty()
+            && segments.iter().all(|seg| {
+                let first_word = seg
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_start_matches("./");
+                matches!(
+                    first_word,
+                    "sleep"
+                        | "timeout"
+                        | "wait"
+                        | "cat"
+                        | "head"
+                        | "tail"
+                        | "grep"
+                        | "egrep"
+                        | "fgrep"
+                        | "rg"
+                        | "find"
+                        | "ls"
+                        | "dir"
+                        | "wc"
+                        | "pwd"
+                        | "whoami"
+                        | "id"
+                        | "ps"
+                        | "top"
+                        | "echo"
+                        | "printf"
+                        | "true"
+                        | "false"
+                        | "test"
+                        | "git"
+                ) && (!first_word.starts_with("git")
+                    || seg.contains("status")
+                    || seg.contains("log")
+                    || seg.contains("diff")
+                    || seg.contains("branch")
+                    || seg.contains("show"))
+            })
     };
-    if is_pure_read_or_delay {
+    if is_entirely_read_only {
         return false;
     }
 
-    // 2. Direct exact or substring match of relative path
-    if cmd_lower.contains(&norm_lower) {
-        return true;
-    }
-
-    // 3. Basename match (e.g. `main.rs`, `Cargo.toml`, `script.py`)
-    let p = std::path::Path::new(&norm_lower);
-    if let Some(fname) = p.file_name().and_then(|f| f.to_str()) {
-        if fname.len() >= 3 && cmd_lower.contains(fname) {
-            return true;
-        }
-    }
-
-    // 4. Directory ancestor match (e.g. `mkdir -p test_dir && cargo new test_dir`)
-    for comp in p.components() {
-        if let std::path::Component::Normal(comp_os) = comp {
-            if let Some(c_str) = comp_os.to_str() {
-                if c_str.len() >= 3
-                    && !matches!(c_str, "src" | "test" | "tests" | "lib" | "bin")
-                    && cmd_lower.contains(c_str)
-                {
-                    return true;
+    // 2. Scaffolding commands with specific folder targets (e.g. `cargo new zzz`, `cargo init my_dir`, `mkdir -p target_dir`)
+    for scaffolder in ["cargo new ", "cargo init ", "mkdir ", "mkdir -p "] {
+        if let Some(pos) = cmd_lower.find(scaffolder) {
+            let after = &cmd_lower[pos + scaffolder.len()..];
+            let segment = after.split(&[';', '&', '|'][..]).next().unwrap_or("");
+            let target_dir = segment
+                .split_whitespace()
+                .find(|w| !w.starts_with('-'))
+                .unwrap_or("")
+                .trim_matches(&['"', '\'', ';', '&', '|'][..]);
+            if !target_dir.is_empty() {
+                let target_clean = target_dir.trim_start_matches("./").trim_end_matches('/');
+                if !target_clean.is_empty() && !matches!(target_clean, "." | "src" | "lib") {
+                    // Only files inside this specific target directory belong to the scaffolder
+                    if norm_lower == target_clean
+                        || norm_lower.starts_with(&format!("{}/", target_clean))
+                    {
+                        return true;
+                    }
                 }
             }
         }
     }
 
-    // 5. Build/compiler or scaffolding commands that legitimately write untracked artifacts into subdirs
-    let is_scaffolder = cmd_lower.contains("cargo new")
-        || cmd_lower.contains("cargo init")
-        || cmd_lower.contains("npm init")
-        || cmd_lower.contains("npx create-")
-        || cmd_lower.contains("yarn create")
-        || cmd_lower.contains("pnpm create")
-        || cmd_lower.contains("git clone");
-    if is_scaffolder {
+    // 3. Execution tools, compilers, script interpreters, and build systems can legitimately create or modify files
+    // (e.g. python, python3, node, ruby, gcc, cargo build, make, sh, bash, or any command with output redirection)
+    let is_execution_tool = has_redirection
+        || cmd_lower.contains("python")
+        || cmd_lower.contains("python3")
+        || cmd_lower.contains("node")
+        || cmd_lower.contains("ruby")
+        || cmd_lower.contains("perl")
+        || cmd_lower.contains("bash")
+        || cmd_lower.contains("sh ")
+        || cmd_lower.contains("make")
+        || cmd_lower.contains("cargo build")
+        || cmd_lower.contains("cargo run")
+        || cmd_lower.contains("gcc")
+        || cmd_lower.contains("clang")
+        || cmd_lower.contains("rustc")
+        || cmd_lower.contains("npm ")
+        || cmd_lower.contains("yarn ")
+        || cmd_lower.contains("pnpm ");
+
+    if is_execution_tool {
         return true;
+    }
+
+    // 4. Fallback: check if relative path or basename is explicitly referenced in the command line
+    if cmd_lower.contains(&norm_lower) {
+        return true;
+    }
+    let p = std::path::Path::new(&norm_lower);
+    if let Some(fname) = p.file_name().and_then(|f| f.to_str()) {
+        if fname.len() >= 3 && cmd_lower.contains(fname) {
+            return true;
+        }
     }
 
     false
@@ -3013,6 +3077,40 @@ mod command_attribution_tests {
         assert!(!command_wrote_or_targeted_path("cat README.md", "mine.txt"));
         assert!(!command_wrote_or_targeted_path("ls -la", "src/main.rs"));
 
+        // Chained pipeline with grep and pipes: read-only, must NOT attribute mine.txt
+        assert!(!command_wrote_or_targeted_path(
+            "sleep 6 && grep keep mine.txt | wc -l",
+            "mine.txt"
+        ));
+
+        // Scaffolding scoped command: files inside target dir match, files outside do NOT match
+        assert!(command_wrote_or_targeted_path(
+            "cargo new zzz; sleep 6",
+            "zzz/Cargo.toml"
+        ));
+        assert!(command_wrote_or_targeted_path(
+            "cargo new zzz; sleep 6",
+            "zzz/src/main.rs"
+        ));
+        assert!(!command_wrote_or_targeted_path(
+            "cargo new zzz; sleep 6",
+            "foo.txt"
+        ));
+        assert!(!command_wrote_or_targeted_path(
+            "cargo new zzz; sleep 6",
+            "other_file.txt"
+        ));
+
+        // Script execution tools writing unreferenced files (e.g. Python writing out.json) MUST match
+        assert!(command_wrote_or_targeted_path(
+            "python make_data.py",
+            "out.json"
+        ));
+        assert!(command_wrote_or_targeted_path(
+            "python3 -c \"open('out.json', 'w').write('{}')\"",
+            "out.json"
+        ));
+
         // Direct redirection or file writing
         assert!(command_wrote_or_targeted_path(
             "cat << 'EOF' > src/main.rs",
@@ -3021,16 +3119,6 @@ mod command_attribution_tests {
         assert!(command_wrote_or_targeted_path(
             "echo 'hello' > foo.txt",
             "foo.txt"
-        ));
-        assert!(command_wrote_or_targeted_path(
-            "python -c \"open('out.json', 'w').write('{}')\"",
-            "out.json"
-        ));
-
-        // Scaffolding commands
-        assert!(command_wrote_or_targeted_path(
-            "cargo new my_app",
-            "my_app/Cargo.toml"
         ));
     }
 }

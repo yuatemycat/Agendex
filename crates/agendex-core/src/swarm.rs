@@ -302,7 +302,7 @@ impl SharedApprovalQueue {
                                     );
                                     print!("{}", card);
                                     print!(
-                                        "  {}Allow execution? [y]es / [n]o / [a]lways allow{} {}❯{} ",
+                                        "  {}Allow execution? [y]es / [n]o / [e]dit / [a]lways allow{} {}❯{} ",
                                         crate::ui::TEXT_PRIMARY,
                                         crate::ui::RESET,
                                         crate::ui::ACCENT_AMBER,
@@ -339,7 +339,7 @@ impl SharedApprovalQueue {
                                     let colored_diff = crate::ui::format_diff_colored(&path, &diff);
                                     print!("{}", colored_diff);
                                     print!(
-                                        "  {}Apply this change? [y]es / [n]o / [a]lways allow{} {}❯{} ",
+                                        "  {}Apply this change? [y]es / [n]o / [e]dit / [a]lways allow{} {}❯{} ",
                                         crate::ui::TEXT_PRIMARY,
                                         crate::ui::RESET,
                                         crate::ui::ACCENT_CYAN,
@@ -364,25 +364,68 @@ impl SharedApprovalQueue {
                             if let Some(ticket) = active_approval.take() {
                                 let trimmed = input.trim().to_lowercase();
                                 let is_always = trimmed == "a" || trimmed == "always";
+                                let is_edit = trimmed == "e" || trimmed == "edit";
                                 let approved = is_always || trimmed == "y" || trimmed == "yes";
                                 match ticket {
                                     ActiveApproval::Command { tx, command } => {
-                                        if is_always {
-                                            allowed_cmds_thread
-                                                .lock()
-                                                .unwrap()
-                                                .insert(command);
+                                        if is_edit {
+                                            let editor = std::env::var("EDITOR")
+                                                .or_else(|_| std::env::var("VISUAL"))
+                                                .unwrap_or_else(|_| {
+                                                    if cfg!(windows) {
+                                                        "notepad".to_string()
+                                                    } else {
+                                                        "nano".to_string()
+                                                    }
+                                                });
+                                            let ext = if cfg!(windows) { "bat" } else { "sh" };
+                                            let tmp_file = std::env::temp_dir().join(format!(
+                                                "agendex_cmd_{}.{}",
+                                                uuid::Uuid::new_v4(),
+                                                ext
+                                            ));
+                                            let _ = std::fs::write(&tmp_file, &command);
+                                            println!("Opening command in {}...", editor);
+                                            let _ = std::process::Command::new(editor)
+                                                .arg(&tmp_file)
+                                                .status();
+                                            let _ = std::fs::remove_file(&tmp_file);
+                                            let _ = tx.send(true);
+                                        } else {
+                                            if is_always {
+                                                allowed_cmds_thread
+                                                    .lock()
+                                                    .unwrap()
+                                                    .insert(command);
+                                            }
+                                            let _ = tx.send(approved);
                                         }
-                                        let _ = tx.send(approved);
                                     }
                                     ActiveApproval::Diff { tx, path } => {
-                                        if is_always {
-                                            allowed_diffs_thread
-                                                .lock()
-                                                .unwrap()
-                                                .insert(path);
+                                        if is_edit {
+                                            let editor = std::env::var("EDITOR")
+                                                .or_else(|_| std::env::var("VISUAL"))
+                                                .unwrap_or_else(|_| {
+                                                    if cfg!(windows) {
+                                                        "notepad".to_string()
+                                                    } else {
+                                                        "nano".to_string()
+                                                    }
+                                                });
+                                            println!("Opening '{}' in {}...", path, editor);
+                                            let _ = std::process::Command::new(editor)
+                                                .arg(&path)
+                                                .status();
+                                            let _ = tx.send(true);
+                                        } else {
+                                            if is_always {
+                                                allowed_diffs_thread
+                                                    .lock()
+                                                    .unwrap()
+                                                    .insert(path);
+                                            }
+                                            let _ = tx.send(approved);
                                         }
-                                        let _ = tx.send(approved);
                                     }
                                 }
 
@@ -415,7 +458,7 @@ impl SharedApprovalQueue {
                                                 );
                                             }
                                             println!("  {}", command);
-                                            print!("Allow execution? [y]es / [n]o / [a]lways allow: ");
+                                            print!("Allow execution? [y]es / [n]o / [e]dit / [a]lways allow: ");
                                             let _ = std::io::stdout().flush();
                                             active_approval = Some(ActiveApproval::Command {
                                                 tx: responder,
@@ -441,7 +484,7 @@ impl SharedApprovalQueue {
                                                 );
                                             }
                                             println!("{}", diff);
-                                            print!("Apply this change? [y]es / [n]o / [a]lways allow: ");
+                                            print!("Apply this change? [y]es / [n]o / [e]dit / [a]lways allow: ");
                                             let _ = std::io::stdout().flush();
                                             active_approval = Some(ActiveApproval::Diff {
                                                 tx: responder,
