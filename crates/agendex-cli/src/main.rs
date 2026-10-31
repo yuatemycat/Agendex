@@ -69,11 +69,22 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Direct tracing logs to stderr to keep stdout 100% clean for JSON lines
-    if parsed.json_mode {
-        let _ = tracing_subscriber::fmt().with_writer(io::stderr).try_init();
+    let is_one_shot = parsed.prompt.is_some();
+    // Direct tracing logs to stderr to keep stdout 100% clean for output/JSON
+    if parsed.json_mode || is_one_shot {
+        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(io::stderr)
+            .try_init();
     } else {
-        let _ = tracing_subscriber::fmt().try_init();
+        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(io::stderr)
+            .try_init();
     }
 
     agendex_core::ui::init_terminal();
@@ -174,10 +185,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if let Some(p) = prompt {
-        let spinner_handle = spinner_ctrl.start("Thinking...");
-        let turn_res = agent.process_turn(&p).await;
-        spinner_ctrl.stop();
-        let _ = spinner_handle.await;
+        let expanded_prompt = agendex_cli::editor::expand_file_mentions(&config.workspace_dir, &p);
+        let spinner_handle = if !parsed.json_mode {
+            Some(spinner_ctrl.start("Thinking..."))
+        } else {
+            None
+        };
+        let turn_res = agent.process_turn(&expanded_prompt).await;
+        if let Some(sh) = spinner_handle {
+            spinner_ctrl.stop();
+            let _ = sh.await;
+        }
         if !parsed.json_mode {
             let flushed = stream_filter.lock().unwrap().flush();
             if !flushed.is_empty() {
@@ -482,11 +500,17 @@ async fn main() -> anyhow::Result<()> {
                             trimmed,
                         );
 
-                        let spinner_handle = spinner_ctrl.start("Thinking...");
+                        let spinner_handle = if !parsed.json_mode {
+                            Some(spinner_ctrl.start("Thinking..."))
+                        } else {
+                            None
+                        };
                         tokio::select! {
                             turn_res = agent.process_turn(&expanded) => {
-                                spinner_ctrl.stop();
-                                let _ = spinner_handle.await;
+                                if let Some(sh) = spinner_handle {
+                                    spinner_ctrl.stop();
+                                    let _ = sh.await;
+                                }
                                 let flushed = stream_filter.lock().unwrap().flush();
                                 if !flushed.is_empty() {
                                     print!("{}", flushed);
@@ -522,8 +546,10 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                             _ = tokio::signal::ctrl_c() => {
-                                spinner_ctrl.stop();
-                                let _ = spinner_handle.await;
+                                if let Some(sh) = spinner_handle {
+                                    spinner_ctrl.stop();
+                                    let _ = sh.await;
+                                }
                                 let flushed = stream_filter.lock().unwrap().flush();
                                 if !flushed.is_empty() {
                                     print!("{}", flushed);

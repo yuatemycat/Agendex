@@ -280,7 +280,7 @@ pub fn mask_secrets(input: &str) -> String {
     // Preserves whitespace and surrounding quotes verbatim to avoid reformatting display/logs
     static INLINE_ASSIGN_REGEX: OnceLock<Regex> = OnceLock::new();
     let inline_re = INLINE_ASSIGN_REGEX.get_or_init(|| {
-        Regex::new(r#"(\b[A-Za-z0-9_]+\s*=\s*["']?)([^"'\s;&|\r\n]+)(["']?)"#).unwrap()
+        Regex::new(r#"(\b[A-Za-z0-9_]+\s*=\s*["']?)([^"'\s;&|\r\n\\]+)(["']?)"#).unwrap()
     });
     result = inline_re
         .replace_all(&result, |caps: &regex::Captures| {
@@ -289,7 +289,7 @@ pub fn mask_secrets(input: &str) -> String {
             let suffix = &caps[3];
             let key = prefix
                 .trim_start()
-                .trim_end_matches(|c| c == '=' || c == ' ' || c == '\t' || c == '"' || c == '\'')
+                .trim_end_matches(['=', ' ', '\t', '"', '\''])
                 .trim();
             if (is_sensitive_key_name(key) || is_sensitive_value(val))
                 && !is_safe_assignment(key, val)
@@ -305,7 +305,7 @@ pub fn mask_secrets(input: &str) -> String {
     static ENV_REGEX: OnceLock<Regex> = OnceLock::new();
     let env_re = ENV_REGEX.get_or_init(|| {
         Regex::new(
-            r#"(?m)^(\s*(?:export\s+)?([A-Za-z0-9_]{2,})\s*=\s*["']?)([^"'\r\n\s#]+)(["']?.*)$"#,
+            r#"(?m)^(\s*(?:export\s+)?([A-Za-z0-9_]{2,})\s*=\s*(["']?))([^"'\r\n\s#\\]*)(["']?.*)$"#,
         )
         .unwrap()
     });
@@ -314,8 +314,8 @@ pub fn mask_secrets(input: &str) -> String {
         .replace_all(&result, |caps: &regex::Captures| {
             let prefix = &caps[1];
             let key = &caps[2];
-            let val = &caps[3];
-            let suffix = &caps[4];
+            let val = &caps[4];
+            let suffix = &caps[5];
             if (is_sensitive_key_name(key) || is_sensitive_value(val))
                 && !is_safe_assignment(key, val)
             {
@@ -471,6 +471,7 @@ mod tests {
     fn test_mask_env_file_assignments() {
         let env_content = r#"
 # Database config
+NAME=demo
 DB_HOST=127.0.0.1
 DB_PORT=5432
 DB_PASSWORD=my_super_secret_db_pass_123
@@ -480,8 +481,19 @@ OPENAI_API_KEY=sk-live-secret-openai-key-999
 NVIDIA_API_KEY=nvapi-production-token-888
 SAFE_REF=$ALREADY_AN_ENV_VAR
 EMPTY_VAL=
+DEBUG=true
 "#;
         let masked = mask_secrets(env_content);
+        assert!(
+            masked.contains("NAME=demo"),
+            "Must retain NAME=demo, got: {}",
+            masked
+        );
+        assert!(
+            masked.contains("DEBUG=true"),
+            "Must retain DEBUG=true, got: {}",
+            masked
+        );
         assert!(!masked.contains("my_super_secret_db_pass_123"));
         assert!(!masked.contains("sk-live-secret-openai-key-999"));
         assert!(!masked.contains("nvapi-production-token-888"));

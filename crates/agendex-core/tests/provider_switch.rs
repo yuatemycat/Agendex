@@ -1,12 +1,12 @@
 use agendex_core::agent::{AgendexAgent, AgentConfig};
 use agendex_core::model::ModelFormat;
-use std::sync::Mutex;
+use tokio::sync::Mutex;
 
-static ENV_MUTEX: Mutex<()> = Mutex::new(());
+static ENV_MUTEX: Mutex<()> = Mutex::const_new(());
 
 #[tokio::test]
 async fn test_provider_slash_command_flow() -> anyhow::Result<()> {
-    let _lock = ENV_MUTEX.lock().unwrap();
+    let _lock = ENV_MUTEX.lock().await;
     let tmp = std::env::temp_dir().join(format!("agendex_provider_test_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp)?;
     let test_cfg_path = tmp.join("config.toml");
@@ -133,7 +133,7 @@ async fn test_provider_slash_command_flow() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_provider_add_4_part_persists_to_env_and_uses_ref() -> anyhow::Result<()> {
-    let _lock = ENV_MUTEX.lock().unwrap();
+    let _lock = ENV_MUTEX.lock().await;
     let tmp = std::env::temp_dir().join(format!("agendex_prov_4part_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp)?;
     let test_cfg_path = tmp.join(".agendex").join("config.toml");
@@ -185,7 +185,7 @@ async fn test_provider_add_4_part_persists_to_env_and_uses_ref() -> anyhow::Resu
 
 #[tokio::test]
 async fn test_provider_add_key_before_model() -> anyhow::Result<()> {
-    let _lock = ENV_MUTEX.lock().unwrap();
+    let _lock = ENV_MUTEX.lock().await;
     let tmp = std::env::temp_dir().join(format!("agendex_prov_kbm_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp)?;
     let test_cfg_path = tmp.join(".agendex").join("config.toml");

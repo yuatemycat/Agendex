@@ -271,6 +271,7 @@ async fn test_medium_repo_execution_with_context_compaction_and_revert() -> anyh
         auto_compaction: true,
         mcp_config: None,
         auto_approve_risky: true,
+        max_turn_tokens: None,
     };
 
     let agent = AgendexAgent::init(config.clone()).await?;

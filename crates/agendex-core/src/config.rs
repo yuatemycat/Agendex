@@ -30,6 +30,8 @@ pub struct AgendexConfigFile {
     pub tier: Option<String>,
     #[serde(default)]
     pub auto_approve_risky: Option<bool>,
+    #[serde(default)]
+    pub max_turn_tokens: Option<usize>,
 
     #[serde(default)]
     pub agent: Option<AgentConfigSection>,
@@ -61,6 +63,7 @@ pub struct AgentConfigSection {
     pub tier: Option<String>,
     pub auto_approve_risky: Option<bool>,
     pub max_tool_iterations: Option<usize>,
+    pub max_turn_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -250,10 +253,8 @@ pub fn expand_env_var_or_literal(val: &str) -> String {
         Some(&trimmed[2..trimmed.len() - 1])
     } else if let Some(stripped) = trimmed.strip_prefix('$') {
         Some(stripped)
-    } else if let Some(stripped) = trimmed.strip_prefix("env:") {
-        Some(stripped)
     } else {
-        None
+        trimmed.strip_prefix("env:")
     };
 
     if let Some(name) = var_name {
@@ -721,10 +722,12 @@ pub fn create_default_config_with_presets() -> AgendexConfigFile {
         api_key: Some("$NVIDIA_API_KEY".to_string()),
         tier: Some("128k".to_string()),
         auto_approve_risky: Some(false),
+        max_turn_tokens: None,
         agent: Some(AgentConfigSection {
             tier: Some("128k".to_string()),
             auto_approve_risky: Some(false),
             max_tool_iterations: Some(25),
+            max_turn_tokens: None,
         }),
         model_config_section: None,
         model_section: None,

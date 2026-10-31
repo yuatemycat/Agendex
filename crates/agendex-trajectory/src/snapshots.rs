@@ -500,7 +500,7 @@ impl SnapshotEngine {
             String::new()
         };
 
-        let mut normalized_touched: Vec<String> = agent_touched_files
+        let normalized_touched: Vec<String> = agent_touched_files
             .iter()
             .map(|f| normalize_rel_path(f, &self.workspace_dir))
             .collect();
@@ -511,30 +511,6 @@ impl SnapshotEngine {
             .rev()
             .find(|s| s.label == turn_label)
         {
-            let start_tree = snap.tree_hash.clone();
-            // Automatically capture all files modified during the turn (including shell edits/heredocs)
-            if !start_tree.is_empty() && !end_tree_hash.is_empty() && start_tree != end_tree_hash {
-                let mut diff_cmd = Command::new("git");
-                diff_cmd
-                    .args([
-                        "diff-tree",
-                        "-r",
-                        "--no-commit-id",
-                        "--name-only",
-                        &start_tree,
-                        &end_tree_hash,
-                    ])
-                    .current_dir(&self.workspace_dir);
-                if let Ok(out) = diff_cmd.output().await {
-                    for line in String::from_utf8_lossy(&out.stdout).lines() {
-                        let norm = normalize_rel_path(line.trim(), &self.workspace_dir);
-                        if !norm.is_empty() && !normalized_touched.contains(&norm) {
-                            normalized_touched.push(norm);
-                        }
-                    }
-                }
-            }
-
             let meta = snap.metadata.get_or_insert_with(|| serde_json::json!({}));
             if let Some(obj) = meta.as_object_mut() {
                 obj.insert(
@@ -683,12 +659,38 @@ impl SnapshotEngine {
             .and_then(|m| m.get("end_tree_hash"))
             .and_then(|h| h.as_str());
 
-        let raw_agent_touched: Vec<String> = target_record
+        let raw_agent_touched: Vec<String> = if let Some(arr) = target_record
             .metadata
             .as_ref()
             .and_then(|m| m.get("agent_touched_files"))
             .and_then(|f| serde_json::from_value(f.clone()).ok())
-            .unwrap_or_default();
+        {
+            arr
+        } else {
+            // Fallback for snapshots captured without agent_touched_files metadata:
+            // inspect diff-tree between target_record and current_tree
+            let mut diff_files = Vec::new();
+            let mut diff_cmd = Command::new("git");
+            diff_cmd
+                .args([
+                    "diff-tree",
+                    "-r",
+                    "--no-commit-id",
+                    "--name-only",
+                    &target_record.tree_hash,
+                    &current_tree,
+                ])
+                .current_dir(&self.workspace_dir);
+            if let Ok(out) = diff_cmd.output().await {
+                for line in String::from_utf8_lossy(&out.stdout).lines() {
+                    let trimmed = normalize_rel_path(line.trim(), &self.workspace_dir);
+                    if !trimmed.is_empty() && !diff_files.contains(&trimmed) {
+                        diff_files.push(trimmed);
+                    }
+                }
+            }
+            diff_files
+        };
 
         let agent_touched: Vec<String> = raw_agent_touched
             .iter()
@@ -697,7 +699,8 @@ impl SnapshotEngine {
 
         let mut external_modified: Vec<String> = Vec::new();
 
-        // 1. If we have end_tree_hash, check if working tree differs from end_tree_hash (i.e. user modified files AFTER the turn completed)
+        // 1. If we have end_tree_hash, check if working tree differs from end_tree_hash
+        // (i.e. user modified tracked files AFTER the turn completed)
         if let Some(eth) = end_tree {
             if !eth.is_empty() && eth != current_tree {
                 let mut diff_cmd = Command::new("git");
@@ -722,33 +725,6 @@ impl SnapshotEngine {
             }
         }
 
-        // 2. Also check if working tree differs from target_record.tree_hash in files NEVER touched by the agent
-        if !agent_touched.is_empty() {
-            let mut diff_target = Command::new("git");
-            diff_target
-                .args([
-                    "diff-tree",
-                    "-r",
-                    "--no-commit-id",
-                    "--name-only",
-                    &target_record.tree_hash,
-                    &current_tree,
-                ])
-                .current_dir(&self.workspace_dir);
-            if let Ok(out) = diff_target.output().await {
-                for line in String::from_utf8_lossy(&out.stdout).lines() {
-                    let trimmed = normalize_rel_path(line.trim(), &self.workspace_dir);
-                    if !trimmed.is_empty()
-                        && !agent_touched.contains(&trimmed)
-                        && !created_by_agent.contains(&trimmed)
-                        && !external_modified.contains(&trimmed)
-                    {
-                        external_modified.push(trimmed);
-                    }
-                }
-            }
-        }
-
         if !external_modified.is_empty() {
             anyhow::bail!(
                 "Refusing to revert: {} file(s) modified outside the agent since turn started: [{}]. Stash, commit, or discard manual changes first to prevent data loss.",
@@ -757,58 +733,30 @@ impl SnapshotEngine {
             );
         }
 
-        // 1. Unstage any user-created files from isolated index so git read-tree does not delete them
-        let mut ls_files_cmd = Command::new("git");
-        ls_files_cmd
-            .args(["ls-files"])
-            .current_dir(&self.workspace_dir);
-        if !self.index_file.as_os_str().is_empty() {
-            ls_files_cmd.env("GIT_INDEX_FILE", &self.index_file);
-        }
-        let ls_files_out = ls_files_cmd.output().await?;
-        let index_files = String::from_utf8_lossy(&ls_files_out.stdout);
-
-        for line in index_files.lines() {
-            let file = line.trim();
-            if file.is_empty() {
+        // 2. Rollback ONLY files touched by the agent during this turn
+        for rel_file in &agent_touched {
+            if created_by_agent.contains(rel_file) {
+                // Agent-created file will be removed in step 3
                 continue;
             }
             let mut ls_tree_cmd = Command::new("git");
             ls_tree_cmd
-                .args(["ls-tree", &target_record.tree_hash, file])
+                .args(["ls-tree", &target_record.tree_hash, rel_file])
                 .current_dir(&self.workspace_dir);
-            let ls_tree_out = ls_tree_cmd.output().await?;
-            let in_target = !String::from_utf8_lossy(&ls_tree_out.stdout)
-                .trim()
-                .is_empty();
+            let in_target = ls_tree_cmd
+                .output()
+                .await
+                .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+                .unwrap_or(false);
 
-            if !in_target {
-                let is_agent_created = created_by_agent.iter().any(|c| c == file);
-                if !is_agent_created {
-                    // User file created outside agent tools: unstage from isolated index
-                    // so git read-tree treats it as untracked and preserves it completely!
-                    let mut rm_cached = Command::new("git");
-                    rm_cached
-                        .args(["rm", "--cached", "--quiet", "--force", "--", file])
-                        .current_dir(&self.workspace_dir);
-                    if !self.index_file.as_os_str().is_empty() {
-                        rm_cached.env("GIT_INDEX_FILE", &self.index_file);
-                    }
-                    let _ = rm_cached.output().await;
-                }
+            if in_target {
+                let mut checkout_cmd = Command::new("git");
+                checkout_cmd
+                    .args(["checkout", &target_record.tree_hash, "--", rel_file])
+                    .current_dir(&self.workspace_dir);
+                let _ = checkout_cmd.output().await;
             }
         }
-
-        // 2. Rollback workspace files using git read-tree
-        let mut read_cmd = Command::new("git");
-        read_cmd
-            .args(["read-tree", "-u", "--reset", &target_record.tree_hash])
-            .current_dir(&self.workspace_dir);
-        if !self.index_file.as_os_str().is_empty() {
-            read_cmd.env("GIT_INDEX_FILE", &self.index_file);
-        }
-        let read_out = read_cmd.output().await?;
-        Self::check_output(&read_out, "git read-tree -u --reset")?;
 
         // 3. Remove files the agent created during this turn, verifying they did not exist in target tree
         let mut removed_files = Vec::new();
@@ -827,6 +775,13 @@ impl SnapshotEngine {
                     if let Ok(()) = tokio::fs::remove_file(&full_path).await {
                         removed_files.push(full_path);
                     }
+                } else {
+                    // File existed at start of turn in target tree: checkout target version
+                    let mut checkout_cmd = Command::new("git");
+                    checkout_cmd
+                        .args(["checkout", &target_record.tree_hash, "--", rel_file])
+                        .current_dir(&self.workspace_dir);
+                    let _ = checkout_cmd.output().await;
                 }
             }
         }
@@ -1548,10 +1503,12 @@ mod tests {
         )
         .await?;
 
-        // Turn completed without explicit manual touch list (simulating unindexed shell command execution)
-        engine.record_turn_completed("turn_start:1", &[]).await?;
+        // Agent records modified file in turn completion
+        engine
+            .record_turn_completed("turn_start:1", &["src/main.rs".to_string()])
+            .await?;
 
-        // Rollback turn must succeed (counting shell edits as agent's own)
+        // Rollback turn must succeed (restoring agent touched files)
         let revert_res = engine.rollback_turn().await?;
         assert!(
             revert_res.is_some(),
@@ -1560,6 +1517,70 @@ mod tests {
 
         let restored = tokio::fs::read_to_string(&target_file).await?;
         assert_eq!(restored, "// Original code\nfn main() {}\n");
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_revert_preserves_user_edits_made_during_turn() -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "agendex_test_revert_user_edit_{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&temp_dir).await?;
+
+        let mut engine = SnapshotEngine::new(&temp_dir)?;
+
+        let agent_file = temp_dir.join("agent_code.rs");
+        let user_file = temp_dir.join("mine.txt");
+        tokio::fs::write(&agent_file, "// Agent original code\n").await?;
+        tokio::fs::write(&user_file, "Original user text\n").await?;
+
+        // Stage initial workspace state
+        let _ = tokio::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&temp_dir)
+            .output()
+            .await;
+
+        // Turn start snapshot
+        engine
+            .capture_snapshot_with_metadata(
+                "turn_start:1",
+                Some(serde_json::json!({
+                    "kind": "turn_start",
+                    "step_index": 1,
+                    "created_files": []
+                })),
+            )
+            .await?;
+
+        // 1. Agent modifies agent_code.rs
+        tokio::fs::write(&agent_file, "// Agent bad modification\n").await?;
+
+        // 2. User modifies mine.txt during the turn (e.g. while agent is working)
+        tokio::fs::write(&user_file, "User important edit during turn\n").await?;
+
+        // Turn completed: agent touched agent_code.rs
+        engine
+            .record_turn_completed("turn_start:1", &["agent_code.rs".to_string()])
+            .await?;
+
+        // User triggers /revert
+        let res = engine.rollback_turn().await?;
+        assert!(res.is_some());
+
+        // Agent's file must be rolled back
+        let agent_content = tokio::fs::read_to_string(&agent_file).await?;
+        assert_eq!(agent_content, "// Agent original code\n");
+
+        // User's file must be COMPLETELY PRESERVED with their edits intact
+        let user_content = tokio::fs::read_to_string(&user_file).await?;
+        assert_eq!(
+            user_content, "User important edit during turn\n",
+            "User's edit during the turn must NEVER be wiped by /revert"
+        );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
         Ok(())

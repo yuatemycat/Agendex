@@ -211,7 +211,8 @@ where
                 if (status == reqwest::StatusCode::TOO_MANY_REQUESTS
                     || status == reqwest::StatusCode::BAD_GATEWAY
                     || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-                    || status == reqwest::StatusCode::GATEWAY_TIMEOUT)
+                    || status == reqwest::StatusCode::GATEWAY_TIMEOUT
+                    || status == reqwest::StatusCode::INTERNAL_SERVER_ERROR)
                     && attempts < max_attempts
                 {
                     let sleep_duration = resp
@@ -318,7 +319,7 @@ impl ModelClient {
         on_token: Option<TokenStreamHandler>,
     ) -> anyhow::Result<ModelResponse> {
         let mut stream_attempts = 0;
-        let max_stream_attempts = 3;
+        let max_stream_attempts = 5;
         let mut stream_backoff = std::time::Duration::from_millis(1500);
 
         loop {
@@ -348,6 +349,11 @@ impl ModelClient {
                         || err_msg.contains("stream ended prematurely")
                         || err_msg.contains("Connection reset by peer")
                         || err_msg.contains("error reading a body from connection")
+                        || err_msg.contains("error decoding response body")
+                        || err_msg.contains("connection error")
+                        || err_msg.contains("hyper::Error")
+                        || err_msg.contains("chunked transfer")
+                        || err_msg.contains("premature EOF")
                         || err_msg.contains("unexpected end of file")
                         || err_msg.contains("incomplete message")
                         || err_msg.contains("stream error"))

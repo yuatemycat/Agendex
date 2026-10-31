@@ -26,6 +26,7 @@ pub struct AgentConfig {
     pub max_tool_iterations: usize,
     pub mcp_config: Option<PathBuf>,
     pub auto_approve_risky: bool,
+    pub max_turn_tokens: Option<usize>,
 }
 
 impl Default for AgentConfig {
@@ -39,6 +40,7 @@ impl Default for AgentConfig {
             max_tool_iterations: 25,
             mcp_config: None,
             auto_approve_risky: false,
+            max_turn_tokens: None,
         }
     }
 }
@@ -514,7 +516,8 @@ impl AgendexAgent {
             self.config.clone(),
             mailbox,
             worktree_mgr,
-        );
+        )
+        .with_trajectory(Arc::clone(&self.trajectory));
         if let Some(queue) = &self.approval_queue {
             mgr = mgr.with_approval_queue(Arc::clone(queue));
         } else if let Some(handler) = &self.approval_handler {
@@ -1050,9 +1053,14 @@ impl AgendexAgent {
                 .store(turn_completion_tokens, std::sync::atomic::Ordering::SeqCst);
 
             // Per-turn token ceiling guard to prevent runaway spend or recursive loops
-            let max_turn_tokens: usize = std::env::var("AGENDEX_MAX_TURN_TOKENS")
-                .ok()
-                .and_then(|v| v.parse().ok())
+            let max_turn_tokens: usize = self
+                .config
+                .max_turn_tokens
+                .or_else(|| {
+                    std::env::var("AGENDEX_MAX_TURN_TOKENS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                })
                 .unwrap_or(500_000);
 
             if (turn_prompt_tokens + turn_completion_tokens) >= max_turn_tokens {
@@ -1324,6 +1332,7 @@ impl AgendexAgent {
                     return format!("Command denied by safety policy: {}", reason);
                 }
                 crate::safety::CommandSafetyVerdict::NeedsApproval { risk_reason } => {
+                    self.notify_activity();
                     let approved = if self
                         .auto_approve_yolo
                         .load(std::sync::atomic::Ordering::SeqCst)
@@ -1555,6 +1564,7 @@ impl AgendexAgent {
                     content_preview
                 );
 
+                self.notify_activity();
                 let approved = if let Some(queue) = &self.approval_queue {
                     let agent_id = self.effective_subagent_id();
                     queue.request_approval(agent_id, &action, &reason).await
@@ -1630,7 +1640,7 @@ impl AgendexAgent {
                         .arguments
                         .get("overwrite")
                         .and_then(|o| o.as_bool())
-                        .unwrap_or(false);
+                        .unwrap_or(true);
                     let append = tc
                         .arguments
                         .get("append")
@@ -1807,12 +1817,12 @@ impl AgendexAgent {
                             }
                         }
                         self.notify_progress(&format!("[Tool: {}] Completed.", tc.name));
-                        let out_str =
-                            serde_json::to_string_pretty(&res).unwrap_or_else(|_| "{}".to_string());
+                        let mut res_clean = res;
                         if tc.name == "read_file" || tc.name == "run_command" || tc.name == "grep" {
-                            return agendex_trajectory::mask_secrets(&out_str);
+                            res_clean = agendex_trajectory::redact_json_value(&res_clean);
                         }
-                        out_str
+                        serde_json::to_string_pretty(&res_clean)
+                            .unwrap_or_else(|_| "{}".to_string())
                     }
                     Err(e) => {
                         self.notify_progress(&format!("[Tool: {}] Error: {}", tc.name, e));

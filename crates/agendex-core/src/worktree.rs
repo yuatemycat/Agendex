@@ -79,25 +79,29 @@ impl WorktreeManager {
                 .status();
         }
 
-        // Stage and commit any existing files so HEAD contains full workspace files for worktree checkout
-        let _ = Command::new("git")
-            .args(["add", "-A"])
+        // Check if HEAD exists in the repository
+        let head_check = Command::new("git")
+            .args(["rev-parse", "--verify", "HEAD"])
             .current_dir(&self.base_repo_path)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
 
-        let _ = Command::new("git")
-            .args([
-                "commit",
-                "-m",
-                "chore: sync files for worktree initialization",
-                "--allow-empty",
-            ])
-            .current_dir(&self.base_repo_path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        if !head_check.map(|s| s.success()).unwrap_or(false) {
+            // Only create an empty initial commit if the repo has zero commits,
+            // using --allow-empty WITHOUT staging any files or touching user files
+            let _ = Command::new("git")
+                .args([
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "chore: initial commit for worktree initialization",
+                ])
+                .current_dir(&self.base_repo_path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
 
         Ok(())
     }
@@ -193,6 +197,13 @@ impl WorktreeManager {
                     let err = String::from_utf8_lossy(&output.stderr);
                     anyhow::bail!("Failed to create Git worktree: {}", err);
                 }
+
+                // Copy uncommitted project files to worktree without modifying base repo git state
+                copy_dir_recursive(
+                    &self.base_repo_path,
+                    &dest_path,
+                    &[".git", "target", ".agendex", ".agenda"],
+                )?;
 
                 let ws = IsolatedWorkspace {
                     id: id.to_string(),

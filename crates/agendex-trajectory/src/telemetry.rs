@@ -116,8 +116,8 @@ pub fn estimate_cost_optional(
             (0.00001500, 0.00007500)
         }
         m if m.contains("nemotron") => {
-            // Nvidia NIM Nemotron ($0.70 / 1M prompt, $2.80 / 1M completion)
-            (0.00000070, 0.00000280)
+            // Nvidia NIM Nemotron official catalog pricing ($1.20 / 1M prompt, $1.20 / 1M completion)
+            (0.00000120, 0.00000120)
         }
         m if m.contains("llama-3.1-70b")
             || m.contains("llama-3.3-70b")

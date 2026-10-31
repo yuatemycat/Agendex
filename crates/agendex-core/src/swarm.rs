@@ -278,6 +278,7 @@ impl SharedApprovalQueue {
                                         responder,
                                     });
                                 } else {
+                                    eprint!("\r\x1b[2K");
                                     let card = crate::ui::format_safety_gate_card(
                                         &command,
                                         &reason,
@@ -316,6 +317,7 @@ impl SharedApprovalQueue {
                                         responder,
                                     });
                                 } else {
+                                    eprint!("\r\x1b[2K");
                                     let colored_diff = crate::ui::format_diff_colored(&path, &diff);
                                     print!("{}", colored_diff);
                                     print!(
@@ -588,6 +590,7 @@ pub struct SubagentManager {
     join_handles: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     pub approval_handler: Option<ApprovalHandler>,
     pub approval_queue: Option<Arc<SharedApprovalQueue>>,
+    pub parent_trajectory: Option<Arc<tokio::sync::Mutex<agendex_trajectory::TrajectoryLogger>>>,
 }
 
 impl SubagentManager {
@@ -617,7 +620,16 @@ impl SubagentManager {
             join_handles: Arc::new(Mutex::new(HashMap::new())),
             approval_handler: None,
             approval_queue: None,
+            parent_trajectory: None,
         }
+    }
+
+    pub fn with_trajectory(
+        mut self,
+        traj: Arc<tokio::sync::Mutex<agendex_trajectory::TrajectoryLogger>>,
+    ) -> Self {
+        self.parent_trajectory = Some(traj);
+        self
     }
 
     pub fn with_approval_handler(mut self, handler: ApprovalHandler) -> Self {
@@ -709,6 +721,7 @@ impl SubagentManager {
         let prompt_owned = prompt.to_string();
         let approval_queue = self.approval_queue.clone();
         let approval_handler = self.approval_handler.clone();
+        let parent_trajectory = self.parent_trajectory.clone();
 
         // 3. Spawn background execution task
         let handle = tokio::spawn(async move {
@@ -741,6 +754,18 @@ impl SubagentManager {
                         .with_parent_id(parent_id_clone);
 
                     let turn_res = agent.process_turn(&prompt_owned).await;
+                    if let Some(usage) = agent.last_turn_usage().await {
+                        if let Some(ref p_traj) = parent_trajectory {
+                            let mut t = p_traj.lock().await;
+                            let _ = t.record_token_usage(
+                                None,
+                                usage.prompt_tokens,
+                                usage.completion_tokens,
+                                usage.estimated_cost,
+                                true,
+                            );
+                        }
+                    }
                     match turn_res {
                         Ok(output) => {
                             let mut inst_map = instances.write().await;

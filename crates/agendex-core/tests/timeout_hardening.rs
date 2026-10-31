@@ -1,14 +1,14 @@
 use agendex_core::model::{ChatMessage, ModelClient, ModelConfig, ModelFormat};
-use std::sync::Mutex;
 use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 
-static TIMEOUT_ENV_MUTEX: Mutex<()> = Mutex::new(());
+static TIMEOUT_ENV_MUTEX: Mutex<()> = Mutex::const_new(());
 
 #[tokio::test]
 async fn test_first_byte_timeout_does_not_retry() -> anyhow::Result<()> {
-    let _lock = TIMEOUT_ENV_MUTEX.lock().unwrap();
+    let _lock = TIMEOUT_ENV_MUTEX.lock().await;
     std::env::set_var("AGENDEX_REQUEST_TIMEOUT_SECS", "1");
 
     // Bind a listener that accepts the connection and sleeps (hung provider)
@@ -65,7 +65,7 @@ async fn test_first_byte_timeout_does_not_retry() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_mid_stream_stall_honors_request_timeout_setting() -> anyhow::Result<()> {
-    let _lock = TIMEOUT_ENV_MUTEX.lock().unwrap();
+    let _lock = TIMEOUT_ENV_MUTEX.lock().await;
     std::env::set_var("AGENDEX_REQUEST_TIMEOUT_SECS", "1");
 
     // Bind a server that sends SSE headers and one chunk, then stalls

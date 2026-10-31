@@ -11,6 +11,75 @@ pub struct GitCommitResult {
     pub files_changed: Vec<String>,
 }
 
+/// Formats a user task prompt into a structured Conventional Commit message.
+pub fn format_commit_message(summary: &str) -> String {
+    let trimmed = summary.trim();
+    if trimmed.is_empty() {
+        return "chore: task completed via Agendex".to_string();
+    }
+    if trimmed.starts_with("feat:")
+        || trimmed.starts_with("fix:")
+        || trimmed.starts_with("chore:")
+        || trimmed.starts_with("refactor:")
+        || trimmed.starts_with("docs:")
+        || trimmed.starts_with("test:")
+    {
+        return trimmed.to_string();
+    }
+
+    let clean = trimmed
+        .trim_start_matches("Please ")
+        .trim_start_matches("please ")
+        .trim_start_matches("Can you ")
+        .trim_start_matches("can you ")
+        .trim_start_matches("Could you ")
+        .trim_start_matches("could you ")
+        .trim_start_matches("I need you to ")
+        .trim_start_matches("Help me ")
+        .trim();
+
+    let clean_lower = clean.to_lowercase();
+    let prefix = if clean_lower.starts_with("fix")
+        || clean_lower.starts_with("bug")
+        || clean_lower.starts_with("patch")
+        || clean_lower.starts_with("resolve")
+    {
+        "fix"
+    } else if clean_lower.starts_with("add")
+        || clean_lower.starts_with("create")
+        || clean_lower.starts_with("implement")
+        || clean_lower.starts_with("build")
+        || clean_lower.starts_with("new")
+    {
+        "feat"
+    } else if clean_lower.starts_with("refactor")
+        || clean_lower.starts_with("rename")
+        || clean_lower.starts_with("clean")
+    {
+        "refactor"
+    } else if clean_lower.starts_with("test") {
+        "test"
+    } else if clean_lower.starts_with("doc") {
+        "docs"
+    } else {
+        "chore"
+    };
+
+    let first_line = clean.lines().next().unwrap_or(clean).trim();
+    let first_line = first_line.trim_end_matches('.');
+    let subject = if first_line.len() > 65 {
+        format!("{}: {}", prefix, first_line[..65].trim())
+    } else {
+        format!("{}: {}", prefix, first_line)
+    };
+
+    if trimmed.lines().count() > 1 || trimmed.len() > 72 {
+        format!("{}\n\nTask prompt:\n{}", subject, trimmed)
+    } else {
+        subject
+    }
+}
+
 /// Resolves Git author identity overrides (user.name and user.email).
 /// If not already configured in repository or globally, returns Agendex defaults
 /// to be passed as runtime flags/environment variables without mutating the repo's `.git/config`.
@@ -192,23 +261,7 @@ pub async fn commit_task_changes(
     }
 
     // 2. Format commit message
-    let trimmed = summary.trim();
-    let commit_msg = if trimmed.is_empty() {
-        "chore: task completed via Agendex".to_string()
-    } else if trimmed.starts_with("feat:")
-        || trimmed.starts_with("fix:")
-        || trimmed.starts_with("chore:")
-        || trimmed.starts_with("agendex:")
-    {
-        trimmed.to_string()
-    } else {
-        let first_line = trimmed.lines().next().unwrap_or("task completed").trim();
-        if first_line.len() > 72 {
-            format!("agendex: {}\n\n{}", &first_line[..72], trimmed)
-        } else {
-            format!("agendex: {}", trimmed)
-        }
-    };
+    let commit_msg = format_commit_message(summary);
 
     // 3. Commit changes with author identity without mutating repo config
     let (extra_name, extra_email) = resolve_git_author_env(workspace_dir).await;

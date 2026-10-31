@@ -201,8 +201,9 @@ pub fn generate_unified_diff(file_path: &str, old_content: &str, new_content: &s
     }
 
     let mut result = String::new();
-    result.push_str(&format!("--- a/{}\n", normalized_path));
-    result.push_str(&format!("+++ b/{}\n", normalized_path));
+    let clean_path = normalized_path.trim_start_matches('/');
+    result.push_str(&format!("--- a/{}\n", clean_path));
+    result.push_str(&format!("+++ b/{}\n", clean_path));
 
     for hunk in hunks {
         result.push_str(&format!(

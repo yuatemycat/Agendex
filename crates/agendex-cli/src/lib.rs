@@ -41,6 +41,7 @@ pub fn try_parse_cli_args(args: &[String], current_dir: PathBuf) -> anyhow::Resu
     let mut git_commit = false;
     let mut git_branch: Option<String> = None;
     let mut provider: Option<String> = None;
+    let mut max_turn_tokens: Option<usize> = None;
 
     // First scan for an explicit --config flag
     let mut explicit_config_path: Option<PathBuf> = None;
@@ -73,11 +74,13 @@ pub fn try_parse_cli_args(args: &[String], current_dir: PathBuf) -> anyhow::Resu
             max_tool_iterations: 25,
             mcp_config: mcp_config.clone(),
             auto_approve_risky: auto_approve,
+            max_turn_tokens,
         };
         cfg.apply_to_agent_config(&mut temp_agent_config);
         model_config = temp_agent_config.model;
         tier = temp_agent_config.model_tier;
         auto_approve = temp_agent_config.auto_approve_risky;
+        max_turn_tokens = temp_agent_config.max_turn_tokens;
     }
 
     let mut i = 1;
@@ -205,6 +208,14 @@ pub fn try_parse_cli_args(args: &[String], current_dir: PathBuf) -> anyhow::Resu
             "--git-commit" => {
                 git_commit = true;
             }
+            "--max-turn-tokens" => {
+                if i + 1 < args.len() {
+                    if let Ok(val) = args[i + 1].parse::<usize>() {
+                        max_turn_tokens = Some(val);
+                    }
+                    i += 1;
+                }
+            }
             "--git-branch" => {
                 if i + 1 < args.len() {
                     git_branch = Some(args[i + 1].clone());
@@ -228,6 +239,7 @@ pub fn try_parse_cli_args(args: &[String], current_dir: PathBuf) -> anyhow::Resu
         max_tool_iterations: 25,
         mcp_config,
         auto_approve_risky: auto_approve,
+        max_turn_tokens,
     };
 
     Ok(CliParsedArgs {

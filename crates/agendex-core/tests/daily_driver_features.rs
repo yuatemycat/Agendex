@@ -166,6 +166,7 @@ async fn test_interactive_diff_acceptance_applies_edit() -> anyhow::Result<()> {
         max_tool_iterations: 5,
         mcp_config: None,
         auto_approve_risky: false,
+        max_turn_tokens: None,
     };
 
     let diff_received = Arc::new(std::sync::Mutex::new(String::new()));
@@ -258,6 +259,7 @@ async fn test_interactive_diff_rejection_leaves_file_untouched() -> anyhow::Resu
         max_tool_iterations: 5,
         mcp_config: None,
         auto_approve_risky: false,
+        max_turn_tokens: None,
     };
 
     let agent = AgendexAgent::init(config)
@@ -336,6 +338,7 @@ async fn test_write_file_existing_diff_rejection() -> anyhow::Result<()> {
         max_tool_iterations: 5,
         mcp_config: None,
         auto_approve_risky: false,
+        max_turn_tokens: None,
     };
 
     let agent = AgendexAgent::init(config)
@@ -414,6 +417,7 @@ async fn test_streaming_tokens_and_tool_progress_callbacks() -> anyhow::Result<(
         max_tool_iterations: 5,
         mcp_config: None,
         auto_approve_risky: true,
+        max_turn_tokens: None,
     };
 
     let streamed_tokens = Arc::new(std::sync::Mutex::new(Vec::new()));
