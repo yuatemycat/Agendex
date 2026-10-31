@@ -124,6 +124,12 @@ async fn main() -> anyhow::Result<()> {
         };
 
     let spinner_ctrl = SpinnerController::new();
+    if let Some(ref queue) = approval_queue {
+        let sc_q = spinner_ctrl.clone();
+        queue.set_activity_hook(Arc::new(move || {
+            sc_q.stop();
+        }));
+    }
     let stream_filter = Arc::new(std::sync::Mutex::new(
         agendex_trajectory::StreamingSecretFilter::new(),
     ));

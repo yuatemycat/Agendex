@@ -1454,25 +1454,27 @@ impl AgendexAgent {
                         Err(e) => return format!("Failed to edit {}: {}", path, e),
                     };
 
+                let rel_path =
+                    agendex_trajectory::normalize_rel_path(path, &self.config.workspace_dir);
                 let diff = agendex_ast::diff::generate_unified_diff(
-                    path,
+                    &rel_path,
                     &old_content,
                     &patch_res.content,
                 );
                 if !diff.is_empty() {
-                    match self.request_diff_approval(path, &diff).await {
+                    match self.request_diff_approval(&rel_path, &diff).await {
                         DiffApprovalResult::Approved => {}
                         DiffApprovalResult::RejectedByUser => {
                             self.notify_progress(&format!(
                                 "[Tool: edit_file] Edit on '{}' declined by user.",
-                                path
+                                rel_path
                             ));
-                            return "Edit declined by user. Do NOT retry this edit; choose an alternative approach or ask the user for guidance.".to_string();
+                            return "Edit permanently declined by user for this turn. STOP trying to modify this file. Retrying will be rejected immediately. Conclude your turn or explain why you are blocked to the user.".to_string();
                         }
                         DiffApprovalResult::RejectedNonTerminal => {
                             self.notify_progress(&format!(
                                 "[Tool: edit_file] Edit on '{}' rejected: requires interactive terminal approval or -y/--auto-approve flag.",
-                                path
+                                rel_path
                             ));
                             return "Edit rejected: non-interactive session requires -y/--auto-approve to apply changes without terminal prompt.".to_string();
                         }
@@ -1662,25 +1664,29 @@ impl AgendexAgent {
                             };
 
                             if old_content != new_content {
-                                let diff = agendex_ast::diff::generate_unified_diff(
+                                let rel_path = agendex_trajectory::normalize_rel_path(
                                     path_str,
+                                    &self.config.workspace_dir,
+                                );
+                                let diff = agendex_ast::diff::generate_unified_diff(
+                                    &rel_path,
                                     &old_content,
                                     &new_content,
                                 );
                                 if !diff.is_empty() {
-                                    match self.request_diff_approval(path_str, &diff).await {
+                                    match self.request_diff_approval(&rel_path, &diff).await {
                                         DiffApprovalResult::Approved => {}
                                         DiffApprovalResult::RejectedByUser => {
                                             self.notify_progress(&format!(
                                                 "[Tool: write_file] Edit on '{}' declined by user.",
-                                                path_str
+                                                rel_path
                                             ));
-                                            return "Edit declined by user. Do NOT retry this edit; choose an alternative approach or ask the user for guidance.".to_string();
+                                            return "Edit permanently declined by user for this turn. STOP trying to modify this file. Retrying will be rejected immediately. Conclude your turn or explain why you are blocked to the user.".to_string();
                                         }
                                         DiffApprovalResult::RejectedNonTerminal => {
                                             self.notify_progress(&format!(
                                                 "[Tool: write_file] Edit on '{}' rejected: requires interactive terminal approval or -y/--auto-approve flag.",
-                                                path_str
+                                                rel_path
                                             ));
                                             return "Edit rejected: non-interactive session requires -y/--auto-approve to apply changes without terminal prompt.".to_string();
                                         }
@@ -1689,22 +1695,26 @@ impl AgendexAgent {
                             }
                         } else if !target_path.exists() {
                             // Review diff for proposed new file creation
+                            let rel_path = agendex_trajectory::normalize_rel_path(
+                                path_str,
+                                &self.config.workspace_dir,
+                            );
                             let diff =
-                                agendex_ast::diff::generate_unified_diff(path_str, "", content);
+                                agendex_ast::diff::generate_unified_diff(&rel_path, "", content);
                             if !diff.is_empty() {
-                                match self.request_diff_approval(path_str, &diff).await {
+                                match self.request_diff_approval(&rel_path, &diff).await {
                                     DiffApprovalResult::Approved => {}
                                     DiffApprovalResult::RejectedByUser => {
                                         self.notify_progress(&format!(
                                             "[Tool: write_file] File creation of '{}' declined by user.",
-                                            path_str
+                                            rel_path
                                         ));
-                                        return "File creation declined by user".to_string();
+                                        return "File creation permanently declined by user for this turn. STOP trying to create this file. Conclude your turn or explain why you are blocked to the user.".to_string();
                                     }
                                     DiffApprovalResult::RejectedNonTerminal => {
                                         self.notify_progress(&format!(
                                             "[Tool: write_file] File creation of '{}' rejected: requires interactive terminal approval or -y/--auto-approve flag.",
-                                            path_str
+                                            rel_path
                                         ));
                                         return "File creation rejected: non-interactive session requires -y/--auto-approve to apply changes without terminal prompt.".to_string();
                                     }
@@ -1758,6 +1768,14 @@ impl AgendexAgent {
                     .await;
 
                 if let Some((pre_untracked, pre_modified)) = pre_cmd_state {
+                    let cmd_str = tc
+                        .arguments
+                        .get("CommandLine")
+                        .or_else(|| tc.arguments.get("command"))
+                        .or_else(|| tc.arguments.get("cmd"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
                     let post_untracked_out = tokio::process::Command::new("git")
                         .args(["ls-files", "--others", "--exclude-standard"])
                         .current_dir(&self.config.workspace_dir)
@@ -1771,7 +1789,10 @@ impl AgendexAgent {
                                 line.trim(),
                                 &self.config.workspace_dir,
                             );
-                            if !trimmed.is_empty() && !pre_untracked.contains(&trimmed) {
+                            if !trimmed.is_empty()
+                                && !pre_untracked.contains(&trimmed)
+                                && command_wrote_or_targeted_path(cmd_str, &trimmed)
+                            {
                                 snap.record_created_file(&trimmed);
                                 touched.insert(trimmed);
                             }
@@ -1790,7 +1811,10 @@ impl AgendexAgent {
                                 line.trim(),
                                 &self.config.workspace_dir,
                             );
-                            if !trimmed.is_empty() && !pre_modified.contains(&trimmed) {
+                            if !trimmed.is_empty()
+                                && !pre_modified.contains(&trimmed)
+                                && command_wrote_or_targeted_path(cmd_str, &trimmed)
+                            {
                                 touched.insert(trimmed);
                             }
                         }
@@ -2893,4 +2917,120 @@ fn format_num(n: usize) -> String {
         out.push(c);
     }
     out
+}
+
+/// Determines if a shell command explicitly wrote, modified, or targeted a given relative file path,
+/// preventing unrelated external or user edits made during the command's execution from being attributed to the agent.
+fn command_wrote_or_targeted_path(cmd: &str, rel_path: &str) -> bool {
+    let cmd_clean = cmd.replace('\\', "/");
+    let cmd_lower = cmd_clean.to_lowercase();
+    let norm_path = rel_path.replace('\\', "/");
+    let norm_lower = norm_path.to_lowercase();
+
+    // 1. Pure read-only inspection or delay commands without redirection never create or edit workspace files
+    let is_pure_read_or_delay = {
+        let first_word = cmd_lower
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_start_matches("./");
+        matches!(
+            first_word,
+            "sleep"
+                | "timeout"
+                | "wait"
+                | "cat"
+                | "head"
+                | "tail"
+                | "ls"
+                | "dir"
+                | "grep"
+                | "find"
+                | "pwd"
+                | "whoami"
+                | "ps"
+                | "top"
+        ) && !cmd_lower.contains('>')
+            && !cmd_lower.contains(">>")
+            && !cmd_lower.contains('|')
+            && !cmd_lower.contains("out-file")
+            && !cmd_lower.contains("set-content")
+    };
+    if is_pure_read_or_delay {
+        return false;
+    }
+
+    // 2. Direct exact or substring match of relative path
+    if cmd_lower.contains(&norm_lower) {
+        return true;
+    }
+
+    // 3. Basename match (e.g. `main.rs`, `Cargo.toml`, `script.py`)
+    let p = std::path::Path::new(&norm_lower);
+    if let Some(fname) = p.file_name().and_then(|f| f.to_str()) {
+        if fname.len() >= 3 && cmd_lower.contains(fname) {
+            return true;
+        }
+    }
+
+    // 4. Directory ancestor match (e.g. `mkdir -p test_dir && cargo new test_dir`)
+    for comp in p.components() {
+        if let std::path::Component::Normal(comp_os) = comp {
+            if let Some(c_str) = comp_os.to_str() {
+                if c_str.len() >= 3
+                    && !matches!(c_str, "src" | "test" | "tests" | "lib" | "bin")
+                    && cmd_lower.contains(c_str)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // 5. Build/compiler or scaffolding commands that legitimately write untracked artifacts into subdirs
+    let is_scaffolder = cmd_lower.contains("cargo new")
+        || cmd_lower.contains("cargo init")
+        || cmd_lower.contains("npm init")
+        || cmd_lower.contains("npx create-")
+        || cmd_lower.contains("yarn create")
+        || cmd_lower.contains("pnpm create")
+        || cmd_lower.contains("git clone");
+    if is_scaffolder {
+        return true;
+    }
+
+    false
+}
+
+#[cfg(test)]
+mod command_attribution_tests {
+    use super::*;
+
+    #[test]
+    fn test_command_wrote_or_targeted_path() {
+        // Pure read-only delay command must NOT match user edit
+        assert!(!command_wrote_or_targeted_path("sleep 10", "mine.txt"));
+        assert!(!command_wrote_or_targeted_path("cat README.md", "mine.txt"));
+        assert!(!command_wrote_or_targeted_path("ls -la", "src/main.rs"));
+
+        // Direct redirection or file writing
+        assert!(command_wrote_or_targeted_path(
+            "cat << 'EOF' > src/main.rs",
+            "src/main.rs"
+        ));
+        assert!(command_wrote_or_targeted_path(
+            "echo 'hello' > foo.txt",
+            "foo.txt"
+        ));
+        assert!(command_wrote_or_targeted_path(
+            "python -c \"open('out.json', 'w').write('{}')\"",
+            "out.json"
+        ));
+
+        // Scaffolding commands
+        assert!(command_wrote_or_targeted_path(
+            "cargo new my_app",
+            "my_app/Cargo.toml"
+        ));
+    }
 }

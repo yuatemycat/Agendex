@@ -201,7 +201,10 @@ pub fn generate_unified_diff(file_path: &str, old_content: &str, new_content: &s
     }
 
     let mut result = String::new();
-    let clean_path = normalized_path.trim_start_matches('/');
+    let clean_path = normalized_path
+        .trim_start_matches('/')
+        .trim_start_matches("./");
+    let clean_path = clean_path.strip_prefix("workspace/").unwrap_or(clean_path);
     result.push_str(&format!("--- a/{}\n", clean_path));
     result.push_str(&format!("+++ b/{}\n", clean_path));
 

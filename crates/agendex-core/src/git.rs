@@ -36,6 +36,7 @@ pub fn format_commit_message(summary: &str) -> String {
         .trim_start_matches("could you ")
         .trim_start_matches("I need you to ")
         .trim_start_matches("Help me ")
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
         .trim();
 
     let clean_lower = clean.to_lowercase();
@@ -67,8 +68,10 @@ pub fn format_commit_message(summary: &str) -> String {
 
     let first_line = clean.lines().next().unwrap_or(clean).trim();
     let first_line = first_line.trim_end_matches('.');
-    let subject = if first_line.len() > 65 {
-        format!("{}: {}", prefix, first_line[..65].trim())
+    let char_count = first_line.chars().count();
+    let subject = if char_count > 65 {
+        let truncated: String = first_line.chars().take(65).collect();
+        format!("{}: {}", prefix, truncated.trim())
     } else {
         format!("{}: {}", prefix, first_line)
     };
@@ -396,5 +399,22 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_format_commit_message_non_ascii_and_long_prompts() {
+        // Multi-byte German, Japanese and Emoji characters
+        let german_prompt = "Füge eine umfassende Überprüfung für alle überflüssigen Abhängigkeiten hinzu und bereinige den Cache";
+        let msg = format_commit_message(german_prompt);
+        assert!(msg.starts_with("chore: "));
+        assert!(!msg.is_empty());
+
+        let japanese_prompt = "テストケースを全て追加して、データベースの接続プールを安全に初期化する機能を実装してください。";
+        let msg_ja = format_commit_message(japanese_prompt);
+        assert!(msg_ja.starts_with("chore: "));
+
+        let emoji_prompt = "🚀 Fix critical token exhaustion in reactive mailbox and ensure background tasks exit cleanly";
+        let msg_em = format_commit_message(emoji_prompt);
+        assert!(msg_em.starts_with("fix: "));
     }
 }

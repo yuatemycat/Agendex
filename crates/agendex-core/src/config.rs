@@ -150,6 +150,11 @@ impl AgendexConfigFile {
             .or_else(|| self.agent.as_ref().and_then(|a| a.auto_approve_risky))
     }
 
+    pub fn resolved_max_turn_tokens(&self) -> Option<usize> {
+        self.max_turn_tokens
+            .or_else(|| self.agent.as_ref().and_then(|a| a.max_turn_tokens))
+    }
+
     /// Saves the current configuration file representation to a file on disk with restrictive permissions.
     pub fn save_to_disk(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
@@ -199,6 +204,9 @@ impl AgendexConfigFile {
         }
         if let Some(a) = self.resolved_auto_approve_risky() {
             config.auto_approve_risky = a;
+        }
+        if let Some(mtt) = self.resolved_max_turn_tokens() {
+            config.max_turn_tokens = Some(mtt);
         }
 
         // Active provider configuration takes precedence over legacy top-level fields
@@ -773,12 +781,14 @@ mod tests {
             provider = "proxymateur"
             tier = "256k"
             auto_approve_risky = true
+            max_turn_tokens = 300000
         "#;
         let cfg = load_config_from_str(toml_str).unwrap();
         assert_eq!(cfg.resolved_model(), Some("gpt-4o"));
         assert_eq!(cfg.resolved_provider_or_format(), Some("proxymateur"));
         assert_eq!(cfg.resolved_tier(), Some("256k"));
         assert_eq!(cfg.resolved_auto_approve_risky(), Some(true));
+        assert_eq!(cfg.resolved_max_turn_tokens(), Some(300000));
 
         let mut agent_cfg = AgentConfig::default();
         cfg.apply_to_agent_config(&mut agent_cfg);
@@ -791,6 +801,7 @@ mod tests {
         );
         assert_eq!(agent_cfg.model_tier, ModelTier::HighTier256k);
         assert!(agent_cfg.auto_approve_risky);
+        assert_eq!(agent_cfg.max_turn_tokens, Some(300000));
     }
 
     #[test]
@@ -822,6 +833,7 @@ mod tests {
             [agent]
             tier = "840k"
             auto_approve_risky = false
+            max_turn_tokens = 450000
         "#;
         let cfg = load_config_from_str(toml_str).unwrap();
         let mut agent_cfg = AgentConfig::default();
@@ -831,6 +843,7 @@ mod tests {
         assert_eq!(agent_cfg.model.format, ModelFormat::Anthropic);
         assert_eq!(agent_cfg.model_tier, ModelTier::Extended840k);
         assert!(!agent_cfg.auto_approve_risky);
+        assert_eq!(agent_cfg.max_turn_tokens, Some(450000));
     }
 
     #[test]

@@ -116,8 +116,9 @@ pub fn estimate_cost_optional(
             (0.00001500, 0.00007500)
         }
         m if m.contains("nemotron") => {
-            // Nvidia NIM Nemotron official catalog pricing ($1.20 / 1M prompt, $1.20 / 1M completion)
-            (0.00000120, 0.00000120)
+            // Nvidia NIM / OpenRouter Llama-3.1-Nemotron-70B hosted rate ($0.70 / 1M prompt, $0.70 / 1M completion)
+            // Reference: https://build.nvidia.com/nvidia/llama-3_1-nemotron-70b-instruct and OpenRouter catalog
+            (0.00000070, 0.00000070)
         }
         m if m.contains("llama-3.1-70b")
             || m.contains("llama-3.3-70b")

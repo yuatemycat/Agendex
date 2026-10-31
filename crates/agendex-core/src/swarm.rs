@@ -159,6 +159,9 @@ enum ActiveApproval {
     },
 }
 
+pub type ActivityCallback = Arc<dyn Fn() + Send + Sync>;
+type ActivityHookSlot = Arc<std::sync::Mutex<Option<ActivityCallback>>>;
+
 /// Shared console coordinator serializing all interactive prompts and standard input across
 /// concurrent subagents and the CLI REPL, guaranteeing exactly one reader on terminal stdin.
 pub struct SharedApprovalQueue {
@@ -166,6 +169,7 @@ pub struct SharedApprovalQueue {
     is_paused: Arc<std::sync::atomic::AtomicBool>,
     allowed_commands: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     allowed_diffs: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    activity_hook: ActivityHookSlot,
 }
 
 impl SharedApprovalQueue {
@@ -174,9 +178,11 @@ impl SharedApprovalQueue {
         let is_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let allowed_commands = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
         let allowed_diffs = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let activity_hook: ActivityHookSlot = Arc::new(std::sync::Mutex::new(None));
 
         let allowed_cmds_thread = Arc::clone(&allowed_commands);
         let allowed_diffs_thread = Arc::clone(&allowed_diffs);
+        let activity_hook_thread = Arc::clone(&activity_hook);
 
         // 1. Spawn dedicated Stdin Reader Thread that respects is_paused
         let stdin_tx = event_tx.clone();
@@ -278,7 +284,13 @@ impl SharedApprovalQueue {
                                         responder,
                                     });
                                 } else {
+                                    if let Ok(guard) = activity_hook_thread.lock() {
+                                        if let Some(ref hook) = *guard {
+                                            hook();
+                                        }
+                                    }
                                     eprint!("\r\x1b[2K");
+                                    let _ = std::io::stderr().flush();
                                     let card = crate::ui::format_safety_gate_card(
                                         &command,
                                         &reason,
@@ -317,7 +329,13 @@ impl SharedApprovalQueue {
                                         responder,
                                     });
                                 } else {
+                                    if let Ok(guard) = activity_hook_thread.lock() {
+                                        if let Some(ref hook) = *guard {
+                                            hook();
+                                        }
+                                    }
                                     eprint!("\r\x1b[2K");
+                                    let _ = std::io::stderr().flush();
                                     let colored_diff = crate::ui::format_diff_colored(&path, &diff);
                                     print!("{}", colored_diff);
                                     print!(
@@ -370,6 +388,13 @@ impl SharedApprovalQueue {
 
                                 // If there are pending approvals, prompt the next one
                                 if let Some(next_req) = pending_approvals.pop_front() {
+                                    if let Ok(guard) = activity_hook_thread.lock() {
+                                        if let Some(ref hook) = *guard {
+                                            hook();
+                                        }
+                                    }
+                                    eprint!("\r\x1b[2K");
+                                    let _ = std::io::stderr().flush();
                                     match next_req {
                                         ConsoleRequest::Approval {
                                             subagent_id,
@@ -500,7 +525,15 @@ impl SharedApprovalQueue {
             is_paused,
             allowed_commands,
             allowed_diffs,
+            activity_hook,
         })
+    }
+
+    /// Sets an activity callback hook invoked whenever approval prompts need to be displayed (e.g. to pause background spinners).
+    pub fn set_activity_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        if let Ok(mut lock) = self.activity_hook.lock() {
+            *lock = Some(hook);
+        }
     }
 
     /// Temporarily pauses the background console reader so interactive menus have exclusive terminal access.

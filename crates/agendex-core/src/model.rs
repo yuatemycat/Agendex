@@ -366,6 +366,9 @@ impl ModelClient {
                             max_stream_attempts,
                             err_msg
                         );
+                        if let Some(ref cb) = on_token {
+                            cb("\n[Stream connection interrupted; retrying request...]\n");
+                        }
                         tokio::time::sleep(stream_backoff).await;
                         stream_backoff *= 2;
                         continue;
@@ -479,8 +482,13 @@ impl ModelClient {
         .await?;
 
         if !resp.status().is_success() {
+            let status = resp.status();
             let err_text = resp.text().await?;
-            return Err(anyhow::anyhow!("Gemini API error: {}", err_text));
+            return Err(anyhow::anyhow!(
+                "Gemini API error (HTTP {}): {}",
+                status,
+                err_text
+            ));
         }
 
         let body: Value = resp.json().await?;
@@ -617,8 +625,13 @@ impl ModelClient {
         )
         .await?;
         if !resp.status().is_success() {
+            let status = resp.status();
             let err_text = resp.text().await?;
-            return Err(anyhow::anyhow!("OpenAI API error: {}", err_text));
+            return Err(anyhow::anyhow!(
+                "OpenAI API error (HTTP {}): {}",
+                status,
+                err_text
+            ));
         }
 
         let is_event_stream = resp
@@ -921,8 +934,13 @@ impl ModelClient {
         .await?;
 
         if !resp.status().is_success() {
+            let status = resp.status();
             let err_text = resp.text().await?;
-            return Err(anyhow::anyhow!("Anthropic API error: {}", err_text));
+            return Err(anyhow::anyhow!(
+                "Anthropic API error (HTTP {}): {}",
+                status,
+                err_text
+            ));
         }
 
         let is_event_stream = resp
